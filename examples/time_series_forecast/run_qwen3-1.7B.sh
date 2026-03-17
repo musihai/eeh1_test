@@ -9,17 +9,17 @@ export VLLM_USE_V1=1
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HYDRA_FULL_ERROR=1
 
-DEBUG_CHAIN="${DEBUG_CHAIN:-0}"
-if [ "$DEBUG_CHAIN" = "1" ] || [ "${DEBUG_CHAIN,,}" = "true" ]; then
-    export TS_CHAIN_DEBUG=1
-    export TS_CHAIN_DEBUG_FILE="${TS_CHAIN_DEBUG_FILE:-/tmp/ts_chain_debug.jsonl}"
-    echo "[CHAIN DEBUG] enabled, writing to: $TS_CHAIN_DEBUG_FILE"
-fi
-
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
+
+DEBUG_CHAIN="${DEBUG_CHAIN:-0}"
+if [ "$DEBUG_CHAIN" = "1" ] || [ "${DEBUG_CHAIN,,}" = "true" ]; then
+    export TS_CHAIN_DEBUG=1
+    export TS_CHAIN_DEBUG_FILE="${TS_CHAIN_DEBUG_FILE:-$PROJECT_DIR/logs/debug/ts_chain_debug.jsonl}"
+    mkdir -p "$(dirname "$TS_CHAIN_DEBUG_FILE")"
+    echo "[CHAIN DEBUG] enabled, writing to: $TS_CHAIN_DEBUG_FILE"
+fi
 
 resolve_profile_path() {
     local candidate="$1"
@@ -38,14 +38,17 @@ resolve_profile_path() {
 }
 
 PROFILE_PATH="${PROFILE_PATH:-}"
-if [ -n "$PROFILE_PATH" ]; then
-    RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
-        echo "PROFILE_PATH not found: $PROFILE_PATH"
-        exit 1
-    }
-    # shellcheck disable=SC1090
-    source "$RESOLVED_PROFILE_PATH"
+if [ -z "$PROFILE_PATH" ]; then
+    echo "PROFILE_PATH is required. Set PROFILE_PATH to your single source-of-truth profile file."
+    exit 1
 fi
+
+RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
+    echo "PROFILE_PATH not found: $PROFILE_PATH"
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$RESOLVED_PROFILE_PATH"
 
 CONFIG_PATH="${CONFIG_PATH:-${RL_CONFIG_PATH:-$PROJECT_DIR/recipe/time_series_forecast/base.yaml}}"
 TRAIN_FILES="${TRAIN_FILES:-${RL_TRAIN_FILES:-$PROJECT_DIR/dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424/train.jsonl}}"
@@ -60,6 +63,7 @@ fi
 
 PROJECT_NAME="${PROJECT_NAME:-${RL_PROJECT_NAME:-TimeSeriesForecast}}"
 EXP_NAME="${EXP_NAME:-${RL_EXP_NAME:-etth1_ot_qwen3_1_7b}}"
+TRAINER_LOCAL_DIR="${TRAINER_LOCAL_DIR:-${RL_TRAINER_LOCAL_DIR:-$PROJECT_DIR/artifacts/checkpoints/rl/$EXP_NAME}}"
 NNODES="${NNODES:-${RL_NNODES:-1}}"
 if [ -z "${NUM_GPUS:-}" ] && [ -n "${RL_NUM_GPUS:-}" ]; then
     NUM_GPUS="$RL_NUM_GPUS"
@@ -77,8 +81,8 @@ ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-${RL_ROLLOUT_G
 ROLLOUT_LOAD_FORMAT="${ROLLOUT_LOAD_FORMAT:-${RL_ROLLOUT_LOAD_FORMAT:-safetensors}}"
 ROLLOUT_N="${ROLLOUT_N:-${RL_ROLLOUT_N:-1}}"
 ROLLOUT_TP="${ROLLOUT_TP:-${RL_ROLLOUT_TP:-1}}"
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-${RL_MAX_PROMPT_LENGTH:-2048}}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-${RL_MAX_RESPONSE_LENGTH:-4096}}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-${RL_MAX_PROMPT_LENGTH:-}}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-${RL_MAX_RESPONSE_LENGTH:-}}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-${RL_DATALOADER_NUM_WORKERS:-0}}"
 ACTOR_MAX_TOKEN_LEN_PER_GPU="${ACTOR_MAX_TOKEN_LEN_PER_GPU:-${RL_ACTOR_MAX_TOKEN_LEN_PER_GPU:-8192}}"
 ROLLOUT_MAX_BATCHED_TOKENS="${ROLLOUT_MAX_BATCHED_TOKENS:-${RL_ROLLOUT_MAX_BATCHED_TOKENS:-4096}}"
@@ -94,8 +98,16 @@ LOGGER="${LOGGER:-${RL_LOGGER:-[\"console\"]}}"
 LR="${LR:-${RL_LR:-1e-6}}"
 LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-${RL_LR_SCHEDULER_TYPE:-cosine}}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-${RL_KL_LOSS_COEF:-0.01}}"
-TEMPERATURE="${TEMPERATURE:-${RL_TEMPERATURE:-0.6}}"
-VAL_TEMPERATURE="${VAL_TEMPERATURE:-${RL_VAL_TEMPERATURE:-0.2}}"
+TEMPERATURE="${TEMPERATURE:-${RL_TEMPERATURE:-}}"
+VAL_TEMPERATURE="${VAL_TEMPERATURE:-${RL_VAL_TEMPERATURE:-}}"
+
+for REQUIRED_KEY in MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH TEMPERATURE VAL_TEMPERATURE; do
+    if [ -z "${!REQUIRED_KEY:-}" ]; then
+        echo "Missing required config: $REQUIRED_KEY"
+        echo "Set it in PROFILE_PATH (recommended) or export $REQUIRED_KEY / RL_${REQUIRED_KEY} before launch."
+        exit 1
+    fi
+done
 
 CMD=(
     python3 -m arft.main_agent_ppo
@@ -150,6 +162,7 @@ CMD=(
     "algorithm.use_kl_in_reward=False"
     "algorithm.norm_adv_by_std_in_grpo=False"
     "trainer.logger=$LOGGER"
+    "trainer.default_local_dir=$TRAINER_LOCAL_DIR"
     "trainer.project_name=$PROJECT_NAME"
     "trainer.experiment_name=$EXP_NAME"
     "trainer.n_gpus_per_node=$NUM_GPUS"

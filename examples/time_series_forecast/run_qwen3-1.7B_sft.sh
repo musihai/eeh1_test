@@ -52,7 +52,7 @@ if [ ! -f "${VAL_FILES}" ]; then
     echo "Generate or restore the SFT dataset first."
     exit 1
 fi
-SAVE_DIR="${SAVE_DIR:-${SFT_SAVE_DIR:-$PROJECT_DIR/checkpoints/time_series_forecast_sft}}"
+SAVE_DIR="${SAVE_DIR:-${SFT_SAVE_DIR:-$PROJECT_DIR/artifacts/checkpoints/sft/time_series_forecast_sft}}"
 PROJECT_NAME="${PROJECT_NAME:-${SFT_PROJECT_NAME:-TimeSeriesForecast-SFT}}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-${SFT_EXPERIMENT_NAME:-qwen3-1.7b-etth1-ot-sft}}"
 NUM_GPUS="${NUM_GPUS:-${SFT_NUM_GPUS:-1}}"

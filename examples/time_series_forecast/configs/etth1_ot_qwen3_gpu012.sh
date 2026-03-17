@@ -40,7 +40,7 @@ export RL_NNODES="${RL_NNODES:-1}"
 
 export SFT_TRAIN_FILES="${SFT_TRAIN_FILES:-$PROJECT_DIR/dataset/ett_sft_etth1_runtime_ot_paper200/train.parquet}"
 export SFT_VAL_FILES="${SFT_VAL_FILES:-$PROJECT_DIR/dataset/ett_sft_etth1_runtime_ot_paper200/val.parquet}"
-export SFT_SAVE_DIR="${SFT_SAVE_DIR:-$PROJECT_DIR/checkpoints/time_series_forecast_sft}"
+export SFT_SAVE_DIR="${SFT_SAVE_DIR:-$PROJECT_DIR/artifacts/checkpoints/sft/time_series_forecast_sft}"
 export SFT_PROJECT_NAME="${SFT_PROJECT_NAME:-TimeSeriesForecast-SFT}"
 export SFT_NUM_GPUS="${SFT_NUM_GPUS:-$NUM_GPUS}"
 export SFT_MAX_LENGTH="${SFT_MAX_LENGTH:-8192}"
