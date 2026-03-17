@@ -12,9 +12,9 @@
 - runtime 不再把完整多轮对话当作 memory；只保留紧凑状态：`history_analysis` 和 `prediction_tool_output`
 - 工具轮不再保留冗长 assistant prose，只保留实际 tool effects
 - `predict_time_series` 的 tool 输出改为“单个起始时间戳 + 频率 + 纯数值 forecast values”
-- 最终 `<answer>` 仍保留时间戳，保证 reward 和现有评估逻辑兼容
+- 最终 `<answer>` 统一为 96 行纯数值（无时间戳），与当前 prompt / reward 严格长度约束一致
 - reward 默认使用严格 ablation：只保留格式、长度和 MSE，关闭 change point / season-trend 附加项
-- 正式 RL 默认使用严格最终答案格式：必须输出完整 `<answer>...</answer>`，不再接受截断 `<answer>` 或裸 forecast block
+- 正式 RL 目标仍是完整 `<answer>...</answer>`；同时 runtime 增加 near-complete 回退（当 `<answer>` 未闭合但数值接近完整时可提取）以减少无效样本
 
 ## 环境
 

@@ -351,8 +351,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
     def _expected_min_prediction_count(self) -> int:
         horizon = int(self.forecast_horizon or 0)
         if horizon <= 0:
-            return 8
-        return max(8, min(24, horizon // 4))
+            return 1
+        return max(1, horizon - 2)
 
     def _extract_forecast_block(self, text: str) -> Optional[str]:
         cleaned = (
@@ -407,6 +407,13 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         if match:
             candidate = match.group(1).strip()
             if self._looks_like_forecast_answer(candidate):
+                return candidate, 0.0
+
+        if "<answer>" in response_text and "</answer>" not in response_text:
+            candidate = response_text.split("<answer>", 1)[1].strip()
+            values = extract_values_from_time_series_string(candidate)
+            horizon = int(self.forecast_horizon or 96)
+            if len(values) >= max(1, horizon - 6) and self._looks_like_forecast_answer(candidate):
                 return candidate, 0.0
 
         return None, 0.0

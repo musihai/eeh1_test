@@ -180,6 +180,25 @@ fi
 
 CMD+=("$@")
 
+echo "FINAL MAX_PROMPT_LENGTH=$MAX_PROMPT_LENGTH"
+echo "FINAL MAX_RESPONSE_LENGTH=$MAX_RESPONSE_LENGTH"
+echo "FINAL ACTOR_MAX_TOKEN_LEN_PER_GPU=$ACTOR_MAX_TOKEN_LEN_PER_GPU"
+echo "FINAL TEMPERATURE=$TEMPERATURE"
+echo "FINAL VAL_TEMPERATURE=$VAL_TEMPERATURE"
+
+mkdir -p "$PROJECT_DIR/debug_logs"
+FINAL_CMD_DUMP_PATH="$PROJECT_DIR/debug_logs/final_launch_cmd.txt"
+{
+    printf 'timestamp=%s\n' "$(date -Is)"
+    printf 'profile_path=%s\n' "$RESOLVED_PROFILE_PATH"
+    printf 'exp_name=%s\n' "$EXP_NAME"
+    printf 'model_path=%s\n' "$MODEL_PATH"
+    printf 'cmd='
+    printf '%q ' "${CMD[@]}"
+    printf '\n'
+} > "$FINAL_CMD_DUMP_PATH"
+echo "[LAUNCH CMD] dumped to: $FINAL_CMD_DUMP_PATH"
+
 if [ "${PRINT_CMD_ONLY:-0}" = "1" ]; then
     printf '%q ' "${CMD[@]}"
     printf '\n'
