@@ -1,0 +1,49 @@
+# 数据集和权重
+dataset/
+checkpoints/
+models/
+
+# 输出和日志
+outputs/
+swanlog/
+*.log
+
+# Python缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 临时文件
+/tmp/
+*.tmp
+*.bak
+
+# 大文件
+*.pdf
+*.pth
+*.pt
+*.bin
+*.safetensors
+
+# Ray相关
+/tmp/ray/
+gcs_backup/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 其他
+.env
+.env.local
+verl/
