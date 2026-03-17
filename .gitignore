@@ -6,6 +6,7 @@ models/
 # 输出和日志
 outputs/
 swanlog/
+logs/
 *.log
 
 # Python缓存
