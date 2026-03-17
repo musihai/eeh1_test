@@ -1,3 +1,4 @@
+import os
 import string
 import re
 import numpy as np
@@ -11,6 +12,7 @@ from verl.utils.chain_debug import append_chain_debug, short_text
 # Strict ablation setting: only keep format, length, and MSE rewards.
 ENABLE_CHANGE_POINT_SCORE = False
 ENABLE_SEASON_TREND_SCORE = False
+STRICT_LENGTH_MATCH = os.getenv("TS_REWARD_STRICT_LENGTH", "1").lower() in {"1", "true", "yes", "on"}
 
 
 class moving_avg(nn.Module):
@@ -201,6 +203,19 @@ def compute_format_score(solution_str: str) -> float:
     except Exception as e:
         print(f"[DEBUG] Error in compute_format_score: {e}")
         return -1.0
+
+
+def infer_format_failure_reason(solution_str: Optional[str]) -> str:
+    if solution_str is None:
+        return "empty_solution"
+    if "<answer>" not in solution_str:
+        return "missing_answer_open_tag"
+    if "</answer>" not in solution_str:
+        return "missing_answer_close_tag"
+    answer_text = extract_answer(solution_str)
+    if not answer_text.strip():
+        return "empty_answer_block"
+    return "unknown_format_failure"
 
 
 def compute_length_score(solution_str: str, ground_truth: str) -> float:
@@ -421,7 +436,7 @@ def compute_score(
     solution_str: str,
     ground_truth: str,
     extra_info: Optional[dict] = None
-) -> float:
+) -> dict:
     """
     Compute the total reward score for time series prediction.
     
@@ -471,6 +486,9 @@ def compute_score(
             "mse_score": 0.0,
             "raw_mse": float("nan"),
             "raw_mae": float("nan"),
+            "format_failure_reason": "empty_solution",
+            "length_hard_fail": False,
+            "strict_length_match": bool(STRICT_LENGTH_MATCH),
         }
 
     score = 0.0
@@ -486,8 +504,19 @@ def compute_score(
 
     # 2. Length score
     length_score = 0.0
-    if gt_len > 0 and format_score >= 0:
-        if pred_len >= gt_len:
+    format_failure_reason = "ok"
+    length_hard_fail = False
+    if format_score < 0:
+        format_failure_reason = infer_format_failure_reason(solution_str)
+    elif STRICT_LENGTH_MATCH and gt_len > 0 and pred_len != gt_len:
+        # Hard constraint mode: prediction length must exactly match ground truth length.
+        length_hard_fail = True
+        format_failure_reason = f"length_mismatch:{pred_len}!={gt_len}"
+        score = -1.0
+    elif gt_len > 0 and format_score >= 0:
+        if STRICT_LENGTH_MATCH:
+            length_score = 0.1
+        elif pred_len >= gt_len:
             length_score = 0.1
         else:
             length_score = 0.1 * pred_len / gt_len
@@ -497,7 +526,7 @@ def compute_score(
     mse_score = 0.0
     raw_mse: float = float("nan")
     raw_mae: float = float("nan")
-    if format_score >= 0 and gt_len > 0 and pred_len > 0:
+    if format_score >= 0 and (not length_hard_fail) and gt_len > 0 and pred_len > 0:
         min_len = min(pred_len, gt_len)
         norm_pred, norm_gt = normalize_for_reward(pred_values[:min_len], gt_values[:min_len])
         raw_mse = float(mean_squared_error(norm_gt, norm_pred))
@@ -539,6 +568,9 @@ def compute_score(
             "parsed_answer_text_head": short_text(extract_answer(solution_str), 500),
             "parsed_values": pred_values[:50],
             "output_source": (extra_info or {}).get("output_source"),
+            "format_failure_reason": format_failure_reason,
+            "length_hard_fail": bool(length_hard_fail),
+            "strict_length_match": bool(STRICT_LENGTH_MATCH),
         },
     )
 
@@ -549,4 +581,7 @@ def compute_score(
         "mse_score": float(mse_score),
         "raw_mse": raw_mse,
         "raw_mae": raw_mae,
+        "format_failure_reason": format_failure_reason,
+        "length_hard_fail": bool(length_hard_fail),
+        "strict_length_match": bool(STRICT_LENGTH_MATCH),
     }

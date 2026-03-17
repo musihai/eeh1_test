@@ -86,6 +86,13 @@ If you would use the model predictions directly, paste the actual predicted valu
 ...
 </answer>
 
+STRICT OUTPUT CONSTRAINTS (Turn 3):
+- <answer> must contain EXACTLY 96 lines.
+- Each line must be one forecast item in the format: YYYY-MM-DD HH:MM:SS value
+- One value per line; no table, no bullets, no prose.
+- Do not omit closing </answer>.
+- Do not output markdown/code fences.
+
 ## CRITICAL RULES
 - Turn 1: Feature extraction ONLY. Do NOT call predict_time_series.
 - Turn 2: Call predict_time_series ONLY after features are extracted.
@@ -121,7 +128,7 @@ def get_runtime_turn_info(
         return 2, "Call predict_time_series with your chosen model (e.g., 'chronos2')."
     return 3, (
         "Output your final answer in <think>...</think><answer>...</answer> format using the model predictions. "
-        "Do NOT output any text outside these tags."
+        "Do NOT output any text outside these tags. <answer> must contain exactly 96 lines, one forecast value per line."
     )
 
 
@@ -157,6 +164,8 @@ def build_runtime_user_prompt(
 2. Reflect briefly on whether the forecast values are consistent with the compact analysis summary.
 3. Output the final refined prediction.
 4. Output ONLY <think>...</think> and <answer>...</answer>. Do not include anything else.
+5. <answer> must contain EXACTLY {forecast_horizon} lines.
+6. Each line must be: timestamp + single float value (no extra words, no markdown, no bullets).
 
 <think>
 [Reflection on the consistency between feature evidence and forecast values]

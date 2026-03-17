@@ -118,7 +118,7 @@ python recipe/time_series_forecast/build_etth1_high_quality_sft.py \
 
 ```bash
 MODEL_PATH=/data/linyujie/models/Qwen3-1.7B \
-SAVE_DIR=$PWD/checkpoints/time_series_forecast_sft_teacher200_v2 \
+SAVE_DIR=$PWD/checkpoints/time_series_forecast_sft_teacher200_new \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
 RUN_MODE=train \
 SFT_TRAIN_FILES=$PWD/dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/train.parquet \
@@ -127,14 +127,6 @@ bash examples/time_series_forecast/run_qwen3-1.7B_sft.sh \
   trainer.resume_mode=disable
 ```
 
-如果你只是想先试通链路，不生成 teacher200，也可以直接用 profile 默认的 `paper200`：
-
-```bash
-MODEL_PATH=/data/linyujie/models/Qwen3-1.7B \
-PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
-RUN_MODE=train \
-bash examples/time_series_forecast/run_qwen3-1.7B_sft.sh
-```
 
 SFT 输出目录：
 
@@ -168,7 +160,7 @@ bash examples/time_series_forecast/run_qwen3-1.7B.sh \
 ```bash
 DEBUG_CHAIN=1 \
 TS_CHAIN_DEBUG_FILE=/tmp/ts_chain_debug.jsonl \
-MODEL_PATH=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/checkpoints/time_series_forecast_sft_teacher200_v2/global_step_11/huggingface \
+MODEL_PATH=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/checkpoints/time_series_forecast_sft_teacher200_new/global_step_11/huggingface \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
 RUN_MODE=train \
 RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_gpu012_eval5_fresh \
@@ -184,9 +176,27 @@ RL 输出目录：
 checkpoints/TimeSeriesForecast/
 ```
 
+调试辅助（可选）：
+
+```bash
+# 从 chain debug 中抽取 format 失败样本 + reward 链路摘要
+PYTHONPATH=$PWD conda run -n cast-r1-ts \
+python recipe/time_series_forecast/analyze_chain_debug.py \
+  --debug-file /tmp/ts_chain_debug.jsonl \
+  --top-k-fail 10
+
+# 校验 SFT/curated 数据里 Turn3 最终答案是否满足 96 行约束
+PYTHONPATH=$PWD conda run -n cast-r1-ts \
+python recipe/time_series_forecast/validate_turn3_format.py \
+  --input-jsonl dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/train_curated.jsonl \
+  --expected-len 96 \
+  --top-k-invalid 10
+```
+
 说明：
 
 - RL 默认 `resume_mode=auto`。同一个 `RL_EXP_NAME` 下再次运行，不会从头覆盖，而是会自动续跑最近的 checkpoint。
+- reward 默认开启严格长度约束（`TS_REWARD_STRICT_LENGTH=1`）：`pred_len != gt_len` 直接视为不合法答案并给 `-1.0`。如需回退旧行为可临时设置 `TS_REWARD_STRICT_LENGTH=0`。
 - 如果当前实验已经跑到 `100 step`，再写 `trainer.total_training_steps=100` 通常不会继续训练；续跑时要把总步数设得更大，比如 `200`。
 - 如果你想完全重新开始，请换一个新的 `RL_EXP_NAME`，或者加 `trainer.resume_mode=disable`。
 - 当前这条 ETTh1/OT 训练链路里，`vLLM + load_format=dummy` 会导致 rollout 输出异常长的乱码文本，表现为 `response_length=3072`、`reward=0`。

@@ -767,6 +767,21 @@ class RayAgentTrainer(RayPPOTrainer):
                             batch = batch.union(reward_tensor)
 
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        reward_seq = reward_tensor.sum(-1)
+                        append_chain_debug(
+                            "trainer_reward_extract",
+                            {
+                                "global_step": int(self.global_steps),
+                                "token_score_min": float(reward_tensor.min().item()),
+                                "token_score_max": float(reward_tensor.max().item()),
+                                "token_score_mean": float(reward_tensor.mean().item()),
+                                "seq_score_min": float(reward_seq.min().item()),
+                                "seq_score_max": float(reward_seq.max().item()),
+                                "seq_score_mean": float(reward_seq.mean().item()),
+                                "seq_negative_count": int((reward_seq < 0).sum().item()),
+                                "seq_scores_head": reward_seq[:20].cpu().tolist(),
+                            },
+                        )
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -830,6 +845,7 @@ class RayAgentTrainer(RayPPOTrainer):
                         score_min = float(batch.batch["token_level_scores"].min().item())
                         score_max = float(batch.batch["token_level_scores"].max().item())
                         score_mean = float(batch.batch["token_level_scores"].mean().item())
+                        score_seq = batch.batch["token_level_scores"].sum(-1)
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -846,6 +862,7 @@ class RayAgentTrainer(RayPPOTrainer):
                         reward_min = float(batch.batch["token_level_rewards"].min().item())
                         reward_max = float(batch.batch["token_level_rewards"].max().item())
                         reward_mean = float(batch.batch["token_level_rewards"].mean().item())
+                        reward_seq = batch.batch["token_level_rewards"].sum(-1)
                         append_chain_debug(
                             "trainer_reward_tensor",
                             {
@@ -853,9 +870,17 @@ class RayAgentTrainer(RayPPOTrainer):
                                 "score_min": score_min,
                                 "score_max": score_max,
                                 "score_mean": score_mean,
+                                "score_seq_min": float(score_seq.min().item()),
+                                "score_seq_max": float(score_seq.max().item()),
+                                "score_seq_mean": float(score_seq.mean().item()),
+                                "score_seq_negative_count": int((score_seq < 0).sum().item()),
                                 "reward_min": reward_min,
                                 "reward_max": reward_max,
                                 "reward_mean": reward_mean,
+                                "reward_seq_min": float(reward_seq.min().item()),
+                                "reward_seq_max": float(reward_seq.max().item()),
+                                "reward_seq_mean": float(reward_seq.mean().item()),
+                                "reward_seq_negative_count": int((reward_seq < 0).sum().item()),
                                 "reward_equals_score": bool(
                                     torch.allclose(
                                         batch.batch["token_level_rewards"],
