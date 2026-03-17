@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -133,7 +134,42 @@ def build_feature_tool_results(values: list[float]) -> list[ToolResult]:
     return [ToolResult(tool_name=name, tool_output=builder(values)) for name, builder in FEATURE_TOOL_BUILDERS]
 
 
-def build_final_answer(prediction_text: str, model_name: str, prediction_source: str) -> str:
+def _to_value_only_prediction_text(prediction_text: str, forecast_horizon: int) -> str:
+    values: list[float] = []
+    for line in str(prediction_text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Try last numeric token first (works for timestamp + value).
+        parts = line.split()
+        parsed = None
+        for token in reversed(parts):
+            try:
+                parsed = float(token)
+                break
+            except Exception:
+                continue
+        # Fallback: regex extract the last float-like number.
+        if parsed is None:
+            matches = re.findall(r"-?\d+(?:\.\d+)?", line)
+            if matches:
+                try:
+                    parsed = float(matches[-1])
+                except Exception:
+                    parsed = None
+        if parsed is not None:
+            values.append(float(parsed))
+
+    if not values:
+        return ""
+
+    trimmed = values[:forecast_horizon]
+    if len(trimmed) < forecast_horizon:
+        trimmed = trimmed + [trimmed[-1]] * (forecast_horizon - len(trimmed))
+    return "\n".join(f"{v:.4f}" for v in trimmed)
+
+
+def build_final_answer(prediction_text: str, model_name: str, prediction_source: str, forecast_horizon: int) -> str:
     if prediction_source == "reference_teacher":
         reflection = (
             f"The extracted evidence supports using {model_name.upper()} for this window, "
@@ -144,7 +180,8 @@ def build_final_answer(prediction_text: str, model_name: str, prediction_source:
             "The forecast candidate is consistent with the recent level, daily seasonality, "
             "and local trend, so I keep it as the final answer."
         )
-    return f"<think>{reflection}</think>\n<answer>\n{prediction_text}\n</answer>"
+    value_only_prediction_text = _to_value_only_prediction_text(prediction_text, forecast_horizon=forecast_horizon)
+    return f"<think>{reflection}</think>\n<answer>\n{value_only_prediction_text}\n</answer>"
 
 
 def build_sft_record(sample: dict[str, Any], prediction_mode: str = "preferred") -> dict[str, Any]:
@@ -271,7 +308,15 @@ def build_sft_record(sample: dict[str, Any], prediction_mode: str = "preferred")
             "tool_call_id": prediction_tool_call["id"],
         },
         {"role": "user", "content": turn_3_prompt},
-        {"role": "assistant", "content": build_final_answer(prediction_text, teacher_model, prediction_source)},
+        {
+            "role": "assistant",
+            "content": build_final_answer(
+                prediction_text,
+                teacher_model,
+                prediction_source,
+                forecast_horizon=forecast_horizon,
+            ),
+        },
     ]
 
     return {

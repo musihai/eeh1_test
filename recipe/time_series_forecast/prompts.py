@@ -82,13 +82,13 @@ Your response MUST contain ONLY the two tags below, in this order, with no extra
 If you would use the model predictions directly, paste the actual predicted values inside <answer>.
 <think>[Reflect predictions, note any adjustments]</think>
 <answer>
-2017-05-05 00:00:00 12.3450
+12.3450
 ...
 </answer>
 
 STRICT OUTPUT CONSTRAINTS (Turn 3):
 - <answer> must contain EXACTLY 96 lines.
-- Each line must be one forecast item in the format: YYYY-MM-DD HH:MM:SS value
+- Each line must be a single numeric value (float), no timestamp.
 - One value per line; no table, no bullets, no prose.
 - Do not omit closing </answer>.
 - Do not output markdown/code fences.
@@ -128,7 +128,7 @@ def get_runtime_turn_info(
         return 2, "Call predict_time_series with your chosen model (e.g., 'chronos2')."
     return 3, (
         "Output your final answer in <think>...</think><answer>...</answer> format using the model predictions. "
-        "Do NOT output any text outside these tags. <answer> must contain exactly 96 lines, one forecast value per line."
+        "Do NOT output any text outside these tags. <answer> must contain exactly 96 lines, one numeric value per line, no timestamps."
     )
 
 
@@ -165,7 +165,7 @@ def build_runtime_user_prompt(
 3. Output the final refined prediction.
 4. Output ONLY <think>...</think> and <answer>...</answer>. Do not include anything else.
 5. <answer> must contain EXACTLY {forecast_horizon} lines.
-6. Each line must be: timestamp + single float value (no extra words, no markdown, no bullets).
+6. Each line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
 
 <think>
 [Reflection on the consistency between feature evidence and forecast values]

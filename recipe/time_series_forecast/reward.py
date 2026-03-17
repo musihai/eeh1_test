@@ -92,6 +92,15 @@ def extract_answer(text: str) -> str:
     return match.group(1).strip() if match else text
 
 
+def extract_tail_lines(text: Optional[str], max_lines: int = 10) -> List[str]:
+    if text is None:
+        return []
+    lines = str(text).splitlines()
+    if max_lines <= 0:
+        return []
+    return lines[-max_lines:]
+
+
 def extract_values_from_time_series_string(text: str) -> List[float]:
     """
     Extract numeric values from time series string format.
@@ -566,6 +575,8 @@ def compute_score(
             "first_5_gt_values": gt_values[:5],
             "raw_model_output_head": short_text(solution_str, 500),
             "parsed_answer_text_head": short_text(extract_answer(solution_str), 500),
+            "raw_model_output_tail_10_lines": extract_tail_lines(solution_str, 10),
+            "parsed_answer_tail_10_lines": extract_tail_lines(extract_answer(solution_str), 10),
             "parsed_values": pred_values[:50],
             "output_source": (extra_info or {}).get("output_source"),
             "format_failure_reason": format_failure_reason,
