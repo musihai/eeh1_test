@@ -167,7 +167,7 @@ bash examples/time_series_forecast/run_qwen3-1.7B.sh \
 
 ```bash
 DEBUG_CHAIN=1 \
-TS_CHAIN_DEBUG_FILE=/tmp/ts_chain_debug.jsonl\
+TS_CHAIN_DEBUG_FILE=/tmp/ts_chain_debug.jsonl \
 MODEL_PATH=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/checkpoints/time_series_forecast_sft_teacher200_v2/global_step_11/huggingface \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
 RUN_MODE=train \
