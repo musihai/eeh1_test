@@ -13,6 +13,98 @@ from verl.utils.chain_debug import append_chain_debug, short_text
 ENABLE_CHANGE_POINT_SCORE = False
 ENABLE_SEASON_TREND_SCORE = False
 STRICT_LENGTH_MATCH = os.getenv("TS_REWARD_STRICT_LENGTH", "1").lower() in {"1", "true", "yes", "on"}
+TURN3_SUCCESS_SAMPLE_RATE = max(int(os.getenv("TS_TURN3_SUCCESS_SAMPLE_RATE", "100") or 100), 1)
+
+
+def turn3_generation_debug_file() -> str:
+    override = os.getenv("TS_TURN3_DEBUG_FILE", "").strip()
+    if override:
+        return override
+
+    chain_file = os.getenv("TS_CHAIN_DEBUG_FILE", "/tmp/ts_chain_debug.jsonl")
+    chain_dir = os.path.dirname(chain_file) or "."
+    chain_name = os.path.basename(chain_file)
+    if chain_name.startswith("ts_chain_debug"):
+        suffix = chain_name[len("ts_chain_debug"):]
+        return os.path.join(chain_dir, f"turn3_generation_debug{suffix}")
+    return os.path.join(chain_dir, "turn3_generation_debug.jsonl")
+
+
+def append_turn3_generation_debug(
+    *,
+    data_source: str,
+    solution_str: Optional[str],
+    ground_truth: str,
+    sample_uid: Optional[str],
+    output_source: Optional[str],
+    format_score: float,
+    length_score: float,
+    mse_score: float,
+    final_score: float,
+    raw_mse: float,
+    raw_mae: float,
+    format_failure_reason: str,
+    length_hard_fail: bool,
+    strict_length_match: bool,
+    has_answer_tag: bool,
+    pred_values: List[float],
+    gt_values: List[float],
+) -> None:
+    pred_len = len(pred_values)
+    gt_len = len(gt_values)
+    is_failure = bool(format_score < 0 or length_hard_fail or (gt_len > 0 and pred_len != gt_len))
+    raw_text = solution_str or ""
+    parsed_answer = extract_answer(raw_text)
+    was_clipped = bool(
+        format_failure_reason == "missing_answer_close_tag"
+        or (pred_len > 0 and gt_len > 0 and pred_len < gt_len and not raw_text.strip().endswith("</answer>"))
+    )
+
+    payload = {
+        "data_source": data_source,
+        "sample_uid": sample_uid,
+        "output_source": output_source,
+        "is_failure": is_failure,
+        "was_clipped": was_clipped,
+        "format_failure_reason": format_failure_reason,
+        "length_hard_fail": bool(length_hard_fail),
+        "strict_length_match": bool(strict_length_match),
+        "has_answer_tag": bool(has_answer_tag),
+        "pred_len": pred_len,
+        "gt_len": gt_len,
+        "num_values": pred_len,
+        "format_score": float(format_score),
+        "length_score": float(length_score),
+        "mse_score": float(mse_score),
+        "final_score": float(final_score),
+        "raw_mse": raw_mse,
+        "raw_mae": raw_mae,
+        "_debug_file": turn3_generation_debug_file(),
+    }
+
+    if is_failure:
+        payload.update(
+            {
+                "raw_model_output": raw_text,
+                "parsed_answer_text": parsed_answer,
+                "parsed_values": pred_values,
+                "ground_truth_values": gt_values,
+                "ground_truth_text": ground_truth,
+                "_force_log": True,
+            }
+        )
+    else:
+        payload.update(
+            {
+                "raw_model_output_head": short_text(raw_text, 500),
+                "parsed_answer_head": short_text(parsed_answer, 500),
+                "parsed_values_head": pred_values[:20],
+                "ground_truth_values_head": gt_values[:20],
+                "_sample_rate": TURN3_SUCCESS_SAMPLE_RATE,
+            }
+        )
+
+    append_chain_debug("turn3_generation_debug", payload)
 
 
 class moving_avg(nn.Module):
@@ -153,16 +245,17 @@ def extract_values_from_time_series_string(text: str) -> List[float]:
             except ValueError:
                 pass
     
-    append_chain_debug(
-        "reward_parse_extract",
-        {
-            "has_answer_tag": bool(re.search(r"<answer>(.*?)</answer>", raw_text or "", re.DOTALL)),
-            "raw_text_head": short_text(raw_text, 300),
-            "parsed_answer_head": short_text(text, 300),
-            "num_values": len(values),
-            "values_head": values[:10],
-        },
-    )
+    if os.getenv("TS_REWARD_PARSE_DEBUG", "0").lower() in {"1", "true", "yes", "on"}:
+        append_chain_debug(
+            "reward_parse_extract",
+            {
+                "has_answer_tag": bool(re.search(r"<answer>(.*?)</answer>", raw_text or "", re.DOTALL)),
+                "raw_text_head": short_text(raw_text, 300),
+                "parsed_answer_head": short_text(text, 300),
+                "num_values": len(values),
+                "values_head": values[:10],
+            },
+        )
     return values
 
 
@@ -470,6 +563,25 @@ def compute_score(
         Total reward score
     """
     if solution_str is None:
+        append_turn3_generation_debug(
+            data_source=data_source,
+            solution_str=solution_str,
+            ground_truth=ground_truth,
+            sample_uid=(extra_info or {}).get("uid"),
+            output_source=(extra_info or {}).get("output_source"),
+            format_score=-1.0,
+            length_score=0.0,
+            mse_score=0.0,
+            final_score=-1.0,
+            raw_mse=float("nan"),
+            raw_mae=float("nan"),
+            format_failure_reason="empty_solution",
+            length_hard_fail=False,
+            strict_length_match=bool(STRICT_LENGTH_MATCH),
+            has_answer_tag=False,
+            pred_values=[],
+            gt_values=[],
+        )
         append_chain_debug(
             "reward_compute",
             {
@@ -583,6 +695,26 @@ def compute_score(
             "length_hard_fail": bool(length_hard_fail),
             "strict_length_match": bool(STRICT_LENGTH_MATCH),
         },
+    )
+
+    append_turn3_generation_debug(
+        data_source=data_source,
+        solution_str=solution_str,
+        ground_truth=ground_truth,
+        sample_uid=(extra_info or {}).get("uid"),
+        output_source=(extra_info or {}).get("output_source"),
+        format_score=float(format_score),
+        length_score=float(length_score),
+        mse_score=float(mse_score),
+        final_score=float(score),
+        raw_mse=raw_mse,
+        raw_mae=raw_mae,
+        format_failure_reason=format_failure_reason,
+        length_hard_fail=bool(length_hard_fail),
+        strict_length_match=bool(STRICT_LENGTH_MATCH),
+        has_answer_tag=has_answer_tag,
+        pred_values=pred_values,
+        gt_values=gt_values,
     )
 
     return {

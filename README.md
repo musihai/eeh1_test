@@ -40,17 +40,18 @@ examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
 - `GPU0,1,2` 跑 SFT / RL
 - 基础模型默认是 `/data/linyujie/models/Qwen3-1.7B`
 - 默认 logger 只用 `console`，不会主动连接 `swanlab`
-- RL 默认按多轮 agent 的实际长度预算配置：`max_prompt_length=8192`、`actor_max_token_len_per_gpu=16384`
+- RL 默认长度预算（按当前 profile）：`max_prompt_length=4096`、`actor_max_token_len_per_gpu=8192`
 - RL 默认强制 `actor_rollout_ref.rollout.load_format=safetensors`，不要再用默认 `dummy`
 - RL 默认 `test_freq=5`
 - RL 默认 `data.dataloader_num_workers=0`，避免 `StatefulDataLoader` 在训练结束时出现 worker 被系统回收的退出噪声
+- RL 开启 `DEBUG_CHAIN=1` 时，默认调试文件路径是 `logs/debug/ts_chain_debug.jsonl`
 
 关键脚本：
 
-- 工具服务：[start_model_server.sh](/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/recipe/time_series_forecast/start_model_server.sh)
-- 高质量 SFT 构建：[build_etth1_high_quality_sft.py](/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/recipe/time_series_forecast/build_etth1_high_quality_sft.py)
-- SFT 训练：[run_qwen3-1.7B_sft.sh](/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/examples/time_series_forecast/run_qwen3-1.7B_sft.sh)
-- RL 训练：[run_qwen3-1.7B.sh](/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/examples/time_series_forecast/run_qwen3-1.7B.sh)
+- 工具服务：[start_model_server.sh](recipe/time_series_forecast/start_model_server.sh)
+- 高质量 SFT 构建：[build_etth1_high_quality_sft.py](recipe/time_series_forecast/build_etth1_high_quality_sft.py)
+- SFT 训练：[run_qwen3-1.7B_sft.sh](examples/time_series_forecast/run_qwen3-1.7B_sft.sh)
+- RL 训练：[run_qwen3-1.7B.sh](examples/time_series_forecast/run_qwen3-1.7B.sh)
 
 ## 推荐直接执行的流程
 
@@ -250,6 +251,21 @@ examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
 ```
 
 - 启动脚本要求传 `PROFILE_PATH`；优先级固定为：**命令行覆盖 > 环境变量 > profile 默认值**。
+
+### 6) 服务器上 `git push` 认证失败（`Permission denied (publickey)`）
+
+- 原因：浏览器登录 GitHub 不等于服务器里的 git 凭证；且当前环境需要走代理，SSH 更容易失败。
+- 推荐：直接用 HTTPS + PAT，并固定 git 代理。
+
+```bash
+git remote set-url origin https://github.com/musihai/eeh1_test.git
+git config --global http.proxy http://127.0.0.1:7897
+git config --global https.proxy http://127.0.0.1:7897
+git config --global credential.helper store
+git push origin main
+```
+
+- 首次 push 输入 GitHub 用户名与 PAT，后续会复用缓存凭证。
 
 ## 清理 Ray
 
