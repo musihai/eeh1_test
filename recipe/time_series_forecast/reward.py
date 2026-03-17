@@ -12,7 +12,7 @@ from verl.utils.chain_debug import append_chain_debug, short_text
 # Strict ablation setting: only keep format, length, and MSE rewards.
 ENABLE_CHANGE_POINT_SCORE = False
 ENABLE_SEASON_TREND_SCORE = False
-STRICT_LENGTH_MATCH = os.getenv("TS_REWARD_STRICT_LENGTH", "1").lower() in {"1", "true", "yes", "on"}
+STRICT_RAW_MODE = True
 TURN3_SUCCESS_SAMPLE_RATE = max(int(os.getenv("TS_TURN3_SUCCESS_SAMPLE_RATE", "100") or 100), 1)
 
 
@@ -39,26 +39,28 @@ def append_turn3_generation_debug(
     output_source: Optional[str],
     format_score: float,
     length_score: float,
+    length_penalty: float,
     mse_score: float,
     final_score: float,
     raw_mse: float,
     raw_mae: float,
     format_failure_reason: str,
-    length_hard_fail: bool,
-    strict_length_match: bool,
     has_answer_tag: bool,
+    has_answer_open: bool,
+    has_answer_close: bool,
     pred_values: List[float],
     gt_values: List[float],
 ) -> None:
     pred_len = len(pred_values)
     gt_len = len(gt_values)
-    is_failure = bool(format_score < 0 or length_hard_fail or (gt_len > 0 and pred_len != gt_len))
+    len_gap = abs(pred_len - gt_len) if gt_len > 0 else pred_len
+    is_failure = bool(format_score < 0 or (gt_len > 0 and pred_len != gt_len))
     raw_text = solution_str or ""
     parsed_answer = extract_answer(raw_text)
-    was_clipped = bool(
-        format_failure_reason == "missing_answer_close_tag"
-        or (pred_len > 0 and gt_len > 0 and pred_len < gt_len and not raw_text.strip().endswith("</answer>"))
-    )
+    was_clipped = bool(format_failure_reason == "missing_answer_close_tag")
+    under_generation = bool(gt_len > 0 and pred_len < gt_len)
+    over_generation = bool(gt_len > 0 and pred_len > gt_len)
+    exact_generation = bool(gt_len > 0 and pred_len == gt_len)
 
     payload = {
         "data_source": data_source,
@@ -66,19 +68,27 @@ def append_turn3_generation_debug(
         "output_source": output_source,
         "is_failure": is_failure,
         "was_clipped": was_clipped,
+        "strict_raw_mode": bool(STRICT_RAW_MODE),
         "format_failure_reason": format_failure_reason,
-        "length_hard_fail": bool(length_hard_fail),
-        "strict_length_match": bool(strict_length_match),
         "has_answer_tag": bool(has_answer_tag),
+        "has_answer_open": bool(has_answer_open),
+        "has_answer_close": bool(has_answer_close),
+        "raw_pred_len": pred_len,
         "pred_len": pred_len,
         "gt_len": gt_len,
         "num_values": pred_len,
+        "len_gap": int(len_gap),
+        "under_generation": under_generation,
+        "over_generation": over_generation,
+        "exact_generation": exact_generation,
         "format_score": float(format_score),
         "length_score": float(length_score),
+        "length_penalty": float(length_penalty),
         "mse_score": float(mse_score),
         "final_score": float(final_score),
         "raw_mse": raw_mse,
         "raw_mae": raw_mae,
+        "raw_text_tail": extract_tail_lines(raw_text, 10),
         "_debug_file": turn3_generation_debug_file(),
     }
 
@@ -340,6 +350,30 @@ def compute_length_score(solution_str: str, ground_truth: str) -> float:
         return 0.1 * len(pred_values) / len(gt_values)
 
 
+def compute_length_penalty(pred_len: int, gt_len: int) -> float:
+    if gt_len <= 0:
+        return 0.0
+
+    len_gap = abs(pred_len - gt_len)
+    if len_gap == 0:
+        penalty = 0.0
+    elif len_gap <= 2:
+        penalty = 0.05
+    elif len_gap <= 5:
+        penalty = 0.10
+    elif len_gap <= 20:
+        penalty = 0.20
+    elif len_gap <= 100:
+        penalty = 0.30
+    else:
+        penalty = 0.40
+
+    if pred_len > gt_len:
+        penalty += min((pred_len - gt_len) / gt_len, 1.0) * 0.1
+
+    return float(penalty)
+
+
 def compute_mse_score(solution_str: str, ground_truth: str) -> float:
     """
     Compute score based on MSE between prediction and ground truth.
@@ -571,14 +605,15 @@ def compute_score(
             output_source=(extra_info or {}).get("output_source"),
             format_score=-1.0,
             length_score=0.0,
+            length_penalty=0.0,
             mse_score=0.0,
             final_score=-1.0,
             raw_mse=float("nan"),
             raw_mae=float("nan"),
             format_failure_reason="empty_solution",
-            length_hard_fail=False,
-            strict_length_match=bool(STRICT_LENGTH_MATCH),
             has_answer_tag=False,
+            has_answer_open=False,
+            has_answer_close=False,
             pred_values=[],
             gt_values=[],
         )
@@ -586,13 +621,18 @@ def compute_score(
             "reward_compute",
             {
                 "data_source": data_source,
+                "strict_raw_mode": bool(STRICT_RAW_MODE),
                 "format_score": -1.0,
                 "length_score": 0.0,
+                "length_penalty": 0.0,
                 "mse_score": 0.0,
                 "final_score": -1.0,
+                "raw_pred_len": 0,
                 "pred_len": 0,
                 "gt_len": 0,
                 "has_answer_tag": False,
+                "has_answer_open": False,
+                "has_answer_close": False,
                 "first_5_pred_values": [],
                 "first_5_gt_values": [],
                 "raw_model_output_head": "",
@@ -604,58 +644,60 @@ def compute_score(
             "score": -1.0,
             "format_score": -1.0,
             "length_score": 0.0,
+            "length_penalty": 0.0,
             "mse_score": 0.0,
             "raw_mse": float("nan"),
             "raw_mae": float("nan"),
             "format_failure_reason": "empty_solution",
-            "length_hard_fail": False,
-            "strict_length_match": bool(STRICT_LENGTH_MATCH),
+            "len_gap": 0,
+            "under_generation": False,
+            "over_generation": False,
+            "exact_generation": False,
+            "strict_raw_mode": bool(STRICT_RAW_MODE),
         }
 
     score = 0.0
     has_answer_tag = bool(re.search(r"<answer>(.*?)</answer>", solution_str or "", re.DOTALL))
+    has_answer_open = bool("<answer>" in (solution_str or ""))
+    has_answer_close = bool("</answer>" in (solution_str or ""))
     pred_values = extract_values_from_time_series_string(solution_str)
     gt_values = extract_ground_truth_values(ground_truth)
     pred_len = len(pred_values)
     gt_len = len(gt_values)
+    len_gap = abs(pred_len - gt_len) if gt_len > 0 else pred_len
+    under_generation = bool(gt_len > 0 and pred_len < gt_len)
+    over_generation = bool(gt_len > 0 and pred_len > gt_len)
+    exact_generation = bool(gt_len > 0 and pred_len == gt_len)
 
     # 1. Format score
     format_score = compute_format_score(solution_str)
     score += format_score
 
-    # 2. Length score
+    # 2. Length components (continuous penalty, no hard fail)
     length_score = 0.0
+    length_penalty = 0.0
     format_failure_reason = "ok"
-    length_hard_fail = False
     if format_score < 0:
         format_failure_reason = infer_format_failure_reason(solution_str)
-    elif STRICT_LENGTH_MATCH and gt_len > 0 and pred_len != gt_len:
-        # Hard constraint mode: prediction length must exactly match ground truth length.
-        length_hard_fail = True
-        format_failure_reason = f"length_mismatch:{pred_len}!={gt_len}"
-        score = -1.0
     elif gt_len > 0 and format_score >= 0:
-        if STRICT_LENGTH_MATCH:
-            length_score = 0.1
-        elif pred_len >= gt_len:
-            length_score = 0.1
-        else:
-            length_score = 0.1 * pred_len / gt_len
-        score += length_score
+        if pred_len != gt_len:
+            format_failure_reason = f"length_mismatch:{pred_len}!={gt_len}"
+        length_penalty = compute_length_penalty(pred_len, gt_len)
 
     # 3. MSE score (main accuracy metric)
     mse_score = 0.0
     raw_mse: float = float("nan")
     raw_mae: float = float("nan")
-    if format_score >= 0 and (not length_hard_fail) and gt_len > 0 and pred_len > 0:
+    if format_score >= 0 and gt_len > 0 and pred_len > 0:
         min_len = min(pred_len, gt_len)
         norm_pred, norm_gt = normalize_for_reward(pred_values[:min_len], gt_values[:min_len])
         raw_mse = float(mean_squared_error(norm_gt, norm_pred))
         raw_mae = float(np.mean(np.abs(np.asarray(norm_gt) - np.asarray(norm_pred))))
         mse_trans = 1.0 / (1.0 + np.log1p(raw_mse))
-        length_ratio = min(pred_len / gt_len, 1.0)
-        mse_score = mse_trans * length_ratio * 0.6
-        score += mse_score
+        mse_score = mse_trans * 0.6
+
+    score += mse_score
+    score -= length_penalty
     
     if ENABLE_CHANGE_POINT_SCORE and format_score >= 0:
         try:
@@ -674,15 +716,24 @@ def compute_score(
         {
             "data_source": data_source,
             "sample_uid": (extra_info or {}).get("uid"),
+            "strict_raw_mode": bool(STRICT_RAW_MODE),
             "format_score": float(format_score),
             "length_score": float(length_score),
+            "length_penalty": float(length_penalty),
             "mse_score": float(mse_score),
             "raw_mse": raw_mse,
             "raw_mae": raw_mae,
             "final_score": float(score),
+            "raw_pred_len": pred_len,
             "pred_len": pred_len,
             "gt_len": gt_len,
+            "len_gap": int(len_gap),
+            "under_generation": under_generation,
+            "over_generation": over_generation,
+            "exact_generation": exact_generation,
             "has_answer_tag": has_answer_tag,
+            "has_answer_open": has_answer_open,
+            "has_answer_close": has_answer_close,
             "first_5_pred_values": pred_values[:5],
             "first_5_gt_values": gt_values[:5],
             "raw_model_output_head": short_text(solution_str, 500),
@@ -692,8 +743,8 @@ def compute_score(
             "parsed_values": pred_values[:50],
             "output_source": (extra_info or {}).get("output_source"),
             "format_failure_reason": format_failure_reason,
-            "length_hard_fail": bool(length_hard_fail),
-            "strict_length_match": bool(STRICT_LENGTH_MATCH),
+            "length_hard_fail": False,
+            "strict_length_match": False,
         },
     )
 
@@ -705,14 +756,15 @@ def compute_score(
         output_source=(extra_info or {}).get("output_source"),
         format_score=float(format_score),
         length_score=float(length_score),
+        length_penalty=float(length_penalty),
         mse_score=float(mse_score),
         final_score=float(score),
         raw_mse=raw_mse,
         raw_mae=raw_mae,
         format_failure_reason=format_failure_reason,
-        length_hard_fail=bool(length_hard_fail),
-        strict_length_match=bool(STRICT_LENGTH_MATCH),
         has_answer_tag=has_answer_tag,
+        has_answer_open=has_answer_open,
+        has_answer_close=has_answer_close,
         pred_values=pred_values,
         gt_values=gt_values,
     )
@@ -721,10 +773,16 @@ def compute_score(
         "score": float(score),
         "format_score": float(format_score),
         "length_score": float(length_score),
+        "length_penalty": float(length_penalty),
         "mse_score": float(mse_score),
         "raw_mse": raw_mse,
         "raw_mae": raw_mae,
         "format_failure_reason": format_failure_reason,
-        "length_hard_fail": bool(length_hard_fail),
-        "strict_length_match": bool(STRICT_LENGTH_MATCH),
+        "len_gap": int(len_gap),
+        "under_generation": under_generation,
+        "over_generation": over_generation,
+        "exact_generation": exact_generation,
+        "strict_raw_mode": bool(STRICT_RAW_MODE),
+        "length_hard_fail": False,
+        "strict_length_match": False,
     }

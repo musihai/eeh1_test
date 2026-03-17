@@ -90,11 +90,13 @@ STRICT OUTPUT CONSTRAINTS (Turn 3):
 - <answer> must contain EXACTLY 96 lines.
 - Each line must be a single numeric value (float), no timestamp.
 - One value per line; no table, no bullets, no prose.
-- Do NOT stop at 94 or 95 values.
+- Stop immediately after the 96th value.
+- Do NOT generate a 97th value.
 - After the 96th value, immediately output </answer>.
 - Do not omit closing </answer>.
 - Do not output any text after </answer>.
 - Do not output markdown/code fences.
+- Keep <think> to ONE short sentence.
 
 ## CRITICAL RULES
 - Turn 1: Feature extraction ONLY. Do NOT call predict_time_series.
@@ -132,7 +134,9 @@ def get_runtime_turn_info(
     return 3, (
         "Output your final answer in <think>...</think><answer>...</answer> format using the model predictions. "
         "Do NOT output any text outside these tags. <answer> must contain exactly 96 lines, one numeric value per line, no timestamps. "
-        "Do not stop at 94/95 lines. After the 96th value, immediately close with </answer>, and do not output any text after it."
+        "Stop immediately after the 96th value. Do not generate a 97th value. "
+        "After the 96th value, immediately close with </answer>, and do not output any text after it. "
+        "Keep <think> to one short sentence."
     )
 
 
@@ -170,12 +174,11 @@ def build_runtime_user_prompt(
 4. Output ONLY <think>...</think> and <answer>...</answer>. Do not include anything else.
 5. <answer> must contain EXACTLY {forecast_horizon} lines.
 6. Each line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
-7. Do not stop at 94 or 95 lines.
+7. Stop immediately after the {forecast_horizon}th value, and do NOT generate any extra value.
 8. After the {forecast_horizon}th value, immediately output </answer>, with no extra text after it.
+9. Keep <think> to ONE short sentence.
 
-<think>
-[Reflection on the consistency between feature evidence and forecast values]
-</think>
+<think>[One short sentence reflecting consistency between features and forecast]</think>
 
 <answer>
 [Final prediction after reflection and refinement]

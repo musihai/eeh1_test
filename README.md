@@ -12,9 +12,10 @@
 - runtime 不再把完整多轮对话当作 memory；只保留紧凑状态：`history_analysis` 和 `prediction_tool_output`
 - 工具轮不再保留冗长 assistant prose，只保留实际 tool effects
 - `predict_time_series` 的 tool 输出改为“单个起始时间戳 + 频率 + 纯数值 forecast values”
-- 最终 `<answer>` 统一为 96 行纯数值（无时间戳），与当前 prompt / reward 严格长度约束一致
+- 最终 `<answer>` 统一为 96 行纯数值（无时间戳）
 - reward 默认使用严格 ablation：只保留格式、长度和 MSE，关闭 change point / season-trend 附加项
-- 正式 RL 目标仍是完整 `<answer>...</answer>`；同时 runtime 增加 near-complete 回退（当 `<answer>` 未闭合但数值接近完整时可提取）以减少无效样本
+- 训练主口径统一使用 strict_raw（原始 Turn3 输出），不使用 fallback_normalized 修补路径
+- 长度项采用分段惩罚：少写和多写都惩罚，偏差越大惩罚越重
 
 ## 环境
 
@@ -205,7 +206,7 @@ python recipe/time_series_forecast/validate_turn3_format.py \
 说明：
 
 - RL 默认 `resume_mode=auto`。同一个 `RL_EXP_NAME` 下再次运行，不会从头覆盖，而是会自动续跑最近的 checkpoint。
-- reward 默认开启严格长度约束（`TS_REWARD_STRICT_LENGTH=1`）：`pred_len != gt_len` 直接视为不合法答案并给 `-1.0`。如需回退旧行为可临时设置 `TS_REWARD_STRICT_LENGTH=0`。
+- reward 采用分段长度惩罚（不是 `pred_len!=96` 一刀切判死）：95/94 会轻中度惩罚，像 585 这类 over-generation 会重惩罚。
 - 如果当前实验已经跑到 `100 step`，再写 `trainer.total_training_steps=100` 通常不会继续训练；续跑时要把总步数设得更大，比如 `200`。
 - 如果你想完全重新开始，请换一个新的 `RL_EXP_NAME`，或者加 `trainer.resume_mode=disable`。
 - 当前这条 ETTh1/OT 训练链路里，`vLLM + load_format=dummy` 会导致 rollout 输出异常长的乱码文本，表现为 `response_length=3072`、`reward=0`。
