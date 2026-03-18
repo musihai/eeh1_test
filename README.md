@@ -50,9 +50,36 @@ examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
 关键脚本：
 
 - 工具服务：[start_model_server.sh](recipe/time_series_forecast/start_model_server.sh)
+- 专家模型重训（仅 train split + provenance）：[retrain_expert_models_train_split.py](recipe/time_series_forecast/retrain_expert_models_train_split.py)
 - 高质量 SFT 构建：[build_etth1_high_quality_sft.py](recipe/time_series_forecast/build_etth1_high_quality_sft.py)
 - SFT 训练：[run_qwen3-1.7B_sft.sh](examples/time_series_forecast/run_qwen3-1.7B_sft.sh)
 - RL 训练：[run_qwen3-1.7B.sh](examples/time_series_forecast/run_qwen3-1.7B.sh)
+
+### 专家模型重训（防泄露口径）
+
+若你要明确规避 “PatchTST / iTransformer 是否看过 val/test” 的不确定性，建议先重训这两个专家模型，且**只使用 ETTh1 train split**。
+
+```bash
+python recipe/time_series_forecast/retrain_expert_models_train_split.py \
+  --csv-path dataset/ETT-small/ETTh1.csv \
+  --models patchtst,itransformer \
+  --train-rows 12251 \
+  --val-rows 1913 \
+  --test-rows 3256 \
+  --target-column OT \
+  --lookback-window 96 \
+  --forecast-horizon 96 \
+  --device cuda
+```
+
+脚本会覆盖写入：
+
+- `recipe/time_series_forecast/models/patchtst/checkpoint.pth`
+- `recipe/time_series_forecast/models/patchtst/provenance.json`
+- `recipe/time_series_forecast/models/itransformer/checkpoint.pth`
+- `recipe/time_series_forecast/models/itransformer/provenance.json`
+
+其中 `provenance.json` 包含数据路径、split 边界、训练命令、代码版本（git commit）以及 checkpoint/config 的 sha256 哈希。
 
 ## 推荐直接执行的流程
 

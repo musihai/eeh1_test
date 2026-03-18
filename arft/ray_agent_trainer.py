@@ -21,6 +21,8 @@ This trainer supports model-agonistic model initialization with huggingface
 import gc
 import json
 import os
+import random
+import re
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -217,6 +219,257 @@ class RayAgentTrainer(RayPPOTrainer):
         super().__init__(*args, **kwargs)
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+
+    @staticmethod
+    def _to_float_list(values, n: int, default: float = float("nan")) -> list[float]:
+        if values is None:
+            return [default] * n
+        out: list[float] = []
+        for i in range(n):
+            try:
+                out.append(float(values[i]))
+            except Exception:
+                out.append(default)
+        return out
+
+    @staticmethod
+    def _to_bool_list(values, n: int, default: bool = False) -> list[bool]:
+        if values is None:
+            return [default] * n
+        out: list[bool] = []
+        for i in range(n):
+            try:
+                value = values[i]
+                if isinstance(value, str):
+                    out.append(value.strip().lower() in {"1", "true", "yes", "on"})
+                else:
+                    out.append(bool(value))
+            except Exception:
+                out.append(default)
+        return out
+
+    @staticmethod
+    def _to_str_list(values, n: int, default: str = "") -> list[str]:
+        if values is None:
+            return [default] * n
+        out: list[str] = []
+        for i in range(n):
+            try:
+                value = values[i]
+                if value is None:
+                    out.append(default)
+                else:
+                    out.append(str(value))
+            except Exception:
+                out.append(default)
+        return out
+
+    @staticmethod
+    def _percentile(values: list[float], q: float) -> float:
+        finite = [float(v) for v in values if isinstance(v, (int, float)) and np.isfinite(v)]
+        if not finite:
+            return float("nan")
+        return float(np.percentile(np.asarray(finite, dtype=np.float64), q))
+
+    @staticmethod
+    def _extract_values_from_text(text: str) -> list[float]:
+        values: list[float] = []
+        if not text:
+            return values
+        answer_match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
+        body = answer_match.group(1) if answer_match else text
+        for line in str(body).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = re.search(r"(-?\d+\.?\d*)$", line)
+            if not match:
+                continue
+            try:
+                values.append(float(match.group(1)))
+            except Exception:
+                continue
+        return values
+
+    @staticmethod
+    def _tail_lines(text: str, max_lines: int = 10) -> list[str]:
+        if not text:
+            return []
+        return str(text).splitlines()[-max_lines:]
+
+    @staticmethod
+    def _normalized_mse_mae(pred_values: list[float], gt_values: list[float]) -> tuple[float, float]:
+        if not pred_values or not gt_values:
+            return float("nan"), float("nan")
+        n = min(len(pred_values), len(gt_values))
+        if n <= 0:
+            return float("nan"), float("nan")
+        pred = np.asarray(pred_values[:n], dtype=np.float64)
+        gt = np.asarray(gt_values[:n], dtype=np.float64)
+        mu = float(np.nanmean(gt))
+        std = max(float(np.nanstd(gt)), 1e-8)
+        pred_n = (pred - mu) / std
+        gt_n = (gt - mu) / std
+        diff = pred_n - gt_n
+        mse = float(np.mean(diff ** 2))
+        mae = float(np.mean(np.abs(diff)))
+        return mse, mae
+
+    def _write_min_eval_debug_files(
+        self,
+        *,
+        sample_uids: list,
+        sample_outputs: list,
+        sample_gts: list,
+        sample_scores: list[float],
+        reward_extra_infos_dict: dict[str, list],
+    ) -> None:
+        n = len(sample_scores)
+        if n <= 0:
+            return
+
+        pred_len = self._to_float_list(reward_extra_infos_dict.get("pred_len"), n)
+        raw_mse = self._to_float_list(reward_extra_infos_dict.get("raw_mse"), n)
+        raw_mae = self._to_float_list(reward_extra_infos_dict.get("raw_mae"), n)
+        has_answer_tag = self._to_bool_list(reward_extra_infos_dict.get("has_answer_tag"), n)
+        has_answer_close = self._to_bool_list(reward_extra_infos_dict.get("has_answer_close"), n)
+        was_clipped = self._to_bool_list(reward_extra_infos_dict.get("was_clipped"), n)
+        format_failure_reason = self._to_str_list(reward_extra_infos_dict.get("format_failure_reason"), n)
+        length_hard_fail = self._to_float_list(reward_extra_infos_dict.get("length_hard_fail"), n, default=0.0)
+        trainer_seq_score = self._to_float_list(
+            reward_extra_infos_dict.get("trainer_seq_score") or reward_extra_infos_dict.get("score"),
+            n,
+            default=float("nan"),
+        )
+        selected_model = self._to_str_list(
+            reward_extra_infos_dict.get("selected_model")
+            or reward_extra_infos_dict.get("prediction_model_used")
+            or reward_extra_infos_dict.get("output_source"),
+            n,
+            default="unknown",
+        )
+
+        pred_len_arr = np.asarray(pred_len, dtype=np.float64)
+        valid_pred_len = np.isfinite(pred_len_arr)
+
+        is_96 = (pred_len_arr == 96)
+        is_94_95 = np.logical_or(pred_len_arr == 94, pred_len_arr == 95)
+        is_lt_96 = pred_len_arr < 96
+        is_gt_96 = pred_len_arr > 96
+        missing_close = np.asarray([reason == "missing_answer_close_tag" for reason in format_failure_reason], dtype=bool)
+
+        success_mask = np.logical_and.reduce(
+            [
+                is_96,
+                np.asarray(has_answer_tag, dtype=bool),
+                np.asarray(has_answer_close, dtype=bool),
+                np.asarray([np.isfinite(v) for v in raw_mse], dtype=bool),
+                np.asarray([np.isfinite(v) for v in raw_mae], dtype=bool),
+            ]
+        )
+
+        success_mse_values = [raw_mse[i] for i in range(n) if success_mask[i] and np.isfinite(raw_mse[i])]
+        success_mae_values = [raw_mae[i] for i in range(n) if success_mask[i] and np.isfinite(raw_mae[i])]
+        reward_values = [float(v) for v in sample_scores if isinstance(v, (int, float)) and np.isfinite(v)]
+        length_hard_fail_values = [float(v) for v in length_hard_fail if np.isfinite(v)]
+        trainer_seq_values = [float(v) for v in trainer_seq_score if np.isfinite(v)]
+
+        total = float(n)
+        agg_row = {
+            "step": int(self.global_steps),
+            "total_samples": int(n),
+            "pred_len_96_ratio": float(np.sum(is_96) / total),
+            "pred_len_94_95_ratio": float(np.sum(is_94_95) / total),
+            "pred_len_lt_96_ratio": float(np.sum(np.logical_and(is_lt_96, valid_pred_len)) / total),
+            "pred_len_gt_96_ratio": float(np.sum(np.logical_and(is_gt_96, valid_pred_len)) / total),
+            "has_answer_tag_ratio": float(np.mean(np.asarray(has_answer_tag, dtype=np.float64))),
+            "has_answer_close_ratio": float(np.mean(np.asarray(has_answer_close, dtype=np.float64))),
+            "missing_answer_close_tag_count": int(np.sum(missing_close)),
+            "was_clipped_count": int(np.sum(np.asarray(was_clipped, dtype=bool))),
+            "success_raw_mse_mean": float(np.mean(success_mse_values)) if success_mse_values else float("nan"),
+            "success_raw_mse_p50": self._percentile(success_mse_values, 50),
+            "success_raw_mse_p90": self._percentile(success_mse_values, 90),
+            "success_raw_mae_mean": float(np.mean(success_mae_values)) if success_mae_values else float("nan"),
+            "success_raw_mae_p50": self._percentile(success_mae_values, 50),
+            "success_raw_mae_p90": self._percentile(success_mae_values, 90),
+            "validation_reward_mean": float(np.mean(reward_values)) if reward_values else float("nan"),
+            "length_hard_fail_mean": float(np.mean(length_hard_fail_values)) if length_hard_fail_values else float("nan"),
+            "trainer_seq_score_mean": float(np.mean(trainer_seq_values)) if trainer_seq_values else float("nan"),
+        }
+
+        all_indices = list(range(n))
+        success_indices = [i for i in all_indices if success_mask[i]]
+        near_miss_indices = [i for i in all_indices if is_94_95[i]]
+        failure_indices = [i for i in all_indices if i not in set(success_indices)]
+
+        rng = random.Random(int(self.global_steps) + 20260318)
+
+        def _sample(indices: list[int], k: int) -> list[int]:
+            if len(indices) <= k:
+                return indices
+            return rng.sample(indices, k)
+
+        pick_success = _sample(success_indices, 10)
+        pick_failure = _sample(failure_indices, 10)
+        pick_nearmiss = _sample(near_miss_indices, 10)
+
+        sample_rows: list[dict] = []
+
+        def _build_base_row(i: int, category: str) -> dict:
+            output_text = str(sample_outputs[i]) if i < len(sample_outputs) else ""
+            return {
+                "step": int(self.global_steps),
+                "category": category,
+                "sample_id": str(sample_uids[i]) if i < len(sample_uids) else f"sample_{i}",
+                "selected_model": selected_model[i],
+                "pred_len": int(pred_len_arr[i]) if np.isfinite(pred_len_arr[i]) else -1,
+                "raw_mse": float(raw_mse[i]) if np.isfinite(raw_mse[i]) else float("nan"),
+                "raw_mae": float(raw_mae[i]) if np.isfinite(raw_mae[i]) else float("nan"),
+                "has_answer_tag": bool(has_answer_tag[i]),
+                "has_answer_close": bool(has_answer_close[i]),
+                "failure_reason": format_failure_reason[i] if format_failure_reason[i] else "",
+                "raw_model_output_tail": self._tail_lines(output_text, 10),
+            }
+
+        for i in pick_success:
+            row = _build_base_row(i, "success")
+            output_text = str(sample_outputs[i]) if i < len(sample_outputs) else ""
+            gt_text = str(sample_gts[i]) if i < len(sample_gts) else ""
+            row["pred_values"] = self._extract_values_from_text(output_text)
+            row["gt_values"] = self._extract_values_from_text(gt_text)
+            sample_rows.append(row)
+
+        for i in pick_failure:
+            row = _build_base_row(i, "failure")
+            sample_rows.append(row)
+
+        for i in pick_nearmiss:
+            row = _build_base_row(i, "near_miss_94_95")
+            output_text = str(sample_outputs[i]) if i < len(sample_outputs) else ""
+            gt_text = str(sample_gts[i]) if i < len(sample_gts) else ""
+            pred_values = self._extract_values_from_text(output_text)
+            gt_values = self._extract_values_from_text(gt_text)
+            if pred_values and gt_values and len(pred_values) < len(gt_values):
+                filled_pred = list(pred_values)
+                filled_pred.extend([filled_pred[-1]] * (len(gt_values) - len(filled_pred)))
+                filled_mse, filled_mae = self._normalized_mse_mae(filled_pred, gt_values)
+            else:
+                filled_mse, filled_mae = float("nan"), float("nan")
+            row["filled_raw_mse"] = float(filled_mse)
+            row["filled_raw_mae"] = float(filled_mae)
+            sample_rows.append(row)
+
+        debug_dir = os.getenv("TS_MIN_DEBUG_DIR", os.path.join(os.getcwd(), "logs", "debug"))
+        os.makedirs(debug_dir, exist_ok=True)
+        agg_file = os.getenv("TS_MIN_EVAL_AGG_FILE", os.path.join(debug_dir, "eval_step_aggregate.jsonl"))
+        sample_file = os.getenv("TS_MIN_EVAL_SAMPLE_FILE", os.path.join(debug_dir, "eval_step_samples.jsonl"))
+
+        with open(agg_file, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(agg_row, ensure_ascii=False) + "\n")
+
+        with open(sample_file, "a", encoding="utf-8") as handle:
+            for row in sample_rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -479,6 +732,23 @@ class RayAgentTrainer(RayPPOTrainer):
                     pass  # Skip non-numeric values
         
         append_chain_debug("validation_metrics", validation_debug_info)
+
+        try:
+            self._write_min_eval_debug_files(
+                sample_uids=sample_uids,
+                sample_outputs=sample_outputs,
+                sample_gts=sample_gts,
+                sample_scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+            )
+        except Exception as exc:
+            append_chain_debug(
+                "validation_min_debug_error",
+                {
+                    "global_step": int(self.global_steps),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
 
         # if len(sample_turns) > 0:
         #     sample_turns = np.concatenate(sample_turns)

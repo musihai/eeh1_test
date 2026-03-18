@@ -598,6 +598,15 @@ def compute_score(
     Returns:
         Total reward score
     """
+    selected_model = (
+        str(
+            (extra_info or {}).get("prediction_model_used")
+            or (extra_info or {}).get("selected_model")
+            or (extra_info or {}).get("output_source")
+            or "unknown"
+        )
+    )
+
     if solution_str is None:
         append_turn3_generation_debug(
             data_source=data_source,
@@ -644,6 +653,7 @@ def compute_score(
         )
         return {
             "score": -1.0,
+            "trainer_seq_score": -1.0,
             "format_score": -1.0,
             "length_score": 0.0,
             "length_penalty": 0.0,
@@ -651,6 +661,14 @@ def compute_score(
             "raw_mse": float("nan"),
             "raw_mae": float("nan"),
             "format_failure_reason": "empty_solution",
+            "pred_len": 0,
+            "gt_len": 0,
+            "has_answer_tag": False,
+            "has_answer_open": False,
+            "has_answer_close": False,
+            "missing_answer_close_tag": False,
+            "was_clipped": False,
+            "selected_model": selected_model,
             "len_gap": 0,
             "under_generation": False,
             "over_generation": False,
@@ -773,6 +791,7 @@ def compute_score(
 
     return {
         "score": float(score),
+        "trainer_seq_score": float(score),
         "format_score": float(format_score),
         "length_score": float(length_score),
         "length_penalty": float(length_penalty),
@@ -780,6 +799,14 @@ def compute_score(
         "raw_mse": raw_mse,
         "raw_mae": raw_mae,
         "format_failure_reason": format_failure_reason,
+        "pred_len": int(pred_len),
+        "gt_len": int(gt_len),
+        "has_answer_tag": bool(has_answer_tag),
+        "has_answer_open": bool(has_answer_open),
+        "has_answer_close": bool(has_answer_close),
+        "missing_answer_close_tag": bool(format_failure_reason == "missing_answer_close_tag"),
+        "was_clipped": bool(format_failure_reason == "missing_answer_close_tag"),
+        "selected_model": selected_model,
         "len_gap": int(len_gap),
         "under_generation": under_generation,
         "over_generation": over_generation,
