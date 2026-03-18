@@ -357,14 +357,16 @@ def compute_length_penalty(pred_len: int, gt_len: int) -> float:
     len_gap = abs(pred_len - gt_len)
     if len_gap == 0:
         penalty = 0.0
-    elif len_gap <= 2:
-        penalty = 0.05
+    elif len_gap == 1:
+        penalty = 0.08
+    elif len_gap == 2:
+        penalty = 0.12
     elif len_gap <= 5:
-        penalty = 0.10
+        penalty = 0.16
     elif len_gap <= 20:
-        penalty = 0.20
+        penalty = 0.24
     elif len_gap <= 100:
-        penalty = 0.30
+        penalty = 0.32
     else:
         penalty = 0.40
 

@@ -173,9 +173,9 @@ TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_eval5_test.jsonl \
 MODEL_PATH=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_new/global_step_11/huggingface \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
 RUN_MODE=train \
-RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_gpu012_eval5_test \
+RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_gpu012_eval5_test_reward \
 bash examples/time_series_forecast/run_qwen3-1.7B.sh \
-  trainer.total_training_steps=100 \
+  trainer.total_training_steps=20 \
   trainer.test_freq=5 \
   trainer.resume_mode=disable
 ```
