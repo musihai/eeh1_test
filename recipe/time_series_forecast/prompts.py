@@ -69,10 +69,10 @@ Call one or more feature extraction tools. Do NOT call predict_time_series yet.
 
 **Turn 2 - Prediction**:
 After seeing feature results in "Analysis History", call `predict_time_series` with the chosen model:
-- 'patchtst': Usually strong for ETTh1-like seasonal univariate patterns
-- 'arima': Good when trend/seasonality is stable and mostly linear
-- 'chronos2': Good fallback for irregular or noisy windows
-- 'itransformer': Available, but usually less preferred for single-variable inputs
+- 'patchtst': useful when the window is smooth and shows strong local periodicity
+- 'arima': useful when trend/seasonality is stable and mostly linear
+- 'chronos2': useful fallback for irregular or noisy windows
+- 'itransformer': useful when the window shows regime changes or longer-range dependencies
 
 **Turn 3 - Final Output**:
 Reflect on feature analysis and model predictions, refine unreasonable results, and output the final forecast.
@@ -223,9 +223,10 @@ PREDICT_TIMESERIES_TOOL_SCHEMA = {
         "description": (
             "PREREQUISITE: You must have called feature extraction tools first (check 'Analysis History' is not empty). "
             "Do NOT call this on Turn 1 - extract features first! "
-            "Models: 'patchtst' (preferred for ETTh1-like univariate seasonality), "
-            "'arima' (stable trend/seasonality), 'chronos2' (irregular windows), "
-            "'itransformer' (available but usually less helpful for single-variable inputs)."
+            "Models: 'patchtst' (smooth windows with local periodicity), "
+            "'arima' (stable trend/seasonality), 'chronos2' (irregular or noisy windows), "
+            "'itransformer' (regime changes or longer-range dependencies). "
+            "Choose based on extracted features rather than a fixed preference."
         ),
         "parameters": {
             "type": "object",
@@ -233,7 +234,7 @@ PREDICT_TIMESERIES_TOOL_SCHEMA = {
                 "model_name": {
                     "type": "string",
                     "description": (
-                        "Model to use. Prefer 'patchtst' or 'arima' for regular ETTh1 OT patterns."
+                        "Model to use. Choose based on the extracted features rather than a fixed preference."
                     ),
                     "enum": ["patchtst", "itransformer", "arima", "chronos2"]
                 }

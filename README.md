@@ -147,7 +147,7 @@ python recipe/time_series_forecast/build_etth1_high_quality_sft.py \
 
 ```bash
 MODEL_PATH=/data/linyujie/models/Qwen3-1.7B \
-SAVE_DIR=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_new \
+SAVE_DIR=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_v1 \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
 RUN_MODE=train \
 SFT_TRAIN_FILES=$PWD/dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/train.parquet \
@@ -217,7 +217,7 @@ export TS_MIN_DEBUG_DIR=$PWD/logs/debug/min_eval_${RUN_TS}
 export DEBUG_CHAIN=0
 mkdir -p "$TS_MIN_DEBUG_DIR"
 
-MODEL_PATH=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_new/global_step_11/huggingface \
+MODEL_PATH=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_v1/global_step_11/huggingface \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
 RUN_MODE=train \
 RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_gpu012_eval5_test_reward \

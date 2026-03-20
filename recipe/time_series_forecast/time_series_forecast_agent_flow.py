@@ -50,6 +50,7 @@ from recipe.time_series_forecast.reward import (
     compute_score,
     extract_values_from_time_series_string,
     extract_ground_truth_values,
+    normalize_for_reward,
 )
 import numpy as np
 
@@ -73,6 +74,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.prediction_tool_output = None
         self.prediction_model_used = None
         self.final_answer = None
+        self.final_answer_reject_reason = None
         self.data_source = "ETTh1"
         self.target_column = "OT"
         self.parse_error_message = None
@@ -118,6 +120,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.prediction_tool_output = None
         self.prediction_model_used = None
         self.final_answer = None
+        self.final_answer_reject_reason = None
         self.basic_statistics = None
         self.within_channel_dynamics = None
         self.forecast_residuals = None
@@ -166,8 +169,12 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         if self.parse_error_message is not None:
             return await self._build_parse_failure_output(system_prompt, **kwargs)
         
-        MSE_data = np.nan
-        MAE_data = np.nan
+        orig_mse = np.nan
+        orig_mae = np.nan
+        norm_mse = np.nan
+        norm_mae = np.nan
+        pred_len = 0
+        expected_len = len(extract_ground_truth_values(ground_truth)) if ground_truth else int(self.forecast_horizon or 96)
         io_records: list[dict[str, Any]] = []
 
         num_steps = 0
@@ -244,7 +251,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     tool_output = await self._execute_tool_call(tool_call, **kwargs)
 
                 # Small reward for making progress (using tools correctly)
-                reward_score = 0.05 if tool_calls else 0.0
+                reward_score = 0.01 if tool_calls else 0.0
 
             step = AgentFlowStep(
                 prompt_ids=prompt_ids,
@@ -257,8 +264,15 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             selected_model = self.prediction_model_used or reward_extra_info.get("selected_model") or "unknown"
             reward_extra_info.update(
                 {
-                    "MSE": MSE_data,
-                    "MAE": MAE_data,
+                    "MSE": orig_mse,
+                    "MAE": orig_mae,
+                    "orig_mse": orig_mse,
+                    "orig_mae": orig_mae,
+                    "norm_mse": norm_mse,
+                    "norm_mae": norm_mae,
+                    "pred_len": pred_len,
+                    "expected_len": expected_len,
+                    "final_answer_reject_reason": self.final_answer_reject_reason,
                     "prediction_model_used": self.prediction_model_used,
                     "output_source": self.prediction_model_used,
                     "selected_model": selected_model,
@@ -276,27 +290,43 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             try:
                 pred_values = extract_values_from_time_series_string(self.final_answer)
                 gt_values = extract_ground_truth_values(ground_truth)
-                
-                if pred_values and gt_values:
-                    # Align lengths (use minimum length)
-                    min_len = min(len(pred_values), len(gt_values))
-                    pred_arr = np.array(pred_values[:min_len])
-                    gt_arr = np.array(gt_values[:min_len])
-                    
-                    # Calculate MSE and MAE
-                    MSE_data = float(np.mean((pred_arr - gt_arr) ** 2))
-                    MAE_data = float(np.mean(np.abs(pred_arr - gt_arr)))
-                    
-                    logger.info(f"Metrics - MSE: {MSE_data:.4f}, MAE: {MAE_data:.4f}")
+                pred_len = len(pred_values)
+                expected_len = len(gt_values)
+
+                if pred_values and gt_values and pred_len == expected_len:
+                    pred_arr = np.array(pred_values)
+                    gt_arr = np.array(gt_values)
+                    orig_mse = float(np.mean((pred_arr - gt_arr) ** 2))
+                    orig_mae = float(np.mean(np.abs(pred_arr - gt_arr)))
+                    norm_pred, norm_gt = normalize_for_reward(pred_values, gt_values)
+                    norm_pred_arr = np.array(norm_pred)
+                    norm_gt_arr = np.array(norm_gt)
+                    norm_mse = float(np.mean((norm_pred_arr - norm_gt_arr) ** 2))
+                    norm_mae = float(np.mean(np.abs(norm_pred_arr - norm_gt_arr)))
+
+                    logger.info(
+                        "Metrics - orig_mse: %.4f, orig_mae: %.4f, norm_mse: %.4f, norm_mae: %.4f",
+                        orig_mse,
+                        orig_mae,
+                        norm_mse,
+                        norm_mae,
+                    )
             except Exception as e:
-                logger.error(f"Error calculating MSE/MAE: {e}")
+                logger.error(f"Error calculating metrics: {e}")
         
         final_reward_extra_info = dict(self.steps[-1].extra_fields.get("reward_extra_info", {}) or {})
         final_selected_model = self.prediction_model_used or final_reward_extra_info.get("selected_model") or "unknown"
         final_reward_extra_info.update(
             {
-                "MSE": MSE_data,
-                "MAE": MAE_data,
+                "MSE": orig_mse,
+                "MAE": orig_mae,
+                "orig_mse": orig_mse,
+                "orig_mae": orig_mae,
+                "norm_mse": norm_mse,
+                "norm_mae": norm_mae,
+                "pred_len": pred_len,
+                "expected_len": expected_len,
+                "final_answer_reject_reason": self.final_answer_reject_reason,
                 "prediction_model_used": self.prediction_model_used,
                 "output_source": self.prediction_model_used,
                 "selected_model": final_selected_model,
@@ -370,8 +400,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         
         return False
 
-    def _expected_min_prediction_count(self) -> int:
-        return 8
+    def _expected_prediction_count(self) -> int:
+        return int(self.forecast_horizon or 96)
 
     def _extract_forecast_block(self, text: str) -> Optional[str]:
         cleaned = (
@@ -409,8 +439,30 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
     def _looks_like_forecast_answer(self, answer_text: Optional[str]) -> bool:
         if not answer_text:
             return False
+        expected = self._expected_prediction_count()
+        lines = [line.strip() for line in answer_text.splitlines() if line.strip()]
         values = extract_values_from_time_series_string(answer_text)
-        return len(values) >= self._expected_min_prediction_count()
+        if len(lines) != expected or len(values) != expected:
+            return False
+        for line in lines:
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", line) is None:
+                return False
+        return True
+
+    def _infer_final_answer_reject_reason(self, answer_text: str) -> str:
+        expected = self._expected_prediction_count()
+        lines = [line.strip() for line in answer_text.splitlines() if line.strip()]
+        values = extract_values_from_time_series_string(answer_text)
+        if not lines:
+            return "empty_answer_block"
+        if len(lines) != expected:
+            return f"invalid_answer_shape:lines={len(lines)},expected={expected}"
+        if len(values) != expected:
+            return f"invalid_answer_shape:values={len(values)},expected={expected}"
+        for line in lines:
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", line) is None:
+                return "invalid_answer_shape:non_numeric_line"
+        return "invalid_answer_shape:unknown"
 
     def _extract_final_answer(self, response_text: str) -> tuple[Optional[str], float]:
         """
@@ -422,11 +474,21 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         Returns:
             Tuple of (answer_text, format_penalty).
         """
+        self.final_answer_reject_reason = None
         match = re.search(r'<answer>(.*?)</answer>', response_text, re.DOTALL)
         if match:
             candidate = match.group(1).strip()
             if self._looks_like_forecast_answer(candidate):
                 return candidate, 0.0
+            self.final_answer_reject_reason = self._infer_final_answer_reject_reason(candidate)
+            return None, 0.0
+
+        if "<answer>" in response_text and "</answer>" not in response_text:
+            self.final_answer_reject_reason = "missing_answer_close_tag"
+        elif "</answer>" in response_text and "<answer>" not in response_text:
+            self.final_answer_reject_reason = "missing_answer_open_tag"
+        else:
+            self.final_answer_reject_reason = "missing_answer_block"
 
         return None, 0.0
 

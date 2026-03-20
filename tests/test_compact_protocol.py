@@ -2,7 +2,7 @@ import unittest
 
 import pandas as pd
 
-from recipe.time_series_forecast.prompts import build_runtime_user_prompt
+from recipe.time_series_forecast.prompts import build_runtime_user_prompt, build_timeseries_system_prompt
 from recipe.time_series_forecast.reward import (
     ENABLE_CHANGE_POINT_SCORE,
     ENABLE_SEASON_TREND_SCORE,
@@ -109,6 +109,33 @@ class CompactProtocolTests(unittest.TestCase):
             0.7,
             places=6,
         )
+        self.assertEqual(result["reward_main_scale"], "orig")
+        self.assertTrue(result["strict_length_gate"])
+        self.assertTrue(result["strict_length_match"])
+        self.assertAlmostEqual(result["orig_mse"], 0.0, places=6)
+        self.assertAlmostEqual(result["norm_mse"], 0.0, places=6)
+
+    def test_reward_length_mismatch_triggers_hard_gate(self) -> None:
+        ground_truth = (
+            "2017-05-02 00:00:00 10.0000\n"
+            "2017-05-02 01:00:00 20.0000\n"
+            "2017-05-02 02:00:00 30.0000"
+        )
+        solution = "<answer>\n10.0000\n20.0000\n</answer>"
+        result = compute_score(data_source="time_series", solution_str=solution, ground_truth=ground_truth)
+        self.assertTrue(result["length_hard_fail"])
+        self.assertFalse(result["strict_length_match"])
+        self.assertEqual(result["format_failure_reason"], "length_mismatch:2!=3")
+        self.assertEqual(result["mse_score"], 0.0)
+        self.assertAlmostEqual(result["score"], -0.55, places=6)
+        self.assertAlmostEqual(result["orig_mse"], 0.0, places=6)
+        self.assertAlmostEqual(result["norm_mse"], 0.0, places=6)
+
+    def test_system_prompt_avoids_fixed_model_preferences(self) -> None:
+        prompt = build_timeseries_system_prompt(data_source="ETTh1", target_column="OT")
+        self.assertNotIn("Usually strong for ETTh1-like seasonal univariate patterns", prompt)
+        self.assertNotIn("usually less preferred", prompt)
+        self.assertIn("smooth and shows strong local periodicity", prompt)
 
     def test_dataframe_prediction_tool_output_uses_compact_format(self) -> None:
         pred_df = pd.DataFrame(
