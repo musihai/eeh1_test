@@ -195,7 +195,7 @@ bash examples/time_series_forecast/run_qwen3-1.7B.sh \
 如果你要**新开一轮 RL 实验**，不要和当前 `etth1_ot_qwen3_1_7b_rl_gpu012` 混用，用新的实验名并禁用自动续跑：
 
 ```bash
-DEBUG_CHAIN=1 \
+DEBUG_CHAIN=0 \
 TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_eval5_test.jsonl \
 MODEL_PATH=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_new/global_step_11/huggingface \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
@@ -204,9 +204,31 @@ RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_gpu012_eval5_test_reward \
 bash examples/time_series_forecast/run_qwen3-1.7B.sh \
   trainer.total_training_steps=20 \
   trainer.test_freq=5 \
-  trainer.resume_mode=disable
-```
+  trainer.resume_mode=disable \
+  trainer.log_val_generations=0 \
 
+```
+```bash
+cd /data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main
+conda activate cast-r1-ts
+
+RUN_TS=$(date +%Y%m%d_%H%M%S)
+export TS_MIN_DEBUG_DIR=$PWD/logs/debug/min_eval_${RUN_TS}
+export DEBUG_CHAIN=0
+mkdir -p "$TS_MIN_DEBUG_DIR"
+
+MODEL_PATH=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_new/global_step_11/huggingface \
+PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
+RUN_MODE=train \
+RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_gpu012_eval5_test_reward \
+bash examples/time_series_forecast/run_qwen3-1.7B.sh \
+  trainer.total_training_steps=20 \
+  trainer.test_freq=5 \
+  trainer.resume_mode=disable \
+  trainer.log_val_generations=0 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.28 \
+  actor_rollout_ref.rollout.max_num_batched_tokens=4096
+```
 RL 输出目录：
 
 ```bash

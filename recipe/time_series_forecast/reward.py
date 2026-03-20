@@ -598,22 +598,33 @@ def compute_score(
     Returns:
         Total reward score
     """
-    selected_model = (
-        str(
-            (extra_info or {}).get("prediction_model_used")
-            or (extra_info or {}).get("selected_model")
-            or (extra_info or {}).get("output_source")
-            or "unknown"
-        )
-    )
+    extra_info_dict = extra_info or {}
+    nested_reward_info = extra_info_dict.get("reward_extra_info")
+    if not isinstance(nested_reward_info, dict):
+        nested_reward_info = {}
+
+    def _resolve_extra_value(*keys: str):
+        for key in keys:
+            value = extra_info_dict.get(key)
+            if value is not None:
+                return value
+        for key in keys:
+            value = nested_reward_info.get(key)
+            if value is not None:
+                return value
+        return None
+
+    selected_model = str(_resolve_extra_value("prediction_model_used", "selected_model", "output_source") or "unknown")
+    output_source = _resolve_extra_value("output_source", "prediction_model_used", "selected_model")
+    sample_uid = _resolve_extra_value("uid", "sample_uid")
 
     if solution_str is None:
         append_turn3_generation_debug(
             data_source=data_source,
             solution_str=solution_str,
             ground_truth=ground_truth,
-            sample_uid=(extra_info or {}).get("uid"),
-            output_source=(extra_info or {}).get("output_source"),
+            sample_uid=sample_uid,
+            output_source=output_source,
             format_score=-1.0,
             length_score=0.0,
             length_penalty=0.0,
@@ -632,6 +643,9 @@ def compute_score(
             "reward_compute",
             {
                 "data_source": data_source,
+                "sample_uid": sample_uid,
+                "selected_model": selected_model,
+                "output_source": output_source,
                 "strict_raw_mode": bool(STRICT_RAW_MODE),
                 "format_score": -1.0,
                 "length_score": 0.0,
@@ -735,7 +749,8 @@ def compute_score(
         "reward_compute",
         {
             "data_source": data_source,
-            "sample_uid": (extra_info or {}).get("uid"),
+            "sample_uid": sample_uid,
+            "selected_model": selected_model,
             "strict_raw_mode": bool(STRICT_RAW_MODE),
             "format_score": float(format_score),
             "length_score": float(length_score),
@@ -761,7 +776,7 @@ def compute_score(
             "raw_model_output_tail_10_lines": extract_tail_lines(solution_str, 10),
             "parsed_answer_tail_10_lines": extract_tail_lines(extract_answer(solution_str), 10),
             "parsed_values": pred_values[:50],
-            "output_source": (extra_info or {}).get("output_source"),
+            "output_source": output_source,
             "format_failure_reason": format_failure_reason,
             "length_hard_fail": False,
             "strict_length_match": False,
@@ -772,8 +787,8 @@ def compute_score(
         data_source=data_source,
         solution_str=solution_str,
         ground_truth=ground_truth,
-        sample_uid=(extra_info or {}).get("uid"),
-        output_source=(extra_info or {}).get("output_source"),
+        sample_uid=sample_uid,
+        output_source=output_source,
         format_score=float(format_score),
         length_score=float(length_score),
         length_penalty=float(length_penalty),

@@ -253,7 +253,18 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 reward_score=reward_score,
             )
             step = await self._postprocess(step, **kwargs)
-            step.extra_fields['reward_extra_info'] = {'MSE': MSE_data, 'MAE': MAE_data}
+            reward_extra_info = dict(step.extra_fields.get("reward_extra_info", {}) or {})
+            selected_model = self.prediction_model_used or reward_extra_info.get("selected_model") or "unknown"
+            reward_extra_info.update(
+                {
+                    "MSE": MSE_data,
+                    "MAE": MAE_data,
+                    "prediction_model_used": self.prediction_model_used,
+                    "output_source": self.prediction_model_used,
+                    "selected_model": selected_model,
+                }
+            )
+            step.extra_fields["reward_extra_info"] = reward_extra_info
             self.steps.append(step)
             
             # If final answer is detected, we can stop
@@ -280,7 +291,18 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             except Exception as e:
                 logger.error(f"Error calculating MSE/MAE: {e}")
         
-        self.steps[-1].extra_fields['reward_extra_info'] = {'MSE': MSE_data, 'MAE': MAE_data}
+        final_reward_extra_info = dict(self.steps[-1].extra_fields.get("reward_extra_info", {}) or {})
+        final_selected_model = self.prediction_model_used or final_reward_extra_info.get("selected_model") or "unknown"
+        final_reward_extra_info.update(
+            {
+                "MSE": MSE_data,
+                "MAE": MAE_data,
+                "prediction_model_used": self.prediction_model_used,
+                "output_source": self.prediction_model_used,
+                "selected_model": final_selected_model,
+            }
+        )
+        self.steps[-1].extra_fields["reward_extra_info"] = final_reward_extra_info
 
         return AgentFlowOutput(steps=self.steps, metrics=metrics)
 
