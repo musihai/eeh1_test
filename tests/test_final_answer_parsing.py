@@ -7,6 +7,7 @@ class FinalAnswerParsingTest(unittest.TestCase):
     def _make_agent(self) -> TimeSeriesForecastAgentFlow:
         agent = TimeSeriesForecastAgentFlow.__new__(TimeSeriesForecastAgentFlow)
         agent.forecast_horizon = 96
+        agent.response_length = 3072
         agent.prediction_results = "available"
         agent.final_answer_reject_reason = None
         return agent
@@ -64,6 +65,19 @@ class FinalAnswerParsingTest(unittest.TestCase):
         self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "missing_answer_block")
+
+    def test_final_turn_sampling_params_add_stop_and_cap_tokens(self) -> None:
+        agent = self._make_agent()
+        params = agent._prepare_sampling_params({"temperature": 0.3, "top_p": 0.95})
+        self.assertEqual(params["stop"], ["</answer>"])
+        self.assertTrue(params["include_stop_str_in_output"])
+        self.assertEqual(params["max_tokens"], 1024)
+
+    def test_non_final_turn_sampling_params_are_unchanged(self) -> None:
+        agent = self._make_agent()
+        agent.prediction_results = None
+        params = agent._prepare_sampling_params({"temperature": 0.3, "top_p": 0.95})
+        self.assertEqual(params, {"temperature": 0.3, "top_p": 0.95})
 
 
 if __name__ == "__main__":

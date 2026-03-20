@@ -1,11 +1,14 @@
 import asyncio
+import json
+import os
+import tempfile
 import unittest
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
 
-from arft.ray_agent_trainer import evaluate_validation_reward_manager
+from arft.ray_agent_trainer import RayAgentTrainer, evaluate_validation_reward_manager
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.naive import NaiveRewardManager
 
@@ -80,6 +83,80 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertAlmostEqual(float(reward_tensor[1, 1].item()), 0.3, places=6)
         finally:
             stale_loop.close()
+
+    def test_min_eval_debug_writer_emits_extended_metrics(self) -> None:
+        trainer = RayAgentTrainer.__new__(RayAgentTrainer)
+        trainer.global_steps = 20
+
+        gt_values = [float(i) for i in range(1, 97)]
+        gt_text = "<answer>\n" + "\n".join(f"{v:.4f}" for v in gt_values) + "\n</answer>"
+        success_output = gt_text
+        failure_output = "\n".join(f"{v:.4f}" for v in gt_values[:20])
+        near_miss_output = "<answer>\n" + "\n".join(f"{v:.4f}" for v in gt_values[:-1]) + "\n</answer>"
+
+        reward_extra_infos = {
+            "pred_len": [96, 585, 95],
+            "expected_len": [96, 96, 96],
+            "orig_mse": [0.0, float("nan"), 1.5],
+            "orig_mae": [0.0, float("nan"), 0.9],
+            "norm_mse": [0.0, float("nan"), 0.4],
+            "norm_mae": [0.0, float("nan"), 0.3],
+            "has_answer_tag": [True, False, True],
+            "has_answer_close": [True, False, True],
+            "was_clipped": [False, True, False],
+            "format_failure_reason": ["", "missing_answer_close_tag", "length_mismatch:95!=96"],
+            "final_answer_reject_reason": ["", "missing_answer_close_tag", "invalid_answer_shape:lines=95,expected=96"],
+            "length_hard_fail": [False, False, True],
+            "strict_length_match": [True, False, False],
+            "trainer_seq_score": [0.7, -1.0, -0.55],
+            "selected_model": ["itransformer", "itransformer", "chronos2"],
+            "reward_main_scale": ["orig", "orig", "orig"],
+            "generation_stop_reason": ["stop", "length", "stop"],
+        }
+
+        previous_debug_dir = os.environ.get("TS_MIN_DEBUG_DIR")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            os.environ["TS_MIN_DEBUG_DIR"] = tmp_dir
+            try:
+                trainer._write_min_eval_debug_files(
+                    sample_uids=["sample-0", "sample-1", "sample-2"],
+                    sample_outputs=[success_output, failure_output, near_miss_output],
+                    sample_gts=[gt_text, gt_text, gt_text],
+                    sample_scores=[0.7, -1.0, -0.55],
+                    reward_extra_infos_dict=reward_extra_infos,
+                )
+            finally:
+                if previous_debug_dir is None:
+                    os.environ.pop("TS_MIN_DEBUG_DIR", None)
+                else:
+                    os.environ["TS_MIN_DEBUG_DIR"] = previous_debug_dir
+
+            with open(os.path.join(tmp_dir, "eval_step_aggregate.jsonl"), "r", encoding="utf-8") as handle:
+                agg_row = json.loads(handle.readline())
+
+            self.assertAlmostEqual(agg_row["exact_96_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["final_answer_accept_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["orig_mse_mean"], 0.0, places=6)
+            self.assertAlmostEqual(agg_row["norm_mse_mean"], 0.0, places=6)
+            self.assertAlmostEqual(agg_row["length_hard_fail_ratio"], 1.0 / 3.0, places=6)
+            self.assertEqual(agg_row["selected_model_distribution"], {"chronos2": 1, "itransformer": 2})
+            self.assertEqual(agg_row["format_failure_reason_distribution"]["missing_answer_close_tag"], 1)
+            self.assertEqual(agg_row["generation_stop_reason_distribution"], {"length": 1, "stop": 2})
+            self.assertEqual(
+                agg_row["final_answer_reject_reason_distribution"]["invalid_answer_shape:lines=95,expected=96"],
+                1,
+            )
+
+            with open(os.path.join(tmp_dir, "eval_step_samples.jsonl"), "r", encoding="utf-8") as handle:
+                sample_rows = [json.loads(line) for line in handle if line.strip()]
+
+            near_miss_row = next(
+                row for row in sample_rows if row["category"] == "near_miss_94_95" and row["sample_id"] == "sample-2"
+            )
+            self.assertEqual(near_miss_row["generation_stop_reason"], "stop")
+            self.assertIn("filled_orig_mse", near_miss_row)
+            self.assertIn("filled_norm_mse", near_miss_row)
+            self.assertAlmostEqual(near_miss_row["filled_raw_mse"], near_miss_row["filled_orig_mse"], places=6)
 
 
 if __name__ == "__main__":

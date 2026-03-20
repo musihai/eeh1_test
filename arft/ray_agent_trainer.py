@@ -24,7 +24,7 @@ import os
 import random
 import re
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 import math
@@ -315,6 +315,20 @@ class RayAgentTrainer(RayPPOTrainer):
         mae = float(np.mean(np.abs(diff)))
         return mse, mae
 
+    @staticmethod
+    def _orig_mse_mae(pred_values: list[float], gt_values: list[float]) -> tuple[float, float]:
+        if not pred_values or not gt_values:
+            return float("nan"), float("nan")
+        n = min(len(pred_values), len(gt_values))
+        if n <= 0:
+            return float("nan"), float("nan")
+        pred = np.asarray(pred_values[:n], dtype=np.float64)
+        gt = np.asarray(gt_values[:n], dtype=np.float64)
+        diff = pred - gt
+        mse = float(np.mean(diff ** 2))
+        mae = float(np.mean(np.abs(diff)))
+        return mse, mae
+
     def _write_min_eval_debug_files(
         self,
         *,
@@ -329,18 +343,36 @@ class RayAgentTrainer(RayPPOTrainer):
             return
 
         pred_len = self._to_float_list(reward_extra_infos_dict.get("pred_len"), n)
-        raw_mse = self._to_float_list(reward_extra_infos_dict.get("raw_mse"), n)
-        raw_mae = self._to_float_list(reward_extra_infos_dict.get("raw_mae"), n)
+        expected_len = self._to_float_list(
+            reward_extra_infos_dict.get("expected_len") or reward_extra_infos_dict.get("gt_len"),
+            n,
+        )
+        orig_mse = self._to_float_list(
+            reward_extra_infos_dict.get("orig_mse") or reward_extra_infos_dict.get("raw_mse"),
+            n,
+        )
+        orig_mae = self._to_float_list(
+            reward_extra_infos_dict.get("orig_mae") or reward_extra_infos_dict.get("raw_mae"),
+            n,
+        )
+        norm_mse = self._to_float_list(reward_extra_infos_dict.get("norm_mse"), n)
+        norm_mae = self._to_float_list(reward_extra_infos_dict.get("norm_mae"), n)
         has_answer_tag = self._to_bool_list(reward_extra_infos_dict.get("has_answer_tag"), n)
         has_answer_close = self._to_bool_list(reward_extra_infos_dict.get("has_answer_close"), n)
         was_clipped = self._to_bool_list(reward_extra_infos_dict.get("was_clipped"), n)
         format_failure_reason = self._to_str_list(reward_extra_infos_dict.get("format_failure_reason"), n)
+        final_answer_reject_reason = self._to_str_list(
+            reward_extra_infos_dict.get("final_answer_reject_reason"),
+            n,
+        )
         length_hard_fail = self._to_float_list(reward_extra_infos_dict.get("length_hard_fail"), n, default=0.0)
+        strict_length_match = self._to_bool_list(reward_extra_infos_dict.get("strict_length_match"), n)
         trainer_seq_score = self._to_float_list(
             reward_extra_infos_dict.get("trainer_seq_score") or reward_extra_infos_dict.get("score"),
             n,
             default=float("nan"),
         )
+        generation_stop_reason = self._to_str_list(reward_extra_infos_dict.get("generation_stop_reason"), n)
         selected_model = self._to_str_list(
             reward_extra_infos_dict.get("selected_model")
             or reward_extra_infos_dict.get("prediction_model_used")
@@ -348,54 +380,116 @@ class RayAgentTrainer(RayPPOTrainer):
             n,
             default="unknown",
         )
+        reward_main_scale = self._to_str_list(reward_extra_infos_dict.get("reward_main_scale"), n)
 
         pred_len_arr = np.asarray(pred_len, dtype=np.float64)
+        expected_len_arr = np.asarray(expected_len, dtype=np.float64)
         valid_pred_len = np.isfinite(pred_len_arr)
+        valid_expected_len = np.isfinite(expected_len_arr)
 
         is_96 = (pred_len_arr == 96)
         is_94_95 = np.logical_or(pred_len_arr == 94, pred_len_arr == 95)
         is_lt_96 = pred_len_arr < 96
         is_gt_96 = pred_len_arr > 96
         missing_close = np.asarray([reason == "missing_answer_close_tag" for reason in format_failure_reason], dtype=bool)
-
-        success_mask = np.logical_and.reduce(
+        invalid_answer_shape = np.asarray(
+            [reason.startswith("invalid_answer_shape") for reason in final_answer_reject_reason],
+            dtype=bool,
+        )
+        strict_length_match_arr = np.asarray(strict_length_match, dtype=bool)
+        exact_expected_match = np.logical_and.reduce(
             [
-                is_96,
+                valid_pred_len,
+                valid_expected_len,
+                pred_len_arr == expected_len_arr,
+            ]
+        )
+        final_answer_accept = np.logical_and.reduce(
+            [
                 np.asarray(has_answer_tag, dtype=bool),
                 np.asarray(has_answer_close, dtype=bool),
-                np.asarray([np.isfinite(v) for v in raw_mse], dtype=bool),
-                np.asarray([np.isfinite(v) for v in raw_mae], dtype=bool),
+                exact_expected_match,
+                np.asarray([reason == "" for reason in final_answer_reject_reason], dtype=bool),
             ]
         )
 
-        success_mse_values = [raw_mse[i] for i in range(n) if success_mask[i] and np.isfinite(raw_mse[i])]
-        success_mae_values = [raw_mae[i] for i in range(n) if success_mask[i] and np.isfinite(raw_mae[i])]
+        success_mask = np.logical_and.reduce(
+            [
+                final_answer_accept,
+                np.asarray([np.isfinite(v) for v in orig_mse], dtype=bool),
+                np.asarray([np.isfinite(v) for v in orig_mae], dtype=bool),
+            ]
+        )
+
+        success_orig_mse_values = [orig_mse[i] for i in range(n) if success_mask[i] and np.isfinite(orig_mse[i])]
+        success_orig_mae_values = [orig_mae[i] for i in range(n) if success_mask[i] and np.isfinite(orig_mae[i])]
+        success_norm_mse_values = [norm_mse[i] for i in range(n) if success_mask[i] and np.isfinite(norm_mse[i])]
+        success_norm_mae_values = [norm_mae[i] for i in range(n) if success_mask[i] and np.isfinite(norm_mae[i])]
         reward_values = [float(v) for v in sample_scores if isinstance(v, (int, float)) and np.isfinite(v)]
         length_hard_fail_values = [float(v) for v in length_hard_fail if np.isfinite(v)]
         trainer_seq_values = [float(v) for v in trainer_seq_score if np.isfinite(v)]
+        final_answer_reject_counter = Counter(reason for reason in final_answer_reject_reason if reason)
+        format_failure_reason_counter = Counter(reason for reason in format_failure_reason if reason)
+        generation_stop_reason_counter = Counter(reason for reason in generation_stop_reason if reason)
+        selected_model_counter = Counter(model for model in selected_model if model)
+        reward_main_scale_counter = Counter(scale for scale in reward_main_scale if scale)
 
         total = float(n)
+        known_model_shares = {
+            "patchtst_share": float(selected_model_counter.get("patchtst", 0) / total),
+            "itransformer_share": float(selected_model_counter.get("itransformer", 0) / total),
+            "arima_share": float(selected_model_counter.get("arima", 0) / total),
+            "chronos2_share": float(selected_model_counter.get("chronos2", 0) / total),
+            "unknown_model_share": float(selected_model_counter.get("unknown", 0) / total),
+        }
         agg_row = {
             "step": int(self.global_steps),
             "total_samples": int(n),
+            "exact_96_ratio": float(np.sum(is_96) / total),
             "pred_len_96_ratio": float(np.sum(is_96) / total),
             "pred_len_94_95_ratio": float(np.sum(is_94_95) / total),
             "pred_len_lt_96_ratio": float(np.sum(np.logical_and(is_lt_96, valid_pred_len)) / total),
             "pred_len_gt_96_ratio": float(np.sum(np.logical_and(is_gt_96, valid_pred_len)) / total),
             "has_answer_tag_ratio": float(np.mean(np.asarray(has_answer_tag, dtype=np.float64))),
             "has_answer_close_ratio": float(np.mean(np.asarray(has_answer_close, dtype=np.float64))),
+            "final_answer_accept_ratio": float(np.mean(final_answer_accept.astype(np.float64))),
+            "strict_length_match_ratio": float(np.mean(strict_length_match_arr.astype(np.float64))),
             "missing_answer_close_tag_count": int(np.sum(missing_close)),
+            "invalid_answer_shape_count": int(np.sum(invalid_answer_shape)),
             "was_clipped_count": int(np.sum(np.asarray(was_clipped, dtype=bool))),
-            "success_raw_mse_mean": float(np.mean(success_mse_values)) if success_mse_values else float("nan"),
-            "success_raw_mse_p50": self._percentile(success_mse_values, 50),
-            "success_raw_mse_p90": self._percentile(success_mse_values, 90),
-            "success_raw_mae_mean": float(np.mean(success_mae_values)) if success_mae_values else float("nan"),
-            "success_raw_mae_p50": self._percentile(success_mae_values, 50),
-            "success_raw_mae_p90": self._percentile(success_mae_values, 90),
+            "orig_mse_mean": float(np.mean(success_orig_mse_values)) if success_orig_mse_values else float("nan"),
+            "orig_mse_p50": self._percentile(success_orig_mse_values, 50),
+            "orig_mse_p90": self._percentile(success_orig_mse_values, 90),
+            "orig_mae_mean": float(np.mean(success_orig_mae_values)) if success_orig_mae_values else float("nan"),
+            "orig_mae_p50": self._percentile(success_orig_mae_values, 50),
+            "orig_mae_p90": self._percentile(success_orig_mae_values, 90),
+            "norm_mse_mean": float(np.mean(success_norm_mse_values)) if success_norm_mse_values else float("nan"),
+            "norm_mse_p50": self._percentile(success_norm_mse_values, 50),
+            "norm_mse_p90": self._percentile(success_norm_mse_values, 90),
+            "norm_mae_mean": float(np.mean(success_norm_mae_values)) if success_norm_mae_values else float("nan"),
+            "norm_mae_p50": self._percentile(success_norm_mae_values, 50),
+            "norm_mae_p90": self._percentile(success_norm_mae_values, 90),
+            "success_raw_mse_mean": float(np.mean(success_orig_mse_values)) if success_orig_mse_values else float("nan"),
+            "success_raw_mse_p50": self._percentile(success_orig_mse_values, 50),
+            "success_raw_mse_p90": self._percentile(success_orig_mse_values, 90),
+            "success_raw_mae_mean": float(np.mean(success_orig_mae_values)) if success_orig_mae_values else float("nan"),
+            "success_raw_mae_p50": self._percentile(success_orig_mae_values, 50),
+            "success_raw_mae_p90": self._percentile(success_orig_mae_values, 90),
             "validation_reward_mean": float(np.mean(reward_values)) if reward_values else float("nan"),
+            "length_hard_fail_ratio": float(np.mean(length_hard_fail_values)) if length_hard_fail_values else float("nan"),
             "length_hard_fail_mean": float(np.mean(length_hard_fail_values)) if length_hard_fail_values else float("nan"),
             "trainer_seq_score_mean": float(np.mean(trainer_seq_values)) if trainer_seq_values else float("nan"),
+            "selected_model_distribution": {str(k): int(v) for k, v in sorted(selected_model_counter.items())},
+            "format_failure_reason_distribution": {str(k): int(v) for k, v in sorted(format_failure_reason_counter.items())},
+            "final_answer_reject_reason_distribution": {
+                str(k): int(v) for k, v in sorted(final_answer_reject_counter.items())
+            },
+            "generation_stop_reason_distribution": {
+                str(k): int(v) for k, v in sorted(generation_stop_reason_counter.items())
+            },
+            "reward_main_scale_distribution": {str(k): int(v) for k, v in sorted(reward_main_scale_counter.items())},
         }
+        agg_row.update(known_model_shares)
 
         all_indices = list(range(n))
         success_indices = [i for i in all_indices if success_mask[i]]
@@ -423,11 +517,21 @@ class RayAgentTrainer(RayPPOTrainer):
                 "sample_id": str(sample_uids[i]) if i < len(sample_uids) else f"sample_{i}",
                 "selected_model": selected_model[i],
                 "pred_len": int(pred_len_arr[i]) if np.isfinite(pred_len_arr[i]) else -1,
-                "raw_mse": float(raw_mse[i]) if np.isfinite(raw_mse[i]) else float("nan"),
-                "raw_mae": float(raw_mae[i]) if np.isfinite(raw_mae[i]) else float("nan"),
+                "expected_len": int(expected_len_arr[i]) if np.isfinite(expected_len_arr[i]) else -1,
+                "orig_mse": float(orig_mse[i]) if np.isfinite(orig_mse[i]) else float("nan"),
+                "orig_mae": float(orig_mae[i]) if np.isfinite(orig_mae[i]) else float("nan"),
+                "norm_mse": float(norm_mse[i]) if np.isfinite(norm_mse[i]) else float("nan"),
+                "norm_mae": float(norm_mae[i]) if np.isfinite(norm_mae[i]) else float("nan"),
+                "raw_mse": float(orig_mse[i]) if np.isfinite(orig_mse[i]) else float("nan"),
+                "raw_mae": float(orig_mae[i]) if np.isfinite(orig_mae[i]) else float("nan"),
                 "has_answer_tag": bool(has_answer_tag[i]),
                 "has_answer_close": bool(has_answer_close[i]),
                 "failure_reason": format_failure_reason[i] if format_failure_reason[i] else "",
+                "final_answer_reject_reason": final_answer_reject_reason[i] if final_answer_reject_reason[i] else "",
+                "generation_stop_reason": generation_stop_reason[i] if generation_stop_reason[i] else "",
+                "strict_length_match": bool(strict_length_match_arr[i]),
+                "length_hard_fail": bool(length_hard_fail[i]),
+                "trainer_seq_score": float(trainer_seq_score[i]) if np.isfinite(trainer_seq_score[i]) else float("nan"),
                 "raw_model_output_tail": self._tail_lines(output_text, 10),
             }
 
@@ -452,11 +556,17 @@ class RayAgentTrainer(RayPPOTrainer):
             if pred_values and gt_values and len(pred_values) < len(gt_values):
                 filled_pred = list(pred_values)
                 filled_pred.extend([filled_pred[-1]] * (len(gt_values) - len(filled_pred)))
-                filled_mse, filled_mae = self._normalized_mse_mae(filled_pred, gt_values)
+                filled_orig_mse, filled_orig_mae = self._orig_mse_mae(filled_pred, gt_values)
+                filled_norm_mse, filled_norm_mae = self._normalized_mse_mae(filled_pred, gt_values)
             else:
-                filled_mse, filled_mae = float("nan"), float("nan")
-            row["filled_raw_mse"] = float(filled_mse)
-            row["filled_raw_mae"] = float(filled_mae)
+                filled_orig_mse, filled_orig_mae = float("nan"), float("nan")
+                filled_norm_mse, filled_norm_mae = float("nan"), float("nan")
+            row["filled_orig_mse"] = float(filled_orig_mse)
+            row["filled_orig_mae"] = float(filled_orig_mae)
+            row["filled_norm_mse"] = float(filled_norm_mse)
+            row["filled_norm_mae"] = float(filled_norm_mae)
+            row["filled_raw_mse"] = float(filled_orig_mse)
+            row["filled_raw_mae"] = float(filled_orig_mae)
             sample_rows.append(row)
 
         debug_dir = os.getenv("TS_MIN_DEBUG_DIR", os.path.join(os.getcwd(), "logs", "debug"))

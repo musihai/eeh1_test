@@ -175,6 +175,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         norm_mae = np.nan
         pred_len = 0
         expected_len = len(extract_ground_truth_values(ground_truth)) if ground_truth else int(self.forecast_horizon or 96)
+        generation_stop_reason = ""
         io_records: list[dict[str, Any]] = []
 
         num_steps = 0
@@ -198,12 +199,14 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 None,
                 lambda: self.tokenizer.apply_chat_template(messages, **apply_chat_template_kwargs),
             )
+            current_sampling_params = self._prepare_sampling_params(sampling_params)
 
             with simple_timer("generate_sequences", metrics):
                 output = await self.server_manager.generate(
-                    request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
+                    request_id=request_id, prompt_ids=prompt_ids, sampling_params=current_sampling_params
                 )
             response_ids = output.token_ids[: self.response_length]
+            generation_stop_reason = getattr(output, "stop_reason", "")
             
             # Decode response to check for final answer
             response_text = await self.loop.run_in_executor(None, self.tokenizer.decode, response_ids)
@@ -276,6 +279,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     "prediction_model_used": self.prediction_model_used,
                     "output_source": self.prediction_model_used,
                     "selected_model": selected_model,
+                    "generation_stop_reason": generation_stop_reason,
                 }
             )
             step.extra_fields["reward_extra_info"] = reward_extra_info
@@ -330,6 +334,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 "prediction_model_used": self.prediction_model_used,
                 "output_source": self.prediction_model_used,
                 "selected_model": final_selected_model,
+                "generation_stop_reason": generation_stop_reason,
             }
         )
         self.steps[-1].extra_fields["reward_extra_info"] = final_reward_extra_info
@@ -402,6 +407,26 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
     def _expected_prediction_count(self) -> int:
         return int(self.forecast_horizon or 96)
+
+    def _final_answer_max_tokens(self) -> int:
+        expected = self._expected_prediction_count()
+        # Keep enough headroom for 96 numeric lines plus tags, but avoid letting
+        # malformed final outputs run all the way to the global response cap.
+        return min(int(self.response_length or 0), max(256, expected * 10 + 64))
+
+    def _prepare_sampling_params(self, sampling_params: dict[str, Any]) -> dict[str, Any]:
+        params = dict(sampling_params)
+        if self.prediction_results:
+            params["stop"] = ["</answer>"]
+            params["include_stop_str_in_output"] = True
+            existing_max_tokens = params.get("max_tokens", params.get("max_new_tokens"))
+            final_turn_max_tokens = self._final_answer_max_tokens()
+            if existing_max_tokens is None:
+                params["max_tokens"] = final_turn_max_tokens
+            else:
+                params["max_tokens"] = min(int(existing_max_tokens), final_turn_max_tokens)
+                params.pop("max_new_tokens", None)
+        return params
 
     def _extract_forecast_block(self, text: str) -> Optional[str]:
         cleaned = (

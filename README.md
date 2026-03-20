@@ -15,7 +15,8 @@
 - 最终 `<answer>` 统一为 96 行纯数值（无时间戳）
 - reward 默认使用严格 ablation：只保留格式、长度和 MSE，关闭 change point / season-trend 附加项
 - 训练主口径统一使用 strict_raw（原始 Turn3 输出），不使用 fallback_normalized 修补路径
-- 长度项采用分段惩罚：少写和多写都惩罚，偏差越大惩罚越重
+- 长度项采用严格门控：`pred_len != gt_len` 时直接 hard fail，不再给 MSE 正奖励
+- 调试聚合默认同时输出原始口径和归一化口径误差，以及 final answer 接受率和模型选择分布
 
 ## 环境
 
@@ -192,9 +193,14 @@ bash examples/time_series_forecast/run_qwen3-1.7B.sh \
   trainer.test_freq=5
 ```
 
-如果你要**新开一轮 RL 实验**，不要和当前 `etth1_ot_qwen3_1_7b_rl_gpu012` 混用，用新的实验名并禁用自动续跑：
+如果你要**先做链路 smoke test**，20 steps 可以用，但它只用于确认不报错，不用于判断方案是否成功：
 
 ```bash
+cd /data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main
+conda activate cast-r1-ts
+export PYTHONPATH=$PWD:$PYTHONPATH
+
+unset PYTORCH_CUDA_ALLOC_CONF
 DEBUG_CHAIN=0 \
 TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_eval5_test.jsonl \
 MODEL_PATH=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_new/global_step_11/huggingface \
@@ -206,28 +212,45 @@ bash examples/time_series_forecast/run_qwen3-1.7B.sh \
   trainer.test_freq=5 \
   trainer.resume_mode=disable \
   trainer.log_val_generations=0 \
-
 ```
+
+如果你要**做本轮方案的机制验证**，不要再用上面的 `20` steps，直接用 `120` steps + `RL_TEMPERATURE=0.3`。下面这组参数也顺带避开了前面碰到的 OOM / vLLM 启动冲突：
+
 ```bash
 cd /data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main
 conda activate cast-r1-ts
+export PYTHONPATH=$PWD:$PYTHONPATH
 
-RUN_TS=$(date +%Y%m%d_%H%M%S)
-export TS_MIN_DEBUG_DIR=$PWD/logs/debug/min_eval_${RUN_TS}
-export DEBUG_CHAIN=0
-mkdir -p "$TS_MIN_DEBUG_DIR"
+unset PYTORCH_CUDA_ALLOC_CONF
+ray stop --force
 
-MODEL_PATH=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_v1/global_step_11/huggingface \
+DEBUG_CHAIN=0 \
+TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_eval20_len_gate_v1.jsonl \
+RL_TEMPERATURE=0.3 \
+RL_ROLLOUT_GPU_MEMORY_UTILIZATION=0.22 \
+RL_ROLLOUT_MAX_MODEL_LEN=8192 \
+RL_ROLLOUT_MAX_BATCHED_TOKENS=4096 \
+RL_ROLLOUT_N=4 \
+RL_MAX_RESPONSE_LENGTH=3072 \
+RL_ACTOR_MAX_TOKEN_LEN_PER_GPU=6144 \
+MODEL_PATH=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_new/global_step_11/huggingface \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
 RUN_MODE=train \
-RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_gpu012_eval5_test_reward \
+RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_gpu012_len_gate_v1 \
 bash examples/time_series_forecast/run_qwen3-1.7B.sh \
-  trainer.total_training_steps=20 \
-  trainer.test_freq=5 \
+  trainer.total_training_steps=120 \
+  trainer.test_freq=20 \
+  trainer.save_freq=40 \
   trainer.resume_mode=disable \
-  trainer.log_val_generations=0 \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.28 \
-  actor_rollout_ref.rollout.max_num_batched_tokens=4096
+  trainer.log_val_generations=0
+```
+
+如果你想把最小验证聚合单独归档到一个时间戳目录，在上面的 smoke test 或 120-step 命令前先加：
+
+```bash
+RUN_TS=$(date +%Y%m%d_%H%M%S)
+export TS_MIN_DEBUG_DIR=$PWD/logs/debug/min_eval_${RUN_TS}
+mkdir -p "$TS_MIN_DEBUG_DIR"
 ```
 RL 输出目录：
 
@@ -255,11 +278,14 @@ python recipe/time_series_forecast/validate_turn3_format.py \
 说明：
 
 - RL 默认 `resume_mode=auto`。同一个 `RL_EXP_NAME` 下再次运行，不会从头覆盖，而是会自动续跑最近的 checkpoint。
-- reward 采用分段长度惩罚（不是 `pred_len!=96` 一刀切判死）：95/94 会轻中度惩罚，像 585 这类 over-generation 会重惩罚。
+- reward 现在是严格长度门控：`pred_len!=gt_len` 会直接 hard fail，95/94 不再拿正奖励。
+- 如果你把 `RL_ROLLOUT_GPU_MEMORY_UTILIZATION` 压得很低，又没有显式设置 `RL_ROLLOUT_MAX_MODEL_LEN`，vLLM 会退回模型原生上下文长度来预留 KV cache，Qwen3-1.7B 这里会按 `40960` 处理，容易直接在启动阶段报 `Engine core initialization failed`。机制验证这组参数建议固定带上 `RL_ROLLOUT_MAX_MODEL_LEN=8192`。
 - 如果当前实验已经跑到 `100 step`，再写 `trainer.total_training_steps=100` 通常不会继续训练；续跑时要把总步数设得更大，比如 `200`。
 - 如果你想完全重新开始，请换一个新的 `RL_EXP_NAME`，或者加 `trainer.resume_mode=disable`。
 - 当前这条 ETTh1/OT 训练链路里，`vLLM + load_format=dummy` 会导致 rollout 输出异常长的乱码文本，表现为 `response_length=3072`、`reward=0`。
 - 现在脚本已经默认改成 `safetensors`，不需要再手工额外覆盖；只有在你明确要测试别的加载方式时，才需要自己改 `RL_ROLLOUT_LOAD_FORMAT`。
+- 如果你手动设置过 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，在 RL 前要先 `unset`；当前 vLLM memory pool 和这个选项不兼容。
+- `MODEL_PATH` 必须指向 `.../global_step_x/huggingface`，不能只写到 `global_step_x`。
 - 如果训练已经跑到目标 step 并写出 `global_step_x`，但最后只剩下 dataloader / vLLM 的退出日志，先以 checkpoint 是否成功落盘为准；当前默认配置已经把这类退出期噪声尽量收到了最小。
 
 ## 常见问题（FAQ）
@@ -275,7 +301,8 @@ python recipe/time_series_forecast/validate_turn3_format.py \
 - 现象：
   - 过高：格式波动增大、长度不稳定。
   - 过低：输出过于保守，探索不足，reward 提升慢。
-- 建议起点：`RL_TEMPERATURE=0.6`，`RL_VAL_TEMPERATURE=0.2`（profile 默认）。
+- profile 默认值是 `RL_TEMPERATURE=0.4`、`RL_VAL_TEMPERATURE=0.1`。
+- 这轮长度门控机制验证建议先用 `RL_TEMPERATURE=0.3`，优先追求收尾稳定性。
 - 调参策略：每次只改一个参数，小步（如 `0.1`）调整并观察 `5~10` 个 test 周期。
 
 ### 3) Batch / token 预算过激，容易 OOM 或吞吐异常
