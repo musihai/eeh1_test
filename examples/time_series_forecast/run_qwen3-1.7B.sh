@@ -51,8 +51,8 @@ RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
 source "$RESOLVED_PROFILE_PATH"
 
 CONFIG_PATH="${CONFIG_PATH:-${RL_CONFIG_PATH:-$PROJECT_DIR/recipe/time_series_forecast/base.yaml}}"
-TRAIN_FILES="${TRAIN_FILES:-${RL_TRAIN_FILES:-$PROJECT_DIR/dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424/train.jsonl}}"
-VAL_FILES="${VAL_FILES:-${RL_VAL_FILES:-$PROJECT_DIR/dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424/val.jsonl}}"
+TRAIN_FILES="${TRAIN_FILES:-${RL_TRAIN_FILES:-$PROJECT_DIR/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_v2/train.jsonl}}"
+VAL_FILES="${VAL_FILES:-${RL_VAL_FILES:-$PROJECT_DIR/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_v2/val.jsonl}}"
 REWARD_FN_PATH="${REWARD_FN_PATH:-${RL_REWARD_FN_PATH:-$PROJECT_DIR/recipe/time_series_forecast/reward.py}}"
 REWARD_FN_NAME="${REWARD_FN_NAME:-${RL_REWARD_FN_NAME:-compute_score}}"
 MODEL_PATH="${MODEL_PATH:-}"

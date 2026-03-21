@@ -381,6 +381,130 @@ class RayAgentTrainer(RayPPOTrainer):
             default="unknown",
         )
         reward_main_scale = self._to_str_list(reward_extra_infos_dict.get("reward_main_scale"), n)
+        selected_forecast_orig_mse = self._to_float_list(
+            reward_extra_infos_dict.get("selected_forecast_orig_mse"),
+            n,
+            default=float("nan"),
+        )
+        selected_forecast_len_match = self._to_bool_list(
+            reward_extra_infos_dict.get("selected_forecast_len_match"),
+            n,
+        )
+        selected_forecast_exact_copy = self._to_bool_list(
+            reward_extra_infos_dict.get("selected_forecast_exact_copy"),
+            n,
+        )
+        final_vs_selected_mse = self._to_float_list(
+            reward_extra_infos_dict.get("final_vs_selected_mse"),
+            n,
+            default=float("nan"),
+        )
+        refinement_delta_orig_mse = self._to_float_list(
+            reward_extra_infos_dict.get("refinement_delta_orig_mse"),
+            n,
+            default=float("nan"),
+        )
+        refinement_compare_len = self._to_float_list(
+            reward_extra_infos_dict.get("refinement_compare_len"),
+            n,
+            default=float("nan"),
+        )
+        refinement_changed_value_count = self._to_float_list(
+            reward_extra_infos_dict.get("refinement_changed_value_count"),
+            n,
+            default=float("nan"),
+        )
+        refinement_first_changed_index = self._to_float_list(
+            reward_extra_infos_dict.get("refinement_first_changed_index"),
+            n,
+            default=float("nan"),
+        )
+        refinement_change_mean_abs = self._to_float_list(
+            reward_extra_infos_dict.get("refinement_change_mean_abs"),
+            n,
+            default=float("nan"),
+        )
+        refinement_change_max_abs = self._to_float_list(
+            reward_extra_infos_dict.get("refinement_change_max_abs"),
+            n,
+            default=float("nan"),
+        )
+        refinement_changed = self._to_bool_list(reward_extra_infos_dict.get("refinement_changed"), n)
+        refinement_improved = self._to_bool_list(reward_extra_infos_dict.get("refinement_improved"), n)
+        refinement_degraded = self._to_bool_list(reward_extra_infos_dict.get("refinement_degraded"), n)
+        analysis_coverage_ratio = self._to_float_list(
+            reward_extra_infos_dict.get("analysis_coverage_ratio"),
+            n,
+            default=float("nan"),
+        )
+        feature_tool_count = self._to_float_list(
+            reward_extra_infos_dict.get("feature_tool_count"),
+            n,
+            default=float("nan"),
+        )
+        prediction_call_count = self._to_float_list(
+            reward_extra_infos_dict.get("prediction_call_count"),
+            n,
+            default=float("nan"),
+        )
+        tool_call_count = self._to_float_list(
+            reward_extra_infos_dict.get("tool_call_count"),
+            n,
+            default=float("nan"),
+        )
+        history_analysis_count = self._to_float_list(
+            reward_extra_infos_dict.get("history_analysis_count"),
+            n,
+            default=float("nan"),
+        )
+        illegal_turn3_tool_call_count = self._to_float_list(
+            reward_extra_infos_dict.get("illegal_turn3_tool_call_count"),
+            n,
+            default=float("nan"),
+        )
+        prediction_model_defaulted = self._to_bool_list(
+            reward_extra_infos_dict.get("prediction_model_defaulted"),
+            n,
+        )
+        prediction_requested_model = self._to_str_list(
+            reward_extra_infos_dict.get("prediction_requested_model"),
+            n,
+        )
+        feature_tool_signature = self._to_str_list(
+            reward_extra_infos_dict.get("feature_tool_signature"),
+            n,
+            default="none",
+        )
+        tool_call_sequence = self._to_str_list(
+            reward_extra_infos_dict.get("tool_call_sequence"),
+            n,
+            default="none",
+        )
+        analysis_state_signature = self._to_str_list(
+            reward_extra_infos_dict.get("analysis_state_signature"),
+            n,
+            default="none",
+        )
+        workflow_status = self._to_str_list(
+            reward_extra_infos_dict.get("workflow_status"),
+            n,
+        )
+        turn_stage = self._to_str_list(
+            reward_extra_infos_dict.get("turn_stage"),
+            n,
+        )
+        prediction_tool_error = self._to_str_list(
+            reward_extra_infos_dict.get("prediction_tool_error"),
+            n,
+        )
+        selected_forecast_preview = self._to_str_list(
+            reward_extra_infos_dict.get("selected_forecast_preview"),
+            n,
+        )
+        final_answer_preview = self._to_str_list(
+            reward_extra_infos_dict.get("final_answer_preview"),
+            n,
+        )
 
         pred_len_arr = np.asarray(pred_len, dtype=np.float64)
         expected_len_arr = np.asarray(expected_len, dtype=np.float64)
@@ -433,6 +557,56 @@ class RayAgentTrainer(RayPPOTrainer):
         generation_stop_reason_counter = Counter(reason for reason in generation_stop_reason if reason)
         selected_model_counter = Counter(model for model in selected_model if model)
         reward_main_scale_counter = Counter(scale for scale in reward_main_scale if scale)
+        feature_tool_signature_counter = Counter(signature for signature in feature_tool_signature if signature)
+        tool_call_sequence_counter = Counter((signature if signature else "none") for signature in tool_call_sequence)
+        analysis_state_signature_counter = Counter(signature for signature in analysis_state_signature if signature)
+        prediction_requested_model_counter = Counter(model for model in prediction_requested_model if model)
+        workflow_status_counter = Counter(status for status in workflow_status if status)
+        turn_stage_counter = Counter(stage for stage in turn_stage if stage)
+        prediction_tool_error_count = int(sum(1 for value in prediction_tool_error if value))
+
+        selected_forecast_orig_mse_values = [
+            float(v) for v in selected_forecast_orig_mse if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        final_vs_selected_mse_values = [
+            float(v) for v in final_vs_selected_mse if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        refinement_delta_orig_mse_values = [
+            float(v) for v in refinement_delta_orig_mse if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        refinement_compare_len_values = [
+            float(v) for v in refinement_compare_len if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        refinement_changed_value_count_values = [
+            float(v) for v in refinement_changed_value_count if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        refinement_first_changed_index_values = [
+            float(v) for v in refinement_first_changed_index if isinstance(v, (int, float)) and np.isfinite(v) and v >= 0
+        ]
+        refinement_change_mean_abs_values = [
+            float(v) for v in refinement_change_mean_abs if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        refinement_change_max_abs_values = [
+            float(v) for v in refinement_change_max_abs if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        analysis_coverage_ratio_values = [
+            float(v) for v in analysis_coverage_ratio if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        feature_tool_count_values = [
+            float(v) for v in feature_tool_count if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        prediction_call_count_values = [
+            float(v) for v in prediction_call_count if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        tool_call_count_values = [
+            float(v) for v in tool_call_count if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        history_analysis_count_values = [
+            float(v) for v in history_analysis_count if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        illegal_turn3_tool_call_count_values = [
+            float(v) for v in illegal_turn3_tool_call_count if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
 
         total = float(n)
         known_model_shares = {
@@ -479,6 +653,71 @@ class RayAgentTrainer(RayPPOTrainer):
             "length_hard_fail_ratio": float(np.mean(length_hard_fail_values)) if length_hard_fail_values else float("nan"),
             "length_hard_fail_mean": float(np.mean(length_hard_fail_values)) if length_hard_fail_values else float("nan"),
             "trainer_seq_score_mean": float(np.mean(trainer_seq_values)) if trainer_seq_values else float("nan"),
+            "selected_forecast_orig_mse_mean": float(np.mean(selected_forecast_orig_mse_values))
+            if selected_forecast_orig_mse_values
+            else float("nan"),
+            "selected_forecast_len_match_ratio": float(
+                np.mean(np.asarray(selected_forecast_len_match, dtype=np.float64))
+            ),
+            "selected_forecast_exact_copy_ratio": float(
+                np.mean(np.asarray(selected_forecast_exact_copy, dtype=np.float64))
+            ),
+            "final_vs_selected_mse_mean": float(np.mean(final_vs_selected_mse_values))
+            if final_vs_selected_mse_values
+            else float("nan"),
+            "refinement_delta_orig_mse_mean": float(np.mean(refinement_delta_orig_mse_values))
+            if refinement_delta_orig_mse_values
+            else float("nan"),
+            "refinement_compare_len_mean": float(np.mean(refinement_compare_len_values))
+            if refinement_compare_len_values
+            else float("nan"),
+            "refinement_changed_value_count_mean": float(np.mean(refinement_changed_value_count_values))
+            if refinement_changed_value_count_values
+            else float("nan"),
+            "refinement_first_changed_index_mean": float(np.mean(refinement_first_changed_index_values))
+            if refinement_first_changed_index_values
+            else float("nan"),
+            "refinement_change_mean_abs_mean": float(np.mean(refinement_change_mean_abs_values))
+            if refinement_change_mean_abs_values
+            else float("nan"),
+            "refinement_change_max_abs_mean": float(np.mean(refinement_change_max_abs_values))
+            if refinement_change_max_abs_values
+            else float("nan"),
+            "refinement_changed_ratio": float(np.mean(np.asarray(refinement_changed, dtype=np.float64))),
+            "refinement_improved_ratio": float(np.mean(np.asarray(refinement_improved, dtype=np.float64))),
+            "refinement_degraded_ratio": float(np.mean(np.asarray(refinement_degraded, dtype=np.float64))),
+            "analysis_coverage_ratio_mean": float(np.mean(analysis_coverage_ratio_values))
+            if analysis_coverage_ratio_values
+            else float("nan"),
+            "feature_tool_count_mean": float(np.mean(feature_tool_count_values))
+            if feature_tool_count_values
+            else float("nan"),
+            "prediction_call_count_mean": float(np.mean(prediction_call_count_values))
+            if prediction_call_count_values
+            else float("nan"),
+            "tool_call_count_mean": float(np.mean(tool_call_count_values)) if tool_call_count_values else float("nan"),
+            "history_analysis_count_mean": float(np.mean(history_analysis_count_values))
+            if history_analysis_count_values
+            else float("nan"),
+            "no_tool_call_ratio": float(
+                np.mean((np.asarray(tool_call_count_values, dtype=np.float64) <= 0.0).astype(np.float64))
+            )
+            if tool_call_count_values
+            else float("nan"),
+            "no_history_analysis_ratio": float(
+                np.mean((np.asarray(history_analysis_count_values, dtype=np.float64) <= 0.0).astype(np.float64))
+            )
+            if history_analysis_count_values
+            else float("nan"),
+            "illegal_turn3_tool_call_ratio": float(
+                np.mean((np.asarray(illegal_turn3_tool_call_count_values, dtype=np.float64) > 0).astype(np.float64))
+            )
+            if illegal_turn3_tool_call_count_values
+            else float("nan"),
+            "prediction_model_defaulted_ratio": float(
+                np.mean(np.asarray(prediction_model_defaulted, dtype=np.float64))
+            ),
+            "prediction_tool_error_count": prediction_tool_error_count,
             "selected_model_distribution": {str(k): int(v) for k, v in sorted(selected_model_counter.items())},
             "format_failure_reason_distribution": {str(k): int(v) for k, v in sorted(format_failure_reason_counter.items())},
             "final_answer_reject_reason_distribution": {
@@ -488,6 +727,20 @@ class RayAgentTrainer(RayPPOTrainer):
                 str(k): int(v) for k, v in sorted(generation_stop_reason_counter.items())
             },
             "reward_main_scale_distribution": {str(k): int(v) for k, v in sorted(reward_main_scale_counter.items())},
+            "feature_tool_signature_distribution": {
+                str(k): int(v) for k, v in sorted(feature_tool_signature_counter.items())
+            },
+            "tool_call_sequence_distribution": {
+                str(k): int(v) for k, v in sorted(tool_call_sequence_counter.items())
+            },
+            "analysis_state_signature_distribution": {
+                str(k): int(v) for k, v in sorted(analysis_state_signature_counter.items())
+            },
+            "prediction_requested_model_distribution": {
+                str(k): int(v) for k, v in sorted(prediction_requested_model_counter.items())
+            },
+            "workflow_status_distribution": {str(k): int(v) for k, v in sorted(workflow_status_counter.items())},
+            "turn_stage_distribution": {str(k): int(v) for k, v in sorted(turn_stage_counter.items())},
         }
         agg_row.update(known_model_shares)
 
@@ -532,6 +785,57 @@ class RayAgentTrainer(RayPPOTrainer):
                 "strict_length_match": bool(strict_length_match_arr[i]),
                 "length_hard_fail": bool(length_hard_fail[i]),
                 "trainer_seq_score": float(trainer_seq_score[i]) if np.isfinite(trainer_seq_score[i]) else float("nan"),
+                "selected_forecast_orig_mse": float(selected_forecast_orig_mse[i])
+                if np.isfinite(selected_forecast_orig_mse[i])
+                else float("nan"),
+                "selected_forecast_len_match": bool(selected_forecast_len_match[i]),
+                "selected_forecast_exact_copy": bool(selected_forecast_exact_copy[i]),
+                "final_vs_selected_mse": float(final_vs_selected_mse[i])
+                if np.isfinite(final_vs_selected_mse[i])
+                else float("nan"),
+                "refinement_delta_orig_mse": float(refinement_delta_orig_mse[i])
+                if np.isfinite(refinement_delta_orig_mse[i])
+                else float("nan"),
+                "refinement_compare_len": int(refinement_compare_len[i])
+                if np.isfinite(refinement_compare_len[i])
+                else -1,
+                "refinement_changed_value_count": int(refinement_changed_value_count[i])
+                if np.isfinite(refinement_changed_value_count[i])
+                else -1,
+                "refinement_first_changed_index": int(refinement_first_changed_index[i])
+                if np.isfinite(refinement_first_changed_index[i])
+                else -1,
+                "refinement_change_mean_abs": float(refinement_change_mean_abs[i])
+                if np.isfinite(refinement_change_mean_abs[i])
+                else float("nan"),
+                "refinement_change_max_abs": float(refinement_change_max_abs[i])
+                if np.isfinite(refinement_change_max_abs[i])
+                else float("nan"),
+                "refinement_changed": bool(refinement_changed[i]),
+                "refinement_improved": bool(refinement_improved[i]),
+                "refinement_degraded": bool(refinement_degraded[i]),
+                "analysis_coverage_ratio": float(analysis_coverage_ratio[i])
+                if np.isfinite(analysis_coverage_ratio[i])
+                else float("nan"),
+                "feature_tool_count": int(feature_tool_count[i]) if np.isfinite(feature_tool_count[i]) else -1,
+                "prediction_call_count": int(prediction_call_count[i]) if np.isfinite(prediction_call_count[i]) else -1,
+                "tool_call_count": int(tool_call_count[i]) if np.isfinite(tool_call_count[i]) else -1,
+                "history_analysis_count": int(history_analysis_count[i])
+                if np.isfinite(history_analysis_count[i])
+                else -1,
+                "illegal_turn3_tool_call_count": int(illegal_turn3_tool_call_count[i])
+                if np.isfinite(illegal_turn3_tool_call_count[i])
+                else -1,
+                "prediction_requested_model": prediction_requested_model[i] if prediction_requested_model[i] else "",
+                "prediction_model_defaulted": bool(prediction_model_defaulted[i]),
+                "feature_tool_signature": feature_tool_signature[i] if feature_tool_signature[i] else "",
+                "tool_call_sequence": tool_call_sequence[i] if tool_call_sequence[i] else "none",
+                "analysis_state_signature": analysis_state_signature[i] if analysis_state_signature[i] else "",
+                "workflow_status": workflow_status[i] if workflow_status[i] else "",
+                "turn_stage": turn_stage[i] if turn_stage[i] else "",
+                "prediction_tool_error": prediction_tool_error[i] if prediction_tool_error[i] else "",
+                "selected_forecast_preview": selected_forecast_preview[i] if selected_forecast_preview[i] else "",
+                "final_answer_preview": final_answer_preview[i] if final_answer_preview[i] else "",
                 "raw_model_output_tail": self._tail_lines(output_text, 10),
             }
 

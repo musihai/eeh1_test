@@ -9,7 +9,7 @@ from recipe.time_series_forecast.build_etth1_sft_subset import build_subset
 
 class TestETTh1SFTSubsetBuilder(unittest.TestCase):
     def test_build_subset_writes_expected_counts(self):
-        source_dir = Path("dataset/ett_sft_etth1_runtime_ot")
+        source_dir = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_v2")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir) / "subset"

@@ -20,7 +20,7 @@ Usage:
 import argparse
 import os
 import json
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -339,39 +339,68 @@ def predict_with_pytorch_model(request: PredictRequest, model_name: str) -> Pred
     
     device = next(model.parameters()).device
     
-    # Prepare data
-    values = np.array(request.values, dtype=np.float32)
-    datetime_list = [pd.to_datetime(ts) for ts in request.timestamps]
-    freq = datetime_list[-1] - datetime_list[-2] if len(datetime_list) >= 2 else pd.Timedelta(hours=1)
+    return predict_with_pytorch_model_batch([request], model_name)[0]
 
-    # Prepare input tensor: [batch, seq_len, n_vars]
-    input_tensor = torch.FloatTensor(values).unsqueeze(0).unsqueeze(-1).to(device)
-    
-    # Predict (model handles normalization/denormalization internally)
-    with torch.no_grad():
-        predictions = model(input_tensor)
-    
-    # Convert to numpy
-    pred_values = predictions.cpu().numpy().squeeze()
-    
-    # Ensure correct length
-    if len(pred_values) > request.prediction_length:
-        pred_values = pred_values[:request.prediction_length]
-    elif len(pred_values) < request.prediction_length:
-        pad_len = request.prediction_length - len(pred_values)
-        pred_values = np.concatenate([pred_values, [pred_values[-1]] * pad_len])
-    
-    # Generate timestamps
-    last_ts = datetime_list[-1]
-    pred_timestamps = [(last_ts + freq * (i + 1)).strftime('%Y-%m-%d %H:%M:%S') 
-                       for i in range(request.prediction_length)]
-    
-    return PredictResponse(
-        timestamps=pred_timestamps,
-        values=pred_values.tolist(),
-        model_used=model_name,
-        status="success"
+
+def predict_with_pytorch_model_batch(
+    requests: Sequence[PredictRequest],
+    model_name: str,
+) -> List[PredictResponse]:
+    """Generate batched predictions using PatchTST or iTransformer."""
+    if not requests:
+        return []
+
+    model = _models[model_name]
+    if model is None:
+        raise HTTPException(status_code=503, detail=f"{model_name} model not loaded")
+
+    device = next(model.parameters()).device
+    seq_lens = {len(request.values) for request in requests}
+    if len(seq_lens) != 1:
+        raise ValueError(
+            f"Batched {model_name} inference requires uniform context lengths, got {sorted(seq_lens)}"
+        )
+
+    values_batch = np.stack(
+        [np.asarray(request.values, dtype=np.float32) for request in requests],
+        axis=0,
     )
+    input_tensor = torch.from_numpy(values_batch).unsqueeze(-1).to(device)
+
+    with torch.inference_mode():
+        predictions = model(input_tensor)
+
+    predictions_np = predictions.detach().cpu().numpy()
+    responses: List[PredictResponse] = []
+
+    for row_idx, request in enumerate(requests):
+        datetime_list = [pd.to_datetime(ts) for ts in request.timestamps]
+        freq = datetime_list[-1] - datetime_list[-2] if len(datetime_list) >= 2 else pd.Timedelta(hours=1)
+        pred_values = predictions_np[row_idx].squeeze()
+        if pred_values.ndim == 0:
+            pred_values = np.asarray([float(pred_values)], dtype=np.float32)
+
+        if len(pred_values) > request.prediction_length:
+            pred_values = pred_values[:request.prediction_length]
+        elif len(pred_values) < request.prediction_length:
+            pad_len = request.prediction_length - len(pred_values)
+            pred_values = np.concatenate([pred_values, [pred_values[-1]] * pad_len])
+
+        last_ts = datetime_list[-1]
+        pred_timestamps = [
+            (last_ts + freq * (i + 1)).strftime('%Y-%m-%d %H:%M:%S')
+            for i in range(request.prediction_length)
+        ]
+        responses.append(
+            PredictResponse(
+                timestamps=pred_timestamps,
+                values=np.asarray(pred_values).tolist(),
+                model_used=model_name,
+                status="success",
+            )
+        )
+
+    return responses
 
 
 # =============================================================================

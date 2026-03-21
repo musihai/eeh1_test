@@ -9,7 +9,15 @@ class FinalAnswerParsingTest(unittest.TestCase):
         agent.forecast_horizon = 96
         agent.response_length = 3072
         agent.prediction_results = "available"
+        agent.prediction_call_count = 1
+        agent.illegal_turn3_tool_call_count = 0
         agent.final_answer_reject_reason = None
+        agent.basic_statistics = {"median": 1.0}
+        agent.within_channel_dynamics = None
+        agent.forecast_residuals = None
+        agent.data_quality = None
+        agent.event_summary = None
+        agent.timestamps = []
         return agent
 
     def _numeric_answer_lines(self, count: int) -> str:
@@ -78,6 +86,14 @@ class FinalAnswerParsingTest(unittest.TestCase):
         agent.prediction_results = None
         params = agent._prepare_sampling_params({"temperature": 0.3, "top_p": 0.95})
         self.assertEqual(params, {"temperature": 0.3, "top_p": 0.95})
+
+    def test_validate_workflow_rejects_tool_calls_after_prediction(self) -> None:
+        agent = self._make_agent()
+        agent.illegal_turn3_tool_call_count = 1
+        valid, penalty, message = agent._validate_workflow_completion(self._numeric_answer_lines(96))
+        self.assertFalse(valid)
+        self.assertLess(penalty, 0.0)
+        self.assertIn("may not call tools", message)
 
 
 if __name__ == "__main__":

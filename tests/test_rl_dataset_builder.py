@@ -8,6 +8,8 @@ from recipe.time_series_forecast.build_etth1_rl_dataset import (
     build_ground_truth,
     build_prompt,
     build_split_configs,
+    compute_teacher_metadata_coverage,
+    compute_normalized_permutation_entropy,
     iter_split_samples,
 )
 
@@ -33,6 +35,11 @@ class TestETTh1RLDatasetBuilder(unittest.TestCase):
         splits = build_split_configs(total_rows=17420, train_rows=12251, val_rows=1913, test_rows=3256)
         counts = [split.num_rows - 96 - 96 + 1 for split in splits]
         self.assertEqual(counts, [12060, 1722, 3065])
+
+    def test_normalized_permutation_entropy_stays_in_unit_interval(self) -> None:
+        entropy = compute_normalized_permutation_entropy([1.0, 2.0, 3.0, 2.5, 2.0, 1.5])
+        self.assertGreaterEqual(entropy, 0.0)
+        self.assertLessEqual(entropy, 1.0)
 
     def test_iter_split_samples_builds_expected_record_shape(self) -> None:
         source = pd.read_csv(Path("dataset/ETT-small/ETTh1.csv")).iloc[:210].copy()
@@ -61,6 +68,26 @@ class TestETTh1RLDatasetBuilder(unittest.TestCase):
 
         gt_lines = first["reward_model"]["ground_truth"].splitlines()
         self.assertEqual(len(gt_lines), 96)
+        self.assertIn("normalized_permutation_entropy", first)
+        self.assertIn("normalized_permutation_entropy_band", first)
+        self.assertIn("reference_teacher_error_band", first)
+        self.assertIn("difficulty_stage", first)
+        self.assertIn("quality_issue_flag", first)
+        self.assertGreaterEqual(first["normalized_permutation_entropy"], 0.0)
+        self.assertLessEqual(first["normalized_permutation_entropy"], 1.0)
+        self.assertIn(first["normalized_permutation_entropy_band"], {"low", "medium", "high"})
+        self.assertIn(first["reference_teacher_error_band"], {"unknown", "low", "medium", "high"})
+        self.assertIn(first["difficulty_stage"], {"easy", "medium", "hard", "unknown"})
+
+    def test_teacher_metadata_coverage_reports_fraction(self) -> None:
+        coverage = compute_teacher_metadata_coverage(
+            num_samples=5,
+            teacher_metadata_by_index={
+                0: {"best_model": "arima"},
+                3: {"best_model": "patchtst"},
+            },
+        )
+        self.assertAlmostEqual(coverage, 0.4)
 
 
 if __name__ == "__main__":

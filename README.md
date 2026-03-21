@@ -1,22 +1,53 @@
 # Cast-R1-TS（ETTh1 单变量 `OT`）
 
-这个分支基于作者原始仓库 [Xiaoyu-Tao/Cast-R1-TS](https://github.com/Xiaoyu-Tao/Cast-R1-TS) 整理，当前只保留 `ETTh1` 单变量 `OT` 预测所需改动，训练主线是：
+这个仓库当前维护的是 `ETTh1` 单变量 `OT` 预测链路，目标是把实现收敛到 [Cast-R1 论文 PDF](/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/Tao%20等%20-%202026%20-%20Cast-R1%20Learning%20Tool-Augmented%20Sequential%20Decision%20Policies%20for%20Time%20Series%20Forecasting.pdf) 的主线：
 
-`工具服务 -> 高质量 teacher200 -> SFT -> RL`
+- `Turn 1`：诊断 / 特征提取
+- `Turn 2`：单模型 routing
+- `Turn 3`：agent 基于 selected forecast 做 reasoning / refinement / final output
 
-当前默认运行时已经切到 compact 协议：
+当前推荐训练主线是：
 
-- Turn 1：提特征
-- Turn 2：调 `predict_time_series`
-- Turn 3：输出 `<think>...</think><answer>...</answer>`
-- runtime 不再把完整多轮对话当作 memory；只保留紧凑状态：`history_analysis` 和 `prediction_tool_output`
-- 工具轮不再保留冗长 assistant prose，只保留实际 tool effects
-- `predict_time_series` 的 tool 输出改为“单个起始时间戳 + 频率 + 纯数值 forecast values”
-- 最终 `<answer>` 统一为 96 行纯数值（无时间戳）
-- reward 默认使用严格 ablation：只保留格式、长度和 MSE，关闭 change point / season-trend 附加项
-- 训练主口径统一使用 strict_raw（原始 Turn3 输出），不使用 fallback_normalized 修补路径
-- 长度项采用严格门控：`pred_len != gt_len` 时直接 hard fail，不再给 MSE 正奖励
-- 调试聚合默认同时输出原始口径和归一化口径误差，以及 final answer 接受率和模型选择分布
+`工具服务 -> 基础 RL jsonl -> 第一轮 teacher eval -> curriculum RL jsonl -> 第二轮 teacher200 -> SFT -> RL`
+
+## 当前实现状态
+
+### 已对齐的部分
+
+- stage-aware prompt 已落地：`Turn 1` 只能特征工具，`Turn 2` 只能 `predict_time_series`，`Turn 3` 不允许继续调用工具。
+- `Turn 2` 是单模型 routing，不再把“同时拿多个 forecast 再比较”当主流程。
+- `Turn 3` 明确要求 final answer 基于 selected model prediction，只允许小幅、证据驱动的 refinement。
+- runtime 在拿到 prediction 之后会拒绝后续 tool invocation，并记录 `illegal_turn3_tool_call_count`。
+- reward 已回到论文式 composite reward：
+  - normalized + log-transformed MSE 主项
+  - turning point / structural alignment
+  - trend / seasonality consistency
+  - format validity
+  - length consistency
+- SFT builder 不再固定五个 feature tools 全调用，改成 state-dependent 选择。
+- RL builder 已补齐离线元信息：
+  - `reference_teacher_error`
+  - `reference_teacher_error_band`
+  - `normalized_permutation_entropy`
+  - `normalized_permutation_entropy_band`
+  - `quality_issue_flag`
+  - `difficulty_stage`
+
+### 还没有完全对齐论文的部分
+
+下面这些已经明确识别出来，但这次还没继续改：
+
+1. runtime memory 仍然是紧凑状态实现，主要依赖 `history_analysis + selected prediction`，还不是显式的结构化 memory object。
+2. SFT 里的 `route_then_refine` 现在已经显式写出：
+   - `refinement_supervision_type`
+   - `refinement_trigger_reason`
+   - `selected_feature_tool_signature`
+   但离线数值目标仍然大多沿用 selected teacher forecast，没有单独合成“refined numeric target”。
+3. `teacher200` 的 curator 现在已经加入了按 `best_model` 的平衡抽样，但还不是完整的 curriculum-aware curator；难度分桶和 teacher-error 分层还没有一并进入 selection。
+4. RL jsonl 已经带了 difficulty metadata，但在线 trainer 还没有接入按 `difficulty_stage` / `entropy_band` 分桶采样。
+5. 调试聚合已经能看到工具链计数、工具调用序列和 refinement 结果，但更细的 turn-level reasoning 仍然要靠 chain debug 排查。
+
+如果你想继续往论文靠，这五项就是下一轮的主方向。
 
 ## 环境
 
@@ -36,164 +67,247 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
 ```
 
+关键脚本：
+
+- 工具服务：[start_model_server.sh](recipe/time_series_forecast/start_model_server.sh)
+- RL 数据构造：[build_etth1_rl_dataset.py](recipe/time_series_forecast/build_etth1_rl_dataset.py)
+- 高质量 teacher / SFT 构造：[build_etth1_high_quality_sft.py](recipe/time_series_forecast/build_etth1_high_quality_sft.py)
+- SFT parquet 构造：[build_etth1_sft_dataset.py](recipe/time_series_forecast/build_etth1_sft_dataset.py)
+- SFT 训练：[run_qwen3-1.7B_sft.sh](examples/time_series_forecast/run_qwen3-1.7B_sft.sh)
+- RL 训练：[run_qwen3-1.7B.sh](examples/time_series_forecast/run_qwen3-1.7B.sh)
+
 默认约定：
 
 - `GPU3` 跑工具服务
 - `GPU0,1,2` 跑 SFT / RL
 - 基础模型默认是 `/data/linyujie/models/Qwen3-1.7B`
-- 默认 logger 只用 `console`，不会主动连接 `swanlab`
-- RL 默认长度预算（按当前 profile）：`max_prompt_length=4096`、`actor_max_token_len_per_gpu=8192`
-- RL 默认强制 `actor_rollout_ref.rollout.load_format=safetensors`，不要再用默认 `dummy`
-- RL 默认 `test_freq=5`
-- RL 默认 `data.dataloader_num_workers=0`，避免 `StatefulDataLoader` 在训练结束时出现 worker 被系统回收的退出噪声
-- RL 开启 `DEBUG_CHAIN=1` 时，默认调试文件路径是 `logs/debug/ts_chain_debug.jsonl`
+- `Chronos2 / PatchTST / iTransformer` 通过工具服务提供
+- `ARIMA` 是本地解析专家，不会显示在 `/models` HTTP 列表里
 
-关键脚本：
+## 完整流程
 
-- 工具服务：[start_model_server.sh](recipe/time_series_forecast/start_model_server.sh)
-- 专家模型重训（仅 train split + provenance）：[retrain_expert_models_train_split.py](recipe/time_series_forecast/retrain_expert_models_train_split.py)
-- 高质量 SFT 构建：[build_etth1_high_quality_sft.py](recipe/time_series_forecast/build_etth1_high_quality_sft.py)
-- SFT 训练：[run_qwen3-1.7B_sft.sh](examples/time_series_forecast/run_qwen3-1.7B_sft.sh)
-- RL 训练：[run_qwen3-1.7B.sh](examples/time_series_forecast/run_qwen3-1.7B.sh)
-
-### 专家模型重训（防泄露口径）
-
-若你要明确规避 “PatchTST / iTransformer 是否看过 val/test” 的不确定性，建议先重训这两个专家模型，且**只使用 ETTh1 train split**。
+### 0. 进入项目
 
 ```bash
-python recipe/time_series_forecast/retrain_expert_models_train_split.py \
-  --csv-path dataset/ETT-small/ETTh1.csv \
-  --models patchtst,itransformer \
-  --train-rows 12251 \
-  --val-rows 1913 \
-  --test-rows 3256 \
-  --target-column OT \
-  --lookback-window 96 \
-  --forecast-horizon 96 \
-  --device cuda
+cd /data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main
+conda activate cast-r1-ts
+export PYTHONPATH=$PWD:$PYTHONPATH
 ```
-
-脚本会覆盖写入：
-
-- `recipe/time_series_forecast/models/patchtst/checkpoint.pth`
-- `recipe/time_series_forecast/models/patchtst/provenance.json`
-- `recipe/time_series_forecast/models/itransformer/checkpoint.pth`
-- `recipe/time_series_forecast/models/itransformer/provenance.json`
-
-其中 `provenance.json` 包含数据路径、split 边界、训练命令、代码版本（git commit）以及 checkpoint/config 的 sha256 哈希。
-
-## 推荐直接执行的流程
 
 ### 1. 启动工具服务
 
-单独开一个终端执行：
+这一步对 RL 训练是必需的；对 Step 3 / Step 5 的 teacher eval 则不是必需，因为当前默认推荐走本地多 GPU teacher 评估。
+
+如果你准备后面直接跑 RL，单独开一个终端执行：
 
 ```bash
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
-bash recipe/time_series_forecast/start_model_server.sh
+bash recipe/time_series_forecast/start_model_server.sh 3 8994
 ```
 
-说明：
-
-- 这个命令会一直占用终端，这是正常的。
-- 服务起来后可以检查：
+服务健康检查：
 
 ```bash
 curl http://127.0.0.1:8994/health
 curl http://127.0.0.1:8994/models
 ```
 
-### 2. 生成高质量 `teacher200_gpu`
+说明：
 
-如果你之前已经生成过 `dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/`，在 compact 协议或 memory 策略更新后建议重新生成一次。
+- `/models` 里只会列出远程加载的 `chronos2 / patchtst / itransformer`
+- `arima` 走本地实现，不依赖这个列表
 
-这一步现在还承担严格 ablation 的 teacher 选择。如果你之前生成的 `teacher200_gpu` 来自旧 reward，请重新生成，避免 teacher 选择目标和当前 RL reward 不一致。
+### 2. 生成基础 RL jsonl
 
-如果你误删了上游 RL jsonl，可以先恢复：
+这一步先生成不带 teacher error 的基础 RL 数据。输出目录我建议新开一套，别继续混旧产物。
 
 ```bash
-python recipe/time_series_forecast/build_etth1_rl_dataset.py
+python recipe/time_series_forecast/build_etth1_rl_dataset.py \
+  --csv-path dataset/ETT-small/ETTh1.csv \
+  --output-dir dataset/ett_rl_etth1_paper_same2 \
+  --lookback-window 96 \
+  --forecast-horizon 96 \
+  --target-column OT \
+  --train-rows 12251 \
+  --val-rows 1913 \
+  --test-rows 3256
 ```
 
-恢复结果会写到：
+输出：
 
-- `dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424/train.jsonl`
-- `dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424/val.jsonl`
-- `dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424/test.jsonl`
+- ` dataset/ett_rl_etth1_paper_same2/train.jsonl`
+- ` dataset/ett_rl_etth1_paper_same2/val.jsonl`
+- ` dataset/ett_rl_etth1_paper_same2/test.jsonl`
+
+### 3. 第一轮 teacher eval / teacher200（为 teacher error 提供来源）
+
+先基于基础 RL jsonl 跑一轮 teacher scoring，生成 `teacher_eval.jsonl` 和第一版 teacher200。
+当前推荐直接走本地多 GPU teacher 评估，不再默认依赖 HTTP 模型服务。
 
 ```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
 python recipe/time_series_forecast/build_etth1_high_quality_sft.py \
-  --output-dir dataset/ett_sft_etth1_runtime_ot_teacher200_gpu \
-  --model-service-url http://127.0.0.1:8994 \
+  --train-jsonl  dataset/ett_rl_etth1_paper_same2/train.jsonl \
+  --val-jsonl  dataset/ett_rl_etth1_paper_same2/val.jsonl \
+  --test-jsonl  dataset/ett_rl_etth1_paper_same2/test.jsonl \
+  --output-dir dataset/ett_sft_etth1_runtime_teacher200_paper_same2 \
   --train-target-samples 200 \
   --val-target-samples 64 \
   --test-target-samples 128 \
   --train-candidate-samples 600 \
   --val-candidate-samples 192 \
   --test-candidate-samples 256 \
-  --models patchtst,chronos2,itransformer \
-  --predictor-mode service \
+  --models patchtst,chronos2,itransformer,arima \
+  --predictor-mode local \
+  --predictor-device cuda \
+  --num-workers 4 \
+  --local-batch-size 256 \
+  --resume-teacher-eval \
   --max-concurrency 4
 ```
 
-生成结果：
+说明：
 
-- `dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/train.parquet`
-- `dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/val.parquet`
-- `dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/test.parquet`
+- `--resume-teacher-eval` 默认开启，会复用已有的 `*_teacher_eval.jsonl`，重复执行时不重算已完成样本。
+- `--local-batch-size` 会对 `patchtst` / `itransformer` 使用 batched inference；`chronos2` / `arima` 仍按单样本路径走。
+- `--num-workers 2` 会把样本分给两个本地 worker，并把可见 GPU 分成两组；如果 4 张卡显存都足够，可以尝试 `--num-workers 4`。
+- 在 `predictor-mode=local` 且 `num-workers=1` 时，builder 会按模型 round-robin 分配 GPU；在 `num-workers>1` 时，先按 worker 分设备组，再由每个 worker 自己给模型分配设备。
+- 如果你想手动指定设备来源，可以额外传：
+  - `--predictor-devices cuda:0,cuda:1,cuda:2,cuda:3`
 
-### 3. 跑 SFT
+这一步会产出两类文件：
 
-推荐直接用高质量 `teacher200_gpu`：
+- `*_teacher_eval.jsonl`：teacher 评分和 best-model 信息
+- `train/val/test.parquet`：第一版 SFT parquet
+
+关键文件：
+
+- `dataset/ett_sft_etth1_runtime_teacher200_paper_same2/train_teacher_eval.jsonl`
+- `dataset/ett_sft_etth1_runtime_teacher200_paper_same2/val_teacher_eval.jsonl`
+- `dataset/ett_sft_etth1_runtime_teacher200_paper_same2/test_teacher_eval.jsonl`
+
+这一步现在默认会写两套 teacher eval：
+
+- `*_teacher_eval.jsonl`：全量 split 的 teacher metadata，给 curriculum 回灌使用
+- `*_teacher_eval_curated.jsonl`：按目标样本数裁出来的 curated 子集
+
+建议立刻检查：
+
+- `*_teacher_eval.jsonl` 的行数应接近对应 split 的样本数
+- `metadata.json` 里的 `train_teacher_distribution` / `val_teacher_distribution` 不应该只剩一个模型
+- `metadata.json` 里的 `resume_teacher_eval`、`num_workers`、`local_batch_size`、`local_worker_device_groups` 应和你的命令一致
+
+### 4. 用 teacher metadata 重建 curriculum RL jsonl
+
+这一步把 `reference_teacher_error` 等元信息灌回 RL jsonl，给 curriculum 和后续分析使用。
+
+```bash
+python recipe/time_series_forecast/build_etth1_rl_dataset.py \
+  --csv-path dataset/ETT-small/ETTh1.csv \
+  --output-dir dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2 \
+  --lookback-window 96 \
+  --forecast-horizon 96 \
+  --target-column OT \
+  --train-rows 12251 \
+  --val-rows 1913 \
+  --test-rows 3256 \
+  --train-teacher-metadata-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/train_teacher_eval.jsonl \
+  --val-teacher-metadata-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/val_teacher_eval.jsonl \
+  --test-teacher-metadata-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/test_teacher_eval.jsonl
+```
+
+这一步新增加的字段包括：
+
+- `reference_teacher_error`
+- `reference_teacher_error_band`
+- `normalized_permutation_entropy`
+- `normalized_permutation_entropy_band`
+- `quality_issue_flag`
+- `difficulty_stage`
+- `curriculum_stage`
+- `curriculum_band`
+
+这一步会检查 teacher metadata 覆盖率；如果你还在拿旧的稀疏 `teacher_eval.jsonl` 来灌 curriculum，会直接报错。正常情况下应看到类似：
+
+```text
+[RL-DATA] split=train teacher metadata coverage: 12060/12060 (100.00%)
+```
+
+### 5. 第二轮 teacher200（推荐正式用于 SFT 的版本）
+
+现在再基于带 curriculum metadata 的 RL jsonl 重跑一轮 teacher200。这样后续 SFT / RL 使用的上游数据就是同一套口径。
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+python recipe/time_series_forecast/build_etth1_high_quality_sft.py \
+  --train-jsonl dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train.jsonl \
+  --val-jsonl dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/val.jsonl \
+  --test-jsonl dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/test.jsonl \
+  --output-dir dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2 \
+  --train-target-samples 200 \
+  --val-target-samples 64 \
+  --test-target-samples 128 \
+  --train-candidate-samples 600 \
+  --val-candidate-samples 192 \
+  --test-candidate-samples 256 \
+  --models patchtst,chronos2,itransformer,arima \
+  --predictor-mode local \
+  --predictor-device cuda \
+  --train-eval-samples 600 \
+  --val-eval-samples 192 \
+  --test-eval-samples 256 \
+  --num-workers 4 \
+  --local-batch-size 256 \
+  --resume-teacher-eval \
+  --max-concurrency 4
+```
+
+推荐后续统一使用这个目录：
+
+- `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2/train.parquet`
+- `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2/val.parquet`
+- `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2/test.parquet`
+
+这一步建议检查：
+
+- `metadata.json` 里的 `train_teacher_distribution` / `val_teacher_distribution` 是否仍然塌到单模型
+- `metadata.json` 里的 `train_teacher_eval_records=600`、`val_teacher_eval_records=192`、`test_teacher_eval_records=256`
+- `metadata.json` 里的 `local_worker_device_groups` 是否符合预期
+- `train.parquet` / `val.parquet` 是否带有：
+  - `sft_trajectory_type`
+  - `refinement_supervision_type`
+  - `refinement_trigger_reason`
+  - `selected_feature_tool_signature`
+
+### 6. 跑 SFT
 
 ```bash
 MODEL_PATH=/data/linyujie/models/Qwen3-1.7B \
-SAVE_DIR=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_v1 \
+SAVE_DIR=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same2 \
+EXPERIMENT_NAME=time_series_forecast_sft_teacher200_paper_same2 \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
 RUN_MODE=train \
-SFT_TRAIN_FILES=$PWD/dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/train.parquet \
-SFT_VAL_FILES=$PWD/dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/val.parquet \
+SFT_TRAIN_FILES=$PWD/dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2/train.parquet \
+SFT_VAL_FILES=$PWD/dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2/val.parquet \
 bash examples/time_series_forecast/run_qwen3-1.7B_sft.sh \
   trainer.resume_mode=disable
 ```
 
-
 SFT 输出目录：
 
 ```bash
-artifacts/checkpoints/sft/
+artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same2/
 ```
 
-后续 RL 需要用到的目录是：
+RL 要用的模型路径必须指向：
 
 ```bash
-artifacts/checkpoints/sft/<exp>/global_step_x/huggingface
+artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same2/<global_step_x>/huggingface
 ```
 
-### 4. 跑 RL
+### 7. RL smoke test
 
-关键默认值（如 `MAX_PROMPT_LENGTH`、`MAX_RESPONSE_LENGTH`、`TEMPERATURE`、`VAL_TEMPERATURE`）只在 profile 文件里维护：
-
-```bash
-examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
-```
-
-`run_qwen3-1.7B.sh` 不再内置这组默认值；优先级固定为：**命令行覆盖 > 环境变量 > profile 默认值**。
-
-把 `MODEL_PATH` 换成**本轮最新 SFT** 导出的 HuggingFace 目录。不要继续复用 compact 协议更新前的旧 checkpoint：
-
-如果你要**续跑当前已经到 100 step 的实验**，把总步数调大，并显式打开验证频率：
-
-```bash
-MODEL_PATH=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/checkpoints/sft/time_series_forecast_sft_compact_state_v1/global_step_11/huggingface \
-PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
-RUN_MODE=train \
-bash examples/time_series_forecast/run_qwen3-1.7B.sh \
-  trainer.total_training_steps=200 \
-  trainer.test_freq=5
-```
-
-如果你要**先做链路 smoke test**，20 steps 可以用，但它只用于确认不报错，不用于判断方案是否成功：
+这个只用于确认链路和显存配置没问题，不用于判断方案是否成功。
 
 ```bash
 cd /data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main
@@ -201,20 +315,35 @@ conda activate cast-r1-ts
 export PYTHONPATH=$PWD:$PYTHONPATH
 
 unset PYTORCH_CUDA_ALLOC_CONF
-DEBUG_CHAIN=0 \
-TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_eval5_test.jsonl \
-MODEL_PATH=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_new/global_step_11/huggingface \
+ray stop --force
+
+DEBUG_CHAIN=1 \
+TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_smoke_v2.jsonl \
+RL_TRAIN_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train.jsonl \
+RL_VAL_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/val.jsonl \
+RL_TEMPERATURE=0.3 \
+RL_ROLLOUT_GPU_MEMORY_UTILIZATION=0.22 \
+RL_ROLLOUT_MAX_MODEL_LEN=8192 \
+RL_ROLLOUT_MAX_BATCHED_TOKENS=4096 \
+RL_ROLLOUT_N=1 \
+RL_MAX_RESPONSE_LENGTH=3072 \
+RL_ACTOR_MAX_TOKEN_LEN_PER_GPU=6144 \
+MODEL_PATH=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same2/global_step_11/huggingface \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
 RUN_MODE=train \
-RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_gpu012_eval5_test_reward \
+RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_smoke_paper_same2 \
 bash examples/time_series_forecast/run_qwen3-1.7B.sh \
   trainer.total_training_steps=20 \
   trainer.test_freq=5 \
   trainer.resume_mode=disable \
-  trainer.log_val_generations=0 \
+  trainer.log_val_generations=0
 ```
 
-如果你要**做本轮方案的机制验证**，不要再用上面的 `20` steps，直接用 `120` steps + `RL_TEMPERATURE=0.3`。下面这组参数也顺带避开了前面碰到的 OOM / vLLM 启动冲突：
+把上面的 `global_step_11` 改成你实际存在的 SFT 导出目录。
+
+### 8. RL 机制验证
+
+这一步才是当前实现该跑的主验证命令。推荐先用 `rollout.n=1` 做低方差验证。
 
 ```bash
 cd /data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main
@@ -225,18 +354,20 @@ unset PYTORCH_CUDA_ALLOC_CONF
 ray stop --force
 
 DEBUG_CHAIN=0 \
-TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_eval20_len_gate_v1.jsonl \
+TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_eval20_paper_same2.jsonl \
+RL_TRAIN_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train.jsonl \
+RL_VAL_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/val.jsonl \
 RL_TEMPERATURE=0.3 \
 RL_ROLLOUT_GPU_MEMORY_UTILIZATION=0.22 \
 RL_ROLLOUT_MAX_MODEL_LEN=8192 \
 RL_ROLLOUT_MAX_BATCHED_TOKENS=4096 \
-RL_ROLLOUT_N=4 \
+RL_ROLLOUT_N=1 \
 RL_MAX_RESPONSE_LENGTH=3072 \
 RL_ACTOR_MAX_TOKEN_LEN_PER_GPU=6144 \
-MODEL_PATH=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_new/global_step_11/huggingface \
+MODEL_PATH=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same2/global_step_11/huggingface \
 PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
 RUN_MODE=train \
-RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_gpu012_len_gate_v1 \
+RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_paper_same2 \
 bash examples/time_series_forecast/run_qwen3-1.7B.sh \
   trainer.total_training_steps=120 \
   trainer.test_freq=20 \
@@ -245,200 +376,139 @@ bash examples/time_series_forecast/run_qwen3-1.7B.sh \
   trainer.log_val_generations=0
 ```
 
-如果你想把最小验证聚合单独归档到一个时间戳目录，在上面的 smoke test 或 120-step 命令前先加：
+如果你只是要续跑同一个实验，把 `trainer.total_training_steps` 调大，并去掉或改掉 `trainer.resume_mode=disable`。
+如果这一步也要抓逐 turn 的链路问题，把 `DEBUG_CHAIN=0` 改成 `1`。
 
-```bash
-RUN_TS=$(date +%Y%m%d_%H%M%S)
-export TS_MIN_DEBUG_DIR=$PWD/logs/debug/min_eval_${RUN_TS}
-mkdir -p "$TS_MIN_DEBUG_DIR"
-```
-RL 输出目录：
+## 训练后看什么
 
-```bash
-artifacts/checkpoints/rl/
-```
+### 当前“反思修正”监督是怎么构造的
 
-调试辅助（可选）：
+当前实现里，`route_then_refine` 不是凭空出现的，而是由 SFT builder 的启发式规则触发：
 
-```bash
-# 从 chain debug 中抽取 format 失败样本 + reward 链路摘要
-PYTHONPATH=$PWD conda run -n cast-r1-ts \
-python recipe/time_series_forecast/analyze_chain_debug.py \
-  --debug-file $PWD/logs/debug/ts_chain_debug_eval5_test.jsonl \
-  --top-k-fail 10
+- 如果选中的 feature tools 包含 `extract_data_quality` 或 `extract_forecast_residuals`，样本会被标成 `route_then_refine`
+- 如果选中的 feature tools 包含 `extract_within_channel_dynamics` 且 `teacher_eval_score_margin <= 0.05`，也会被标成 `route_then_refine`
+- 否则标成 `route_only`
 
-# 校验 SFT/curated 数据里 Turn3 最终答案是否满足 96 行约束
-PYTHONPATH=$PWD conda run -n cast-r1-ts \
-python recipe/time_series_forecast/validate_turn3_format.py \
-  --input-jsonl dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/train_curated.jsonl \
-  --expected-len 96 \
-  --top-k-invalid 10
-```
+当前 SFT 里 agent 学到的“反思修正”主要是两层：
+
+- 轨迹层：何时应该 `route_only`，何时应该 `route_then_refine`
+- 文本层：`<think>` 中如何解释“我为什么保留 selected forecast”或“我为什么做小幅修正”
+
+需要注意的是：当前离线数值 target 仍然大多直接沿用 selected teacher forecast，所以现在的 refinement supervision 仍然偏“language-guided / decision-guided”，还不是一个单独构造出的数值修正 target。这也是后续如果要继续增强的重点。
+
+### 关键日志
+
+- 聚合验证日志：`logs/debug/eval_step_aggregate.jsonl`
+- 样本切片日志：`logs/debug/eval_step_samples.jsonl`
+- chain debug：`$TS_CHAIN_DEBUG_FILE`
+- 最终启动命令：`debug_logs/final_launch_cmd.txt`
+
+### 当前最值得盯的字段
+
+聚合级：
+
+- `validation_reward_mean`
+- `orig_mse_mean`
+- `norm_mse_mean`
+- `selected_model_distribution`
+- `generation_stop_reason_distribution`
+- `final_answer_accept_ratio`
+- `tool_call_count_mean`
+- `history_analysis_count_mean`
+- `no_tool_call_ratio`
+- `tool_call_sequence_distribution`
+
+样本级：
+
+- `selected_model`
+- `generation_stop_reason`
+- `selected_forecast_orig_mse`
+- `final_vs_selected_mse`
+- `refinement_delta_orig_mse`
+- `final_answer_reject_reason`
+- `tool_call_count`
+- `history_analysis_count`
+- `tool_call_sequence`
 
 说明：
 
-- RL 默认 `resume_mode=auto`。同一个 `RL_EXP_NAME` 下再次运行，不会从头覆盖，而是会自动续跑最近的 checkpoint。
-- reward 现在是严格长度门控：`pred_len!=gt_len` 会直接 hard fail，95/94 不再拿正奖励。
-- 如果你把 `RL_ROLLOUT_GPU_MEMORY_UTILIZATION` 压得很低，又没有显式设置 `RL_ROLLOUT_MAX_MODEL_LEN`，vLLM 会退回模型原生上下文长度来预留 KV cache，Qwen3-1.7B 这里会按 `40960` 处理，容易直接在启动阶段报 `Engine core initialization failed`。机制验证这组参数建议固定带上 `RL_ROLLOUT_MAX_MODEL_LEN=8192`。
-- 如果当前实验已经跑到 `100 step`，再写 `trainer.total_training_steps=100` 通常不会继续训练；续跑时要把总步数设得更大，比如 `200`。
-- 如果你想完全重新开始，请换一个新的 `RL_EXP_NAME`，或者加 `trainer.resume_mode=disable`。
-- 当前这条 ETTh1/OT 训练链路里，`vLLM + load_format=dummy` 会导致 rollout 输出异常长的乱码文本，表现为 `response_length=3072`、`reward=0`。
-- 现在脚本已经默认改成 `safetensors`，不需要再手工额外覆盖；只有在你明确要测试别的加载方式时，才需要自己改 `RL_ROLLOUT_LOAD_FORMAT`。
-- 如果你手动设置过 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，在 RL 前要先 `unset`；当前 vLLM memory pool 和这个选项不兼容。
-- `MODEL_PATH` 必须指向 `.../global_step_x/huggingface`，不能只写到 `global_step_x`。
-- 如果训练已经跑到目标 step 并写出 `global_step_x`，但最后只剩下 dataloader / vLLM 的退出日志，先以 checkpoint 是否成功落盘为准；当前默认配置已经把这类退出期噪声尽量收到了最小。
+- `selected_forecast_*` 和 `final_vs_selected_*` 已经进入 reward extra info
+- 如果 `no_tool_call_ratio` 很高，优先怀疑 agent 没有真正进入 Cast-R1 工具链
+- 如果 `tool_call_sequence_distribution` 里大多数是 `none`，先不要分析 forecasting 精度，先修协议和数据
+- 更细的字段优先去 `eval_step_samples.jsonl` 或 chain debug 看
 
-## 常见问题（FAQ）
+## 常见问题
 
-### 1) `response_length` 设得不合理，导致长度失败或输出噪声多
+### 1. `MODEL_PATH` 写错
 
-- 现象：`pred_len!=96` 比例升高，或 reward 里 `length_mismatch` 增多。
-- 建议：先用 profile 默认的 `RL_MAX_RESPONSE_LENGTH=4096`，不要一开始就调太小。
-- 若你想强化“刚好 96 行”，优先从 prompt/SFT 数据约束入手，再小幅调温度，不要先硬砍长度上限。
-
-### 2) `temperature` 过高或过低，格式与精度会互相拉扯
-
-- 现象：
-  - 过高：格式波动增大、长度不稳定。
-  - 过低：输出过于保守，探索不足，reward 提升慢。
-- profile 默认值是 `RL_TEMPERATURE=0.4`、`RL_VAL_TEMPERATURE=0.1`。
-- 这轮长度门控机制验证建议先用 `RL_TEMPERATURE=0.3`，优先追求收尾稳定性。
-- 调参策略：每次只改一个参数，小步（如 `0.1`）调整并观察 `5~10` 个 test 周期。
-
-### 3) Batch / token 预算过激，容易 OOM 或吞吐异常
-
-- 重点联动参数：`RL_TRAIN_BATCH_SIZE`、`RL_PPO_MINI_BATCH_SIZE`、`RL_PPO_MICRO_BATCH_SIZE`、`RL_ACTOR_MAX_TOKEN_LEN_PER_GPU`。
-- 现象：OOM、step 时间极不稳定、Ray worker 频繁重启。
-- 建议：保持 profile 默认（train 模式 `3/3/1`），遇到 OOM 优先降 batch，再考虑降 token 上限。
-
-### 4) 训练步数和续跑模式设置不当，导致“看起来没训练”
-
-- 现象：日志正常但几乎不前进，或很快结束。
-- 常见原因：`trainer.total_training_steps` 小于（或等于）当前已训练步数。
-- 建议：
-  - 续跑：增大 `trainer.total_training_steps`，保持 `resume_mode=auto`。
-  - 全新实验：新 `RL_EXP_NAME` + `trainer.resume_mode=disable`。
-
-### 5) 参数分散在多处，导致配置混乱
-
-- 现在关键默认值只在一个 profile 维护：
+RL 的 `MODEL_PATH` 必须指向：
 
 ```bash
-examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
+.../global_step_x/huggingface
 ```
 
-- 启动脚本要求传 `PROFILE_PATH`；优先级固定为：**命令行覆盖 > 环境变量 > profile 默认值**。
+不能只写到 `global_step_x`。
 
-### 6) 服务器上 `git push` 认证失败（`Permission denied (publickey)`）
+### 2. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
 
-- 原因：浏览器登录 GitHub 不等于服务器里的 git 凭证；且当前环境需要走代理，SSH 更容易失败。
-- 推荐：直接用 HTTPS + PAT，并固定 git 代理。
+当前 vLLM memory pool 和这个选项不兼容。跑 RL 前先：
 
 ```bash
-git remote set-url origin https://github.com/musihai/eeh1_test.git
-git config --global http.proxy http://127.0.0.1:7897
-git config --global https.proxy http://127.0.0.1:7897
-git config --global credential.helper store
-git push origin main
+unset PYTORCH_CUDA_ALLOC_CONF
 ```
 
-- 首次 push 输入 GitHub 用户名与 PAT，后续会复用缓存凭证。
+### 3. `Engine core initialization failed`
+
+如果你把 `RL_ROLLOUT_GPU_MEMORY_UTILIZATION` 压得很低，却没设置 `RL_ROLLOUT_MAX_MODEL_LEN`，vLLM 会回退到模型原生上下文长度来预留 KV cache，Qwen3-1.7B 这里会按 `40960` 处理，常见结果就是启动阶段直接失败。
+
+建议固定带上：
+
+```bash
+RL_ROLLOUT_MAX_MODEL_LEN=8192
+```
+
+### 4. OOM
+
+优先按这个顺序降：
+
+1. `RL_ROLLOUT_GPU_MEMORY_UTILIZATION`
+2. `RL_ROLLOUT_N`
+3. `RL_ROLLOUT_MAX_BATCHED_TOKENS`
+4. `RL_MAX_RESPONSE_LENGTH`
+5. `RL_ACTOR_MAX_TOKEN_LEN_PER_GPU`
+
+### 5. 为什么 `/models` 里看不到 `arima`
+
+`arima` 走本地推理路径，不通过远程模型服务加载，所以不会出现在 `/models` 列表。
+
+### 6. 我已经有旧的 `teacher200` / SFT / RL checkpoint 了，还能接着用吗
+
+不建议。
+
+当前 reward、SFT 轨迹和 RL 元信息都已经变了，旧产物至少要按下面顺序重建：
+
+1. RL jsonl
+2. teacher eval / teacher200
+3. SFT
+4. RL
 
 ## 清理 Ray
 
-训练结束（或卡死）后，先停掉 Ray 集群，再清理临时目录，避免下次启动时继承旧 actor / worker 状态：
-
 ```bash
-# 优雅停止（等待 actor 退出）
 ray stop
-
-# 如果 ray stop 挂住，强制杀掉所有 Ray 进程
 ray stop --force
-
-# 清理 Ray session 临时目录（日志、socket、plasma store 等）
 rm -rf /tmp/ray
 ```
 
-> 注意：如果同一台机器上还有其他人在用 Ray，`ray stop --force` 会影响所有人；确认没有冲突再执行。
+如果同一台机器上还有其他人在用 Ray，先确认不会影响别人。
 
----
-
-## 可选 smoke
-
-如果你只想先确认整条链能起：
-
-### SFT smoke
-
-```bash
-MODEL_PATH=/data/linyujie/models/Qwen3-1.7B \
-PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
-RUN_MODE=smoke \
-bash examples/time_series_forecast/run_qwen3-1.7B_sft.sh
-```
-
-### RL smoke
-
-```bash
-MODEL_PATH=/data/linyujie/models/Qwen3-1.7B \
-PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
-RUN_MODE=smoke \
-bash examples/time_series_forecast/run_qwen3-1.7B.sh
-```
-
-## 当前最重要的几个目录
+## 当前最重要的目录
 
 - 原始数据：`dataset/ETT-small/ETTh1.csv`
-- RL 数据：`dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424/`
-- 默认 SFT 子集：`dataset/ett_sft_etth1_runtime_ot_paper200/`
-- 推荐高质量 SFT：`dataset/ett_sft_etth1_runtime_ot_teacher200_gpu/`
-
-## 推荐目录划分（整理建议）
-
-当前工作区功能完整，但目录混合了“源码、实验产物、临时日志”。建议按“长期保留 vs 可再生产物”分层，后续更容易维护和清理。
-
-建议结构（可渐进迁移，不需要一次性改完）：
-
-```text
-Cast-R1-TS-main/
-  src/                      # 训练/数据/奖励核心代码（可由现有 recipe/, arft/ 渐进映射）
-  scripts/                  # 入口脚本（可由 examples/time_series_forecast/*.sh 归拢）
-  configs/                  # 统一配置（可由 examples/.../configs + recipe 配置归拢）
-  data/
-    raw/                    # 原始数据（如 ETT-small）
-    processed/
-      rl/                   # RL 训练集 jsonl
-      sft/                  # SFT parquet/jsonl
-  artifacts/
-    checkpoints/
-      sft/                  # SFT checkpoint
-      rl/                   # RL checkpoint
-    exports/                # hf export / 最终可发布模型
-  logs/
-    train/                  # 训练日志（原 /tmp/rl_*.log 可软链/复制过来）
-    debug/                  # chain debug jsonl
-    ray/                    # ray session 日志归档
-  docs/                     # 说明文档（可放 修改方案.md、排障笔记）
-  tests/                    # 单测
-```
-
-与当前目录的对应关系（建议）：
-
-- `dataset/` → 逐步映射到 `data/raw` 与 `data/processed/{rl,sft}`。
-- 现在默认统一落盘到 `artifacts/checkpoints/{rl,sft}`。
-- 旧 `checkpoints/TimeSeriesForecast*`、`checkpoints/time_series_forecast_sft*` 已保留软链接兼容，历史命令仍可用。
-- `outputs/`、`swanlog/`、`/tmp/ts_chain_debug*.jsonl` → 统一归档到 `logs/{train,debug}`。
-- `examples/time_series_forecast/*.sh` → 逐步沉淀到 `scripts/`（保留兼容软链接即可）。
-- `recipe/time_series_forecast/` + `arft/` → 保持现状可用，后续按模块逐步迁到 `src/`。
-
-建议先做三件事（收益最高）：
-
-1. 新建 `artifacts/` 与 `logs/` 两层，把 checkpoint / debug / train log 统一落盘。
-2. 保持脚本入口不变，但把路径变量统一为这两层（避免到处写绝对路径）。
-3. 每个实验固定一套命名：`<task>_<model>_<stage>_<date>`，并与 `RL_EXP_NAME` 对齐。
-
-## 一句话注意事项
-
-- 如果你重建过 `teacher200_gpu` 或更新过 compact 协议，就重新跑一次 SFT，不要直接接旧的 RL checkpoint。
-- 工具服务命令是前台常驻，不会自动返回 shell。
-- 正式 RL 之前，优先保证 SFT 已经成功导出 `huggingface` 目录。
-- 如果你确实要启用 `swanlab`，手动覆盖 `SFT_LOGGER='["console","swanlab"]'` 或 `RL_LOGGER='["console","swanlab"]'`。
+- 基础 RL 数据：`dataset/ett_rl_etth1_paper_same2/`
+- curriculum RL 数据：`dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/`
+- 第一轮 teacher200：`dataset/ett_sft_etth1_runtime_teacher200_paper_same2/`
+- 推荐正式 teacher200：`dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2/`
+- SFT checkpoint：`artifacts/checkpoints/sft/`
+- RL checkpoint：`artifacts/checkpoints/rl/`
+- 调试日志：`logs/debug/`

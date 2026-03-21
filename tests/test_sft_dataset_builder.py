@@ -12,7 +12,7 @@ from recipe.time_series_forecast.utils import compact_prediction_tool_output_fro
 
 class TestETTh1SFTDatasetBuilder(unittest.TestCase):
     def test_convert_small_rl_slice_to_multiturn_parquet(self):
-        source_jsonl = Path("dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424/train.jsonl")
+        source_jsonl = Path("dataset/ett_rl_etth1_paper_same/train.jsonl")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = Path(tmpdir) / "train.parquet"
@@ -35,42 +35,54 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
 
             messages = loaded.iloc[0]["messages"]
             roles = [message["role"] for message in messages]
-            self.assertEqual(
-                roles,
-                [
-                    "system",
-                    "user",
-                    "assistant",
-                    "tool",
-                    "tool",
-                    "tool",
-                    "tool",
-                    "tool",
-                    "user",
-                    "assistant",
-                    "tool",
-                    "user",
-                    "assistant",
-                ],
-            )
+            self.assertEqual(roles[0:3], ["system", "user", "assistant"])
+            self.assertEqual(roles[-5:], ["user", "assistant", "tool", "user", "assistant"])
 
             first_tool_calls = messages[2]["tool_calls"]
-            self.assertEqual(len(first_tool_calls), 5)
+            self.assertGreaterEqual(len(first_tool_calls), 2)
+            self.assertLessEqual(len(first_tool_calls), 5)
             self.assertEqual(first_tool_calls[0]["function"]["name"], "extract_basic_statistics")
-            self.assertEqual(messages[9]["tool_calls"][0]["function"]["name"], "predict_time_series")
+            self.assertTrue(all(call["function"]["name"] != "predict_time_series" for call in first_tool_calls))
+
+            prediction_assistant_index = next(
+                idx
+                for idx, message in enumerate(messages)
+                if message["role"] == "assistant"
+                and "tool_calls" in message
+                and len(message["tool_calls"]) > 0
+                and message["tool_calls"][0]["function"]["name"] == "predict_time_series"
+            )
             self.assertEqual(messages[2]["content"], "")
-            self.assertEqual(messages[9]["content"], "")
-            self.assertIn("### Analysis Summary", messages[8]["content"])
-            self.assertIn("### Prediction Tool Output", messages[11]["content"])
+            self.assertEqual(messages[prediction_assistant_index]["content"], "")
+            self.assertIn("### Analysis Summary", messages[prediction_assistant_index - 1]["content"])
+            self.assertIn("### Prediction Tool Output", messages[prediction_assistant_index + 2]["content"])
             self.assertIn("<think>", messages[-1]["content"])
             self.assertIn("<answer>", messages[-1]["content"])
+            self.assertIn(loaded.iloc[0]["sft_trajectory_type"], {"route_only", "route_then_refine"})
+            self.assertIsInstance(list(loaded.iloc[0]["selected_feature_tools"]), list)
+            self.assertIn("selected_feature_tool_count", loaded.columns)
+            self.assertIn("selected_feature_tool_signature", loaded.columns)
+            self.assertIn("refinement_supervision_type", loaded.columns)
+            self.assertIn("refinement_trigger_reason", loaded.columns)
+            self.assertEqual(
+                loaded.iloc[0]["selected_feature_tool_signature"],
+                "->".join(list(loaded.iloc[0]["selected_feature_tools"])),
+            )
+            self.assertEqual(
+                int(loaded.iloc[0]["selected_feature_tool_count"]),
+                len(list(loaded.iloc[0]["selected_feature_tools"])),
+            )
+            if loaded.iloc[0]["sft_trajectory_type"] == "route_then_refine":
+                self.assertEqual(loaded.iloc[0]["refinement_supervision_type"], "language_only_refinement_hint")
+            else:
+                self.assertEqual(loaded.iloc[0]["refinement_supervision_type"], "keep_selected_forecast")
             tools = list(loaded.iloc[0]["tools"])
             self.assertEqual(len(tools), len(TIMESERIES_TOOL_SCHEMAS))
             self.assertEqual(tools[0]["function"]["name"], TIMESERIES_TOOL_SCHEMAS[0]["function"]["name"])
             self.assertEqual(tools[-1]["function"]["name"], TIMESERIES_TOOL_SCHEMAS[-1]["function"]["name"])
 
     def test_convert_uses_cached_teacher_prediction_when_present(self):
-        source_jsonl = Path("dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424/train.jsonl")
+        source_jsonl = Path("dataset/ett_rl_etth1_paper_same/train.jsonl")
 
         with source_jsonl.open("r", encoding="utf-8") as handle:
             sample = json.loads(next(handle))
@@ -92,14 +104,18 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             )
 
             messages = dataframe.iloc[0]["messages"]
+            prediction_tool_message = next(
+                message for message in messages if message["role"] == "tool" and "Forecast Values:" in message["content"]
+            )
             self.assertEqual(
-                messages[10]["content"],
+                prediction_tool_message["content"],
                 compact_prediction_tool_output_from_string(
                     sample["teacher_prediction_text"],
                     model_name="chronos2",
                 ),
             )
-            self.assertIn(sample["teacher_prediction_text"].splitlines()[0], messages[-1]["content"])
+            self.assertIn("1.0000", messages[-1]["content"])
+            self.assertIn("2.0000", messages[-1]["content"])
 
 
 if __name__ == "__main__":

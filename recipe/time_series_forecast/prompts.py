@@ -75,12 +75,12 @@ After seeing feature results in "Analysis History", call `predict_time_series` w
 - 'itransformer': useful when the window shows regime changes or longer-range dependencies
 
 **Turn 3 - Final Output**:
-Reflect on feature analysis and model predictions, refine unreasonable results, and output the final forecast.
+Use the selected model prediction as the initial forecast. Reflect on the diagnostic evidence, make only small evidence-based refinements when necessary, and output the final forecast.
 
 ## Output Format (Turn 3 only)
 Your response MUST contain ONLY the two tags below, in this order, with no extra text before/between/after them.
-If you would use the model predictions directly, paste the actual predicted values inside <answer>.
-<think>[Reflect predictions, note any adjustments]</think>
+Your final forecast must be based on the selected model prediction shown in "Prediction Tool Output". Do not invent an unrelated forecast.
+<think>[Reflect on the selected forecast and note whether a small refinement is needed]</think>
 <answer>
 12.3450
 ...
@@ -132,7 +132,8 @@ def get_runtime_turn_info(
     if not has_predictions:
         return 2, "Call predict_time_series with your chosen model (e.g., 'chronos2')."
     return 3, (
-        "Output your final answer in <think>...</think><answer>...</answer> format using the model predictions. "
+        "Output your final answer in <think>...</think><answer>...</answer> format using the selected model prediction as the initial forecast. "
+        "If you refine it, keep the change small and evidence-based. "
         "Do NOT output any text outside these tags. <answer> must contain exactly 96 lines, one numeric value per line, no timestamps. "
         "Stop immediately after the 96th value. Do not generate a 97th value. "
         "After the 96th value, immediately close with </answer>, and do not output any text after it. "
@@ -169,16 +170,18 @@ def build_runtime_user_prompt(
 
 **Instructions**:
 1. Do NOT call more tools.
-2. Reflect briefly on whether the forecast values are consistent with the compact analysis summary.
-3. Output the final refined prediction.
-4. Output ONLY <think>...</think> and <answer>...</answer>. Do not include anything else.
-5. <answer> must contain EXACTLY {forecast_horizon} lines.
-6. Each line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
-7. Stop immediately after the {forecast_horizon}th value, and do NOT generate any extra value.
-8. After the {forecast_horizon}th value, immediately output </answer>, with no extra text after it.
-9. Keep <think> to ONE short sentence.
+2. Treat "Prediction Tool Output" as the initial forecast produced by the selected model.
+3. Reflect briefly on whether this initial forecast is consistent with the compact analysis summary.
+4. If refinement is needed, keep it small, local, and evidence-based. Do NOT rewrite the forecast arbitrarily.
+5. Output the final forecast generated from that selected-model forecast.
+6. Output ONLY <think>...</think> and <answer>...</answer>. Do not include anything else.
+7. <answer> must contain EXACTLY {forecast_horizon} lines.
+8. Each line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
+9. Stop immediately after the {forecast_horizon}th value, and do NOT generate any extra value.
+10. After the {forecast_horizon}th value, immediately output </answer>, with no extra text after it.
+11. Keep <think> to ONE short sentence.
 
-<think>[One short sentence reflecting consistency between features and forecast]</think>
+<think>[One short sentence reflecting whether the selected-model forecast should be kept or slightly refined]</think>
 
 <answer>
 [Final prediction after reflection and refinement]

@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Optional
 
+import numpy as np
 import pandas as pd
+
+from recipe.time_series_forecast.utils import extract_data_quality
 
 
 DEFAULT_CSV_PATH = Path("dataset/ETT-small/ETTh1.csv")
-DEFAULT_OUTPUT_DIR = Path("dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424")
+DEFAULT_OUTPUT_DIR = Path("dataset/ett_rl_etth1_paper_same")
 
 # These row counts reproduce the historical split sizes that the rest of the
 # repo was built around:
@@ -49,7 +54,7 @@ def build_prompt(
         "Requirements:\n"
         "1) Extract feature evidence before selecting a forecasting model.\n"
         "2) Choose one model from the enabled experts and then predict.\n"
-        "3) Follow the required output protocol with <think> and <answer>.\n"
+        "3) In Turn 3, refine the selected model forecast if needed and follow the required output protocol with <think> and <answer>.\n"
         "Historical Data:\n"
         f"{value_lines}"
     )
@@ -82,6 +87,127 @@ def build_split_configs(
     ]
 
 
+def compute_normalized_permutation_entropy(
+    values: Iterable[float],
+    *,
+    order: int = 3,
+    delay: int = 1,
+) -> float:
+    series = np.asarray(list(values), dtype=float)
+    window_size = (order - 1) * delay + 1
+    if order < 2 or delay < 1 or len(series) < window_size:
+        return 0.0
+
+    pattern_counts: Counter[tuple[int, ...]] = Counter()
+    total = 0
+    for start in range(len(series) - window_size + 1):
+        window = series[start : start + window_size : delay]
+        pattern = tuple(np.argsort(window, kind="mergesort"))
+        pattern_counts[pattern] += 1
+        total += 1
+
+    if total <= 0:
+        return 0.0
+
+    probs = np.asarray(list(pattern_counts.values()), dtype=float) / float(total)
+    entropy = float(-np.sum(probs * np.log(probs + 1e-12)))
+    max_entropy = math.log(math.factorial(order))
+    if max_entropy <= 0:
+        return 0.0
+    return float(np.clip(entropy / max_entropy, 0.0, 1.0))
+
+
+def _compute_quality_issue_flag(values: list[float]) -> bool:
+    quality = extract_data_quality(values)
+    return bool(
+        float(quality.get("quality_quantization_score", 0.0)) >= 0.25
+        or float(quality.get("quality_saturation_ratio", 0.0)) >= 0.08
+        or float(quality.get("quality_constant_channel_ratio", 0.0)) > 0.0
+        or float(quality.get("quality_dropout_ratio", 0.0)) > 0.0
+    )
+
+
+def _quantile_thresholds(values: list[float]) -> tuple[Optional[float], Optional[float]]:
+    finite_values = [float(value) for value in values if value is not None and np.isfinite(value)]
+    if not finite_values:
+        return (None, None)
+    array = np.asarray(finite_values, dtype=float)
+    return (float(np.quantile(array, 1.0 / 3.0)), float(np.quantile(array, 2.0 / 3.0)))
+
+
+def _band_value(value: Optional[float], thresholds: tuple[Optional[float], Optional[float]]) -> str:
+    low, high = thresholds
+    if value is None or not np.isfinite(value):
+        return "unknown"
+    if low is None or high is None:
+        return "medium"
+    if value <= low:
+        return "low"
+    if value <= high:
+        return "medium"
+    return "high"
+
+
+def _resolve_difficulty_stage(error_band: str, entropy_band: str) -> str:
+    rank_map = {"low": 0, "medium": 1, "high": 2}
+    available_ranks = [rank_map[band] for band in (error_band, entropy_band) if band in rank_map]
+    if not available_ranks:
+        return "unknown"
+    return ("easy", "medium", "hard")[max(available_ranks)]
+
+
+def _resolve_reference_teacher_error(metadata: dict[str, Any]) -> Optional[float]:
+    candidate_keys = (
+        "reference_teacher_error",
+        "best_orig_mse",
+        "teacher_eval_best_orig_mse",
+        "orig_mse",
+    )
+    for key in candidate_keys:
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            scalar = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(scalar):
+            return scalar
+    return None
+
+
+def load_teacher_metadata(path: str | Path | None) -> dict[int, dict[str, Any]]:
+    if not path:
+        return {}
+    metadata_path = Path(path)
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Teacher metadata jsonl not found: {metadata_path}")
+
+    metadata_by_index: dict[int, dict[str, Any]] = {}
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            sample_index = int(record.get("sample_index", record.get("index", -1)))
+            if sample_index < 0:
+                continue
+            metadata_by_index[sample_index] = record
+    return metadata_by_index
+
+
+def compute_teacher_metadata_coverage(
+    *,
+    num_samples: int,
+    teacher_metadata_by_index: Optional[dict[int, dict[str, Any]]],
+) -> float:
+    if num_samples <= 0:
+        return 1.0
+    metadata = teacher_metadata_by_index or {}
+    covered = sum(1 for sample_index in range(num_samples) if sample_index in metadata)
+    return float(covered / num_samples)
+
+
 def iter_split_samples(
     df: pd.DataFrame,
     split: SplitConfig,
@@ -89,6 +215,7 @@ def iter_split_samples(
     lookback_window: int,
     forecast_horizon: int,
     target_column: str,
+    teacher_metadata_by_index: Optional[dict[int, dict[str, Any]]] = None,
 ) -> Iterable[dict]:
     split_df = df.iloc[split.start_row : split.end_row].reset_index(drop=True)
     window_span = lookback_window + forecast_horizon
@@ -99,35 +226,73 @@ def iter_split_samples(
             f"Rows: {len(split_df)}"
         )
 
+    teacher_metadata_by_index = teacher_metadata_by_index or {}
+    staged_records: list[dict[str, Any]] = []
+    entropy_values: list[float] = []
+    reference_teacher_errors: list[float] = []
+
     for sample_index in range(num_samples):
         hist_end = sample_index + lookback_window
         forecast_end = hist_end + forecast_horizon
         historical = split_df.iloc[sample_index:hist_end]
         forecast = split_df.iloc[hist_end:forecast_end]
+        historical_values = historical[target_column].tolist()
 
         prompt_text = build_prompt(
-            historical[target_column].tolist(),
+            historical_values,
             lookback_window=lookback_window,
             forecast_horizon=forecast_horizon,
             target_column=target_column,
         )
         ground_truth = build_ground_truth(forecast, target_column=target_column)
 
-        yield {
-            "index": sample_index,
-            "uid": f"etth1-{split.name}-{sample_index:05d}",
-            "agent_name": "time_series_forecast_agent",
-            "data_source": "ETTh1",
-            "target_column": target_column,
-            "lookback_window": lookback_window,
-            "forecast_horizon": forecast_horizon,
-            "split": split.name,
-            "raw_prompt": [{"role": "user", "content": prompt_text}],
-            "reward_model": {
-                "style": "rule",
-                "ground_truth": ground_truth,
-            },
-        }
+        teacher_metadata = dict(teacher_metadata_by_index.get(sample_index, {}))
+        reference_teacher_error = _resolve_reference_teacher_error(teacher_metadata)
+        normalized_entropy = compute_normalized_permutation_entropy(historical_values)
+        quality_issue_flag = _compute_quality_issue_flag(historical_values)
+
+        entropy_values.append(normalized_entropy)
+        if reference_teacher_error is not None:
+            reference_teacher_errors.append(reference_teacher_error)
+
+        staged_records.append(
+            {
+                "index": sample_index,
+                "uid": f"etth1-{split.name}-{sample_index:05d}",
+                "agent_name": "time_series_forecast_agent",
+                "data_source": "ETTh1",
+                "target_column": target_column,
+                "lookback_window": lookback_window,
+                "forecast_horizon": forecast_horizon,
+                "split": split.name,
+                "raw_prompt": [{"role": "user", "content": prompt_text}],
+                "reward_model": {
+                    "style": "rule",
+                    "ground_truth": ground_truth,
+                },
+                "reference_teacher_error": reference_teacher_error,
+                "normalized_permutation_entropy": normalized_entropy,
+                "offline_best_model": teacher_metadata.get("best_model") or teacher_metadata.get("reference_teacher_model"),
+                "offline_margin": teacher_metadata.get("score_margin", teacher_metadata.get("teacher_eval_score_margin")),
+                "quality_issue_flag": bool(quality_issue_flag),
+            }
+        )
+
+    error_thresholds = _quantile_thresholds(reference_teacher_errors)
+    entropy_thresholds = _quantile_thresholds(entropy_values)
+
+    for record in staged_records:
+        error_band = _band_value(record["reference_teacher_error"], error_thresholds)
+        entropy_band = _band_value(record["normalized_permutation_entropy"], entropy_thresholds)
+        difficulty_stage = _resolve_difficulty_stage(error_band, entropy_band)
+        curriculum_band = f"{error_band}/{entropy_band}"
+
+        record["reference_teacher_error_band"] = error_band
+        record["normalized_permutation_entropy_band"] = entropy_band
+        record["difficulty_stage"] = difficulty_stage
+        record["curriculum_stage"] = difficulty_stage
+        record["curriculum_band"] = curriculum_band
+        yield record
 
 
 def write_jsonl(records: Iterable[dict], output_path: Path) -> int:
@@ -150,6 +315,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-rows", type=int, default=DEFAULT_TRAIN_ROWS, help="Number of raw rows in train split.")
     parser.add_argument("--val-rows", type=int, default=DEFAULT_VAL_ROWS, help="Number of raw rows in val split.")
     parser.add_argument("--test-rows", type=int, default=DEFAULT_TEST_ROWS, help="Number of raw rows in test split.")
+    parser.add_argument("--train-teacher-metadata-jsonl", default="", help="Optional teacher-metadata jsonl for train split.")
+    parser.add_argument("--val-teacher-metadata-jsonl", default="", help="Optional teacher-metadata jsonl for val split.")
+    parser.add_argument("--test-teacher-metadata-jsonl", default="", help="Optional teacher-metadata jsonl for test split.")
+    parser.add_argument(
+        "--min-teacher-metadata-coverage",
+        type=float,
+        default=0.95,
+        help=(
+            "Minimum acceptable teacher-metadata coverage ratio when a teacher-metadata jsonl is provided. "
+            "Set to 0 to disable the check."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -174,6 +351,16 @@ def main() -> None:
         test_rows=args.test_rows,
     )
 
+    teacher_metadata_paths = {
+        "train": args.train_teacher_metadata_jsonl,
+        "val": args.val_teacher_metadata_jsonl,
+        "test": args.test_teacher_metadata_jsonl,
+    }
+    teacher_metadata_by_split = {
+        split_name: load_teacher_metadata(path) if path else {}
+        for split_name, path in teacher_metadata_paths.items()
+    }
+
     metadata: dict[str, object] = {
         "source_csv": str(csv_path),
         "target_column": args.target_column,
@@ -181,21 +368,58 @@ def main() -> None:
         "forecast_horizon": args.forecast_horizon,
         "total_rows": len(df),
         "splits": [asdict(split) | {"num_rows": split.num_rows} for split in splits],
+        "teacher_metadata_paths": teacher_metadata_paths,
     }
 
     for split in splits:
-        output_path = output_dir / f"{split.name}.jsonl"
-        count = write_jsonl(
+        split_df = df.iloc[split.start_row : split.end_row].reset_index(drop=True)
+        window_span = args.lookback_window + args.forecast_horizon
+        num_samples = len(split_df) - window_span + 1
+        metadata_for_split = teacher_metadata_by_split.get(split.name)
+        coverage_ratio = compute_teacher_metadata_coverage(
+            num_samples=num_samples,
+            teacher_metadata_by_index=metadata_for_split,
+        )
+        coverage_count = sum(
+            1 for sample_index in range(max(num_samples, 0)) if sample_index in (metadata_for_split or {})
+        )
+        if teacher_metadata_paths.get(split.name):
+            print(
+                f"[RL-DATA] split={split.name} teacher metadata coverage: "
+                f"{coverage_count}/{num_samples} ({coverage_ratio:.2%})"
+            )
+            if args.min_teacher_metadata_coverage > 0 and coverage_ratio < args.min_teacher_metadata_coverage:
+                raise ValueError(
+                    f"Teacher metadata coverage for split={split.name} is too low: "
+                    f"{coverage_count}/{num_samples} ({coverage_ratio:.2%}) < "
+                    f"{args.min_teacher_metadata_coverage:.2%}. "
+                    f"Provided file: {teacher_metadata_paths.get(split.name)}"
+                )
+
+        records = list(
             iter_split_samples(
                 df,
                 split,
                 lookback_window=args.lookback_window,
                 forecast_horizon=args.forecast_horizon,
                 target_column=args.target_column,
-            ),
-            output_path,
+                teacher_metadata_by_index=metadata_for_split,
+            )
         )
+        output_path = output_dir / f"{split.name}.jsonl"
+        count = write_jsonl(records, output_path)
+
+        entropy_values = [float(record["normalized_permutation_entropy"]) for record in records]
+        reference_teacher_errors = [
+            float(record["reference_teacher_error"])
+            for record in records
+            if record.get("reference_teacher_error") is not None
+        ]
         metadata[f"{split.name}_samples"] = count
+        metadata[f"{split.name}_teacher_metadata_coverage_ratio"] = coverage_ratio
+        metadata[f"{split.name}_teacher_metadata_coverage_count"] = coverage_count
+        metadata[f"{split.name}_entropy_thresholds"] = _quantile_thresholds(entropy_values)
+        metadata[f"{split.name}_reference_teacher_error_thresholds"] = _quantile_thresholds(reference_teacher_errors)
         print(
             f"[RL-DATA] split={split.name} rows={split.num_rows} samples={count} -> {output_path}"
         )

@@ -9,12 +9,15 @@ from typing import List, Optional, Tuple
 from verl.utils.chain_debug import append_chain_debug, short_text
 
 
-# Strict ablation setting: only keep format, length, and MSE rewards.
-ENABLE_CHANGE_POINT_SCORE = False
-ENABLE_SEASON_TREND_SCORE = False
-STRICT_RAW_MODE = True
-STRICT_LENGTH_GATE = os.getenv("TS_STRICT_LENGTH_GATE", "1").lower() in {"1", "true", "yes", "on"}
-REWARD_USE_ORIG_SCALE = os.getenv("TS_REWARD_USE_ORIG_SCALE", "1").lower() in {"1", "true", "yes", "on"}
+# Paper-aligned composite reward:
+# - normalized/log-transformed MSE as the main term
+# - structural alignment and season/trend consistency as shaping terms
+# - format validity and output-length consistency as auxiliary constraints
+ENABLE_CHANGE_POINT_SCORE = os.getenv("TS_ENABLE_CHANGE_POINT_SCORE", "1").lower() in {"1", "true", "yes", "on"}
+ENABLE_SEASON_TREND_SCORE = os.getenv("TS_ENABLE_SEASON_TREND_SCORE", "1").lower() in {"1", "true", "yes", "on"}
+STRICT_RAW_MODE = os.getenv("TS_STRICT_RAW_MODE", "0").lower() in {"1", "true", "yes", "on"}
+STRICT_LENGTH_GATE = os.getenv("TS_STRICT_LENGTH_GATE", "0").lower() in {"1", "true", "yes", "on"}
+REWARD_USE_ORIG_SCALE = os.getenv("TS_REWARD_USE_ORIG_SCALE", "0").lower() in {"1", "true", "yes", "on"}
 TURN3_SUCCESS_SAMPLE_RATE = max(int(os.getenv("TS_TURN3_SUCCESS_SAMPLE_RATE", "100") or 100), 1)
 
 
@@ -43,6 +46,8 @@ def append_turn3_generation_debug(
     length_score: float,
     length_penalty: float,
     mse_score: float,
+    change_point_score: float,
+    season_trend_score: float,
     final_score: float,
     orig_mse: float,
     orig_mae: float,
@@ -65,6 +70,17 @@ def append_turn3_generation_debug(
     is_failure = bool(format_score < 0 or (gt_len > 0 and pred_len != gt_len))
     raw_text = solution_str or ""
     parsed_answer = extract_answer(raw_text)
+    answer_region = extract_answer_region(raw_text)
+    numeric_line_count, non_numeric_line_count = count_numeric_only_lines(answer_region)
+    suffix_repetition_detected, suffix_repetition_period, suffix_repetition_repeats = detect_suffix_repetition(
+        pred_values
+    )
+    trailing_after_close = trailing_text_after_close(raw_text)
+    value_unique_ratio = (
+        float(len({round(float(v), 6) for v in pred_values}) / pred_len)
+        if pred_len > 0
+        else float("nan")
+    )
     was_clipped = bool(format_failure_reason == "missing_answer_close_tag")
     under_generation = bool(gt_len > 0 and pred_len < gt_len)
     over_generation = bool(gt_len > 0 and pred_len > gt_len)
@@ -81,6 +97,10 @@ def append_turn3_generation_debug(
         "has_answer_tag": bool(has_answer_tag),
         "has_answer_open": bool(has_answer_open),
         "has_answer_close": bool(has_answer_close),
+        "answer_open_count": int(raw_text.count("<answer>")),
+        "answer_close_count": int(raw_text.count("</answer>")),
+        "think_open_count": int(raw_text.count("<think>")),
+        "think_close_count": int(raw_text.count("</think>")),
         "raw_pred_len": pred_len,
         "pred_len": pred_len,
         "gt_len": gt_len,
@@ -93,6 +113,8 @@ def append_turn3_generation_debug(
         "length_score": float(length_score),
         "length_penalty": float(length_penalty),
         "mse_score": float(mse_score),
+        "change_point_score": float(change_point_score),
+        "season_trend_score": float(season_trend_score),
         "final_score": float(final_score),
         "orig_mse": orig_mse,
         "orig_mae": orig_mae,
@@ -102,6 +124,15 @@ def append_turn3_generation_debug(
         "raw_mae": raw_mae,
         "length_hard_fail": bool(length_hard_fail),
         "strict_length_match": bool(strict_length_match),
+        "answer_region_line_count": int(len([line for line in answer_region.splitlines() if line.strip()])),
+        "numeric_only_line_count": int(numeric_line_count),
+        "non_numeric_line_count": int(non_numeric_line_count),
+        "suffix_repetition_detected": bool(suffix_repetition_detected),
+        "suffix_repetition_period": int(suffix_repetition_period),
+        "suffix_repetition_repeats": int(suffix_repetition_repeats),
+        "value_unique_ratio": value_unique_ratio,
+        "trailing_text_after_close_len": int(len(trailing_after_close)),
+        "trailing_text_after_close_head": short_text(trailing_after_close, 200),
         "raw_text_tail": extract_tail_lines(raw_text, 10),
         "_debug_file": turn3_generation_debug_file(),
     }
@@ -215,6 +246,83 @@ def extract_tail_lines(text: Optional[str], max_lines: int = 10) -> List[str]:
     if max_lines <= 0:
         return []
     return lines[-max_lines:]
+
+
+def extract_answer_region(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    raw_text = str(text)
+    open_tag = "<answer>"
+    close_tag = "</answer>"
+    start = raw_text.rfind(open_tag)
+    if start < 0:
+        return ""
+    start += len(open_tag)
+    end = raw_text.find(close_tag, start)
+    if end < 0:
+        return raw_text[start:].strip()
+    return raw_text[start:end].strip()
+
+
+def count_numeric_only_lines(text: str) -> Tuple[int, int]:
+    numeric_count = 0
+    non_numeric_count = 0
+    for raw_line in str(text).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", line):
+            numeric_count += 1
+        else:
+            non_numeric_count += 1
+    return numeric_count, non_numeric_count
+
+
+def trailing_text_after_close(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    raw_text = str(text)
+    close_tag = "</answer>"
+    if close_tag not in raw_text:
+        return ""
+    return raw_text.split(close_tag, 1)[1].strip()
+
+
+def detect_suffix_repetition(
+    values: List[float],
+    *,
+    max_period: int = 8,
+    min_repeats: int = 2,
+    atol: float = 1e-8,
+) -> Tuple[bool, int, int]:
+    n = len(values)
+    if n < 2:
+        return False, 0, 0
+
+    def _segments_equal(a: List[float], b: List[float]) -> bool:
+        if len(a) != len(b):
+            return False
+        return all(abs(float(x) - float(y)) <= atol for x, y in zip(a, b))
+
+    best_period = 0
+    best_repeats = 0
+    upper_period = min(max_period, n // min_repeats)
+    for period in range(1, upper_period + 1):
+        base = values[-period:]
+        repeats = 1
+        cursor = n - 2 * period
+        while cursor >= 0:
+            segment = values[cursor : cursor + period]
+            if not _segments_equal(segment, base):
+                break
+            repeats += 1
+            cursor -= period
+        if repeats >= min_repeats and repeats * period > best_repeats * max(best_period, 1):
+            best_period = period
+            best_repeats = repeats
+    if best_repeats >= min_repeats:
+        return True, best_period, best_repeats
+    return False, 0, 0
 
 
 def extract_values_from_time_series_string(text: str) -> List[float]:
@@ -368,20 +476,20 @@ def compute_length_penalty(pred_len: int, gt_len: int) -> float:
     if len_gap == 0:
         penalty = 0.0
     elif len_gap == 1:
-        penalty = 0.08
+        penalty = 0.03
     elif len_gap == 2:
-        penalty = 0.12
+        penalty = 0.05
     elif len_gap <= 5:
-        penalty = 0.16
+        penalty = 0.08
     elif len_gap <= 20:
-        penalty = 0.24
+        penalty = 0.12
     elif len_gap <= 100:
-        penalty = 0.32
+        penalty = 0.18
     else:
-        penalty = 0.40
+        penalty = 0.24
 
     if pred_len > gt_len:
-        penalty += min((pred_len - gt_len) / gt_len, 1.0) * 0.1
+        penalty += min((pred_len - gt_len) / gt_len, 1.0) * 0.05
 
     return float(penalty)
 
@@ -578,18 +686,14 @@ def compute_score(
     extra_info: Optional[dict] = None
 ) -> dict:
     """
-    Compute the total reward score for time series prediction.
-    
+    Compute the paper-aligned composite reward for time series prediction.
+
     The score is composed of:
-    1. Format score: -1.0 to 0.0 (penalty for wrong format)
-    2. Length score: 0.0 to 0.1 (reward for correct output length)
-    3. MSE score: 0.0 to 0.6 (main prediction accuracy)
-
-    Strict ablation is enabled by default in this branch. Change-point and
-    season/trend rewards are intentionally disabled so teacher selection and RL
-    optimization use the same ablated objective.
-
-    Total possible range (strict ablation): -1.0 to 0.7
+    1. Format validity: -1.0 or 0.0
+    2. Length consistency: exact-match bonus plus mild mismatch penalty
+    3. Prediction error reward: normalized/log-transformed MSE as the main term
+    4. Structural alignment reward: local turning point consistency
+    5. Trend/seasonality reward: decomposition consistency
     
     Args:
         data_source: Source identifier (unused but kept for compatibility)
@@ -616,6 +720,55 @@ def compute_score(
                 return value
         return None
 
+    passthrough_extra_keys = (
+        "final_answer_reject_reason",
+        "generation_stop_reason",
+        "prediction_model_used",
+        "prediction_call_count",
+        "illegal_turn3_tool_call_count",
+        "prediction_requested_model",
+        "prediction_model_defaulted",
+        "prediction_tool_error",
+        "prediction_step_index",
+        "final_answer_step_index",
+        "feature_tool_count",
+        "feature_tool_signature",
+        "analysis_state_signature",
+        "analysis_coverage_ratio",
+        "history_analysis_count",
+        "tool_call_count",
+        "tool_call_sequence",
+        "turn_stage",
+        "workflow_status",
+        "workflow_violation_reason",
+        "prompt_char_len",
+        "response_char_len",
+        "response_token_len",
+        "selected_forecast_orig_mse",
+        "selected_forecast_orig_mae",
+        "selected_forecast_norm_mse",
+        "selected_forecast_norm_mae",
+        "selected_forecast_preview",
+        "selected_forecast_len_match",
+        "selected_forecast_exact_copy",
+        "final_answer_preview",
+        "final_vs_selected_mse",
+        "final_vs_selected_mae",
+        "refinement_delta_orig_mse",
+        "refinement_delta_orig_mae",
+        "refinement_compare_len",
+        "refinement_changed_value_count",
+        "refinement_first_changed_index",
+        "refinement_change_mean_abs",
+        "refinement_change_max_abs",
+        "refinement_changed",
+        "refinement_improved",
+        "refinement_degraded",
+    )
+    passthrough_extra_info = {
+        key: value for key in passthrough_extra_keys if (value := _resolve_extra_value(key)) is not None
+    }
+
     selected_model = str(_resolve_extra_value("prediction_model_used", "selected_model", "output_source") or "unknown")
     output_source = _resolve_extra_value("output_source", "prediction_model_used", "selected_model")
     sample_uid = _resolve_extra_value("uid", "sample_uid")
@@ -632,6 +785,8 @@ def compute_score(
             length_score=0.0,
             length_penalty=0.0,
             mse_score=0.0,
+            change_point_score=0.0,
+            season_trend_score=0.0,
             final_score=-1.0,
             orig_mse=float("nan"),
             orig_mae=float("nan"),
@@ -662,6 +817,8 @@ def compute_score(
                 "length_score": 0.0,
                 "length_penalty": 0.0,
                 "mse_score": 0.0,
+                "change_point_score": 0.0,
+                "season_trend_score": 0.0,
                 "orig_mse": float("nan"),
                 "orig_mae": float("nan"),
                 "norm_mse": float("nan"),
@@ -692,6 +849,8 @@ def compute_score(
             "length_score": 0.0,
             "length_penalty": 0.0,
             "mse_score": 0.0,
+            "change_point_score": 0.0,
+            "season_trend_score": 0.0,
             "orig_mse": float("nan"),
             "orig_mae": float("nan"),
             "norm_mse": float("nan"),
@@ -716,6 +875,7 @@ def compute_score(
             "reward_main_scale": reward_main_scale,
             "length_hard_fail": False,
             "strict_length_match": False,
+            **passthrough_extra_info,
         }
 
     has_answer_tag = bool(re.search(r"<answer>(.*?)</answer>", solution_str or "", re.DOTALL))
@@ -731,6 +891,8 @@ def compute_score(
     exact_generation = bool(gt_len > 0 and pred_len == gt_len)
     strict_length_match = bool(gt_len > 0 and pred_len == gt_len)
     length_hard_fail = False
+    change_point_score = 0.0
+    season_trend_score = 0.0
 
     format_score = compute_format_score(solution_str)
     length_score = 0.0
@@ -756,11 +918,6 @@ def compute_score(
 
     if format_score < 0:
         score = -1.0
-    elif gt_len > 0 and pred_len != gt_len and STRICT_LENGTH_GATE:
-        format_failure_reason = f"length_mismatch:{pred_len}!={gt_len}"
-        length_hard_fail = True
-        length_penalty = min(1.0, 0.5 + 0.05 * min(len_gap, 10))
-        score = -float(length_penalty)
     else:
         score = float(format_score)
         if gt_len > 0 and pred_len != gt_len:
@@ -774,15 +931,17 @@ def compute_score(
         score += mse_score
         score -= length_penalty
 
-    if ENABLE_CHANGE_POINT_SCORE and format_score >= 0 and not length_hard_fail:
+    if ENABLE_CHANGE_POINT_SCORE and format_score >= 0:
         try:
-            score += compute_change_point_score(solution_str, ground_truth)
+            change_point_score = compute_change_point_score(solution_str, ground_truth)
+            score += change_point_score
         except Exception as e:
             print(f"[DEBUG] Error in compute_change_point_score: {e}")
 
-    if ENABLE_SEASON_TREND_SCORE and format_score >= 0 and not length_hard_fail:
+    if ENABLE_SEASON_TREND_SCORE and format_score >= 0:
         try:
-            score += compute_season_trend_score(solution_str, ground_truth)
+            season_trend_score = compute_season_trend_score(solution_str, ground_truth)
+            score += season_trend_score
         except Exception as e:
             print(f"[DEBUG] Error in compute_season_trend_score: {e}")
 
@@ -800,6 +959,8 @@ def compute_score(
             "length_score": float(length_score),
             "length_penalty": float(length_penalty),
             "mse_score": float(mse_score),
+            "change_point_score": float(change_point_score),
+            "season_trend_score": float(season_trend_score),
             "orig_mse": orig_mse,
             "orig_mae": orig_mae,
             "norm_mse": norm_mse,
@@ -840,6 +1001,8 @@ def compute_score(
         length_score=float(length_score),
         length_penalty=float(length_penalty),
         mse_score=float(mse_score),
+        change_point_score=float(change_point_score),
+        season_trend_score=float(season_trend_score),
         final_score=float(score),
         orig_mse=orig_mse,
         orig_mae=orig_mae,
@@ -864,6 +1027,8 @@ def compute_score(
         "length_score": float(length_score),
         "length_penalty": float(length_penalty),
         "mse_score": float(mse_score),
+        "change_point_score": float(change_point_score),
+        "season_trend_score": float(season_trend_score),
         "orig_mse": orig_mse,
         "orig_mae": orig_mae,
         "norm_mse": norm_mse,
@@ -888,4 +1053,5 @@ def compute_score(
         "reward_main_scale": reward_main_scale,
         "length_hard_fail": bool(length_hard_fail),
         "strict_length_match": bool(strict_length_match),
+        **passthrough_extra_info,
     }

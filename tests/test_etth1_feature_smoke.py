@@ -87,7 +87,7 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
 
     def test_paper_aligned_value_only_protocol(self) -> None:
         self._run_dataset_case(
-            "dataset/ett_rl_etth1_paper_aligned_ot_20260315_151424/train.jsonl",
+            "dataset/ett_rl_etth1_paper_same/train.jsonl",
             protocol_kind="value_only",
         )
 

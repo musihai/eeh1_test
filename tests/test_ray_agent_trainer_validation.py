@@ -112,6 +112,47 @@ class TestValidationRewardManager(unittest.TestCase):
             "selected_model": ["itransformer", "itransformer", "chronos2"],
             "reward_main_scale": ["orig", "orig", "orig"],
             "generation_stop_reason": ["stop", "length", "stop"],
+            "selected_forecast_orig_mse": [0.2, 0.8, 1.7],
+            "selected_forecast_len_match": [True, False, True],
+            "selected_forecast_exact_copy": [True, False, False],
+            "final_vs_selected_mse": [0.0, float("nan"), 0.15],
+            "refinement_delta_orig_mse": [0.2, float("nan"), 0.2],
+            "refinement_compare_len": [96, float("nan"), 95],
+            "refinement_changed_value_count": [0, float("nan"), 3],
+            "refinement_first_changed_index": [-1, float("nan"), 72],
+            "refinement_change_mean_abs": [0.0, float("nan"), 0.05],
+            "refinement_change_max_abs": [0.0, float("nan"), 0.2],
+            "refinement_changed": [False, False, True],
+            "refinement_improved": [True, False, True],
+            "refinement_degraded": [False, False, False],
+            "analysis_coverage_ratio": [1.0, 0.4, 0.8],
+            "feature_tool_count": [3, 1, 2],
+            "prediction_call_count": [1, 1, 1],
+            "tool_call_count": [4, 0, 3],
+            "history_analysis_count": [3, 0, 2],
+            "illegal_turn3_tool_call_count": [0, 0, 1],
+            "prediction_requested_model": ["itransformer", "__missing__", "chronos2"],
+            "prediction_model_defaulted": [False, True, False],
+            "feature_tool_signature": [
+                "extract_basic_statistics->extract_event_summary->extract_data_quality",
+                "extract_data_quality",
+                "extract_basic_statistics->extract_within_channel_dynamics",
+            ],
+            "tool_call_sequence": [
+                "extract_basic_statistics->extract_event_summary->extract_data_quality->predict_time_series",
+                "",
+                "extract_basic_statistics->extract_within_channel_dynamics->predict_time_series",
+            ],
+            "analysis_state_signature": [
+                "basic_statistics|data_quality|event_summary",
+                "data_quality",
+                "basic_statistics|within_channel_dynamics",
+            ],
+            "workflow_status": ["accepted", "not_attempted", "rejected"],
+            "turn_stage": ["refinement", "refinement", "refinement"],
+            "prediction_tool_error": ["", "RuntimeError: timeout", ""],
+            "selected_forecast_preview": ["1.0000, 2.0000 ... 95.0000, 96.0000", "", "1.0000, 2.0000 ... 94.0000, 95.0000"],
+            "final_answer_preview": ["1.0000, 2.0000 ... 95.0000, 96.0000", "", "1.0000, 2.0000 ... 94.5000, 95.5000"],
         }
 
         previous_debug_dir = os.environ.get("TS_MIN_DEBUG_DIR")
@@ -139,7 +180,36 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertAlmostEqual(agg_row["orig_mse_mean"], 0.0, places=6)
             self.assertAlmostEqual(agg_row["norm_mse_mean"], 0.0, places=6)
             self.assertAlmostEqual(agg_row["length_hard_fail_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["selected_forecast_orig_mse_mean"], 0.9, places=6)
+            self.assertAlmostEqual(agg_row["selected_forecast_len_match_ratio"], 2.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["selected_forecast_exact_copy_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["final_vs_selected_mse_mean"], 0.075, places=6)
+            self.assertAlmostEqual(agg_row["refinement_delta_orig_mse_mean"], 0.2, places=6)
+            self.assertAlmostEqual(agg_row["refinement_compare_len_mean"], 95.5, places=6)
+            self.assertAlmostEqual(agg_row["refinement_changed_value_count_mean"], 1.5, places=6)
+            self.assertAlmostEqual(agg_row["refinement_first_changed_index_mean"], 72.0, places=6)
+            self.assertAlmostEqual(agg_row["refinement_changed_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["refinement_improved_ratio"], 2.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["prediction_model_defaulted_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["analysis_coverage_ratio_mean"], (1.0 + 0.4 + 0.8) / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["feature_tool_count_mean"], 2.0, places=6)
+            self.assertAlmostEqual(agg_row["tool_call_count_mean"], 7.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["history_analysis_count_mean"], 5.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["no_tool_call_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["no_history_analysis_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["illegal_turn3_tool_call_ratio"], 1.0 / 3.0, places=6)
+            self.assertEqual(agg_row["prediction_tool_error_count"], 1)
             self.assertEqual(agg_row["selected_model_distribution"], {"chronos2": 1, "itransformer": 2})
+            self.assertEqual(agg_row["prediction_requested_model_distribution"], {"__missing__": 1, "chronos2": 1, "itransformer": 1})
+            self.assertEqual(
+                agg_row["tool_call_sequence_distribution"],
+                {
+                    "extract_basic_statistics->extract_event_summary->extract_data_quality->predict_time_series": 1,
+                    "extract_basic_statistics->extract_within_channel_dynamics->predict_time_series": 1,
+                    "none": 1,
+                },
+            )
+            self.assertEqual(agg_row["workflow_status_distribution"], {"accepted": 1, "not_attempted": 1, "rejected": 1})
             self.assertEqual(agg_row["format_failure_reason_distribution"]["missing_answer_close_tag"], 1)
             self.assertEqual(agg_row["generation_stop_reason_distribution"], {"length": 1, "stop": 2})
             self.assertEqual(
@@ -154,6 +224,20 @@ class TestValidationRewardManager(unittest.TestCase):
                 row for row in sample_rows if row["category"] == "near_miss_94_95" and row["sample_id"] == "sample-2"
             )
             self.assertEqual(near_miss_row["generation_stop_reason"], "stop")
+            self.assertEqual(near_miss_row["prediction_requested_model"], "chronos2")
+            self.assertTrue(near_miss_row["refinement_changed"])
+            self.assertTrue(near_miss_row["selected_forecast_len_match"])
+            self.assertFalse(near_miss_row["selected_forecast_exact_copy"])
+            self.assertEqual(near_miss_row["refinement_changed_value_count"], 3)
+            self.assertEqual(near_miss_row["refinement_first_changed_index"], 72)
+            self.assertEqual(near_miss_row["tool_call_count"], 3)
+            self.assertEqual(near_miss_row["history_analysis_count"], 2)
+            self.assertEqual(
+                near_miss_row["tool_call_sequence"],
+                "extract_basic_statistics->extract_within_channel_dynamics->predict_time_series",
+            )
+            self.assertEqual(near_miss_row["analysis_state_signature"], "basic_statistics|within_channel_dynamics")
+            self.assertIn("94.5000", near_miss_row["final_answer_preview"])
             self.assertIn("filled_orig_mse", near_miss_row)
             self.assertIn("filled_norm_mse", near_miss_row)
             self.assertAlmostEqual(near_miss_row["filled_raw_mse"], near_miss_row["filled_orig_mse"], places=6)

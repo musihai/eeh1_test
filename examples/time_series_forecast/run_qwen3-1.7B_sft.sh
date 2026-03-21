@@ -40,8 +40,8 @@ if [ -z "${MODEL_PATH}" ]; then
     exit 1
 fi
 
-TRAIN_FILES="${TRAIN_FILES:-${SFT_TRAIN_FILES:-$PROJECT_DIR/dataset/ett_sft_etth1_runtime_ot/train.parquet}}"
-VAL_FILES="${VAL_FILES:-${SFT_VAL_FILES:-$PROJECT_DIR/dataset/ett_sft_etth1_runtime_ot/val.parquet}}"
+TRAIN_FILES="${TRAIN_FILES:-${SFT_TRAIN_FILES:-$PROJECT_DIR/dataset/ett_sft_etth1_runtime_ot_teacher200_paper_v2/train.parquet}}"
+VAL_FILES="${VAL_FILES:-${SFT_VAL_FILES:-$PROJECT_DIR/dataset/ett_sft_etth1_runtime_ot_teacher200_paper_v2/val.parquet}}"
 if [ ! -f "${TRAIN_FILES}" ]; then
     echo "SFT train parquet not found: ${TRAIN_FILES}"
     echo "Generate or restore the SFT dataset first."

@@ -22,6 +22,7 @@ from uuid import uuid4
 from arft.agent_flow.agent_flow import AgentFlowBase, AgentFlowOutput, AgentFlowStep, register
 from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.tools.schemas import ToolResponse
+from verl.utils.chain_debug import append_chain_debug, short_text
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 
@@ -73,8 +74,16 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.prediction_results = None
         self.prediction_tool_output = None
         self.prediction_model_used = None
+        self.prediction_requested_model = None
+        self.prediction_model_defaulted = False
+        self.prediction_tool_error = None
+        self.prediction_step_index = None
+        self.prediction_call_count = 0
+        self.illegal_turn3_tool_call_count = 0
+        self.feature_tool_sequence = []
         self.final_answer = None
         self.final_answer_reject_reason = None
+        self.final_answer_step_index = None
         self.data_source = "ETTh1"
         self.target_column = "OT"
         self.parse_error_message = None
@@ -119,8 +128,16 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.prediction_results = None
         self.prediction_tool_output = None
         self.prediction_model_used = None
+        self.prediction_requested_model = None
+        self.prediction_model_defaulted = False
+        self.prediction_tool_error = None
+        self.prediction_step_index = None
+        self.prediction_call_count = 0
+        self.illegal_turn3_tool_call_count = 0
+        self.feature_tool_sequence = []
         self.final_answer = None
         self.final_answer_reject_reason = None
+        self.final_answer_step_index = None
         self.basic_statistics = None
         self.within_channel_dynamics = None
         self.forecast_residuals = None
@@ -181,6 +198,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         num_steps = 0
         while num_steps < self.max_steps:
             num_steps += 1
+            turn_stage = self._current_turn_stage()
             messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": self._build_user_prompt()},
@@ -220,10 +238,15 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             # )
 
             final_answer, format_penalty = self._extract_final_answer(response_text)
+            workflow_status = "not_attempted"
+            workflow_message = ""
+            tool_call_names: list[str] = []
 
             if final_answer:
                 # Final answer detected - but first validate the workflow was followed
                 workflow_valid, workflow_penalty, workflow_msg = self._validate_workflow_completion(final_answer)
+                workflow_status = "accepted" if workflow_valid else "rejected"
+                workflow_message = workflow_msg
                 
                 if not workflow_valid:
                     # Workflow not completed - apply penalty (reward hacking prevention)
@@ -235,6 +258,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 else:
                     # Workflow completed - compute reward based on prediction accuracy
                     self.final_answer = final_answer
+                    self.final_answer_step_index = num_steps
                     reward_score = self._compute_final_reward(final_answer, ground_truth) + format_penalty
                     logger.info(f"Final answer detected. Reward score: {reward_score}")
                     # if reward_score > 0.5:
@@ -246,6 +270,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 # No final answer yet - process tool calls
                 assistant_content, tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
                 tool_calls = tool_calls[:self.max_parallel_calls]
+                tool_call_names = [tool_call.name for tool_call in tool_calls]
                 tool_call_payloads = self._build_tool_call_payloads(tool_calls, step_index=num_steps)
 
                 # Use compact state as memory. Do not carry long assistant prose
@@ -265,6 +290,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             step = await self._postprocess(step, **kwargs)
             reward_extra_info = dict(step.extra_fields.get("reward_extra_info", {}) or {})
             selected_model = self.prediction_model_used or reward_extra_info.get("selected_model") or "unknown"
+            refinement_metrics = self._collect_refinement_metrics(ground_truth)
             reward_extra_info.update(
                 {
                     "MSE": orig_mse,
@@ -280,10 +306,44 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     "output_source": self.prediction_model_used,
                     "selected_model": selected_model,
                     "generation_stop_reason": generation_stop_reason,
+                    "prediction_call_count": int(self.prediction_call_count),
+                    "illegal_turn3_tool_call_count": int(self.illegal_turn3_tool_call_count),
+                    "prediction_requested_model": self.prediction_requested_model or "",
+                    "prediction_model_defaulted": bool(self.prediction_model_defaulted),
+                    "prediction_tool_error": self.prediction_tool_error or "",
+                    "prediction_step_index": int(self.prediction_step_index or 0),
+                    "final_answer_step_index": int(self.final_answer_step_index or 0),
+                    "feature_tool_count": int(len(self.feature_tool_sequence)),
+                    "feature_tool_signature": self._feature_tool_signature(),
+                    "analysis_state_signature": self._analysis_state_signature(),
+                    "analysis_coverage_ratio": self._analysis_coverage_ratio(),
+                    "history_analysis_count": int(len(self.history_analysis)),
+                    "tool_call_count": int(len(tool_call_names)),
+                    "tool_call_sequence": "->".join(tool_call_names) if tool_call_names else "",
+                    "turn_stage": turn_stage,
+                    "workflow_status": workflow_status,
+                    "workflow_violation_reason": workflow_message,
+                    "prompt_char_len": int(len(messages[1]["content"])),
+                    "response_char_len": int(len(response_text)),
+                    "response_token_len": int(len(response_ids)),
+                    **refinement_metrics,
                 }
             )
             step.extra_fields["reward_extra_info"] = reward_extra_info
             self.steps.append(step)
+            self._append_turn_debug(
+                step_index=num_steps,
+                request_id=request_id,
+                sample_index=kwargs.get("index"),
+                turn_stage=turn_stage,
+                prompt_text=messages[1]["content"],
+                response_text=response_text,
+                generation_stop_reason=generation_stop_reason,
+                tool_call_names=tool_call_names,
+                workflow_status=workflow_status,
+                workflow_message=workflow_message,
+                reward_extra_info=reward_extra_info,
+            )
             
             # If final answer is detected, we can stop
             if final_answer:
@@ -320,6 +380,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         
         final_reward_extra_info = dict(self.steps[-1].extra_fields.get("reward_extra_info", {}) or {})
         final_selected_model = self.prediction_model_used or final_reward_extra_info.get("selected_model") or "unknown"
+        final_refinement_metrics = self._collect_refinement_metrics(ground_truth)
         final_reward_extra_info.update(
             {
                 "MSE": orig_mse,
@@ -335,6 +396,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 "output_source": self.prediction_model_used,
                 "selected_model": final_selected_model,
                 "generation_stop_reason": generation_stop_reason,
+                "prediction_call_count": int(self.prediction_call_count),
+                "illegal_turn3_tool_call_count": int(self.illegal_turn3_tool_call_count),
+                **final_refinement_metrics,
             }
         )
         self.steps[-1].extra_fields["reward_extra_info"] = final_reward_extra_info
@@ -356,8 +420,24 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         # Check 2: Must have called predict_time_series
         if self.prediction_results is None:
             return False, -0.5, "predict_time_series was not called. You must get model predictions first."
+
+        # Check 3: Turn 2 must contain exactly one forecasting-tool invocation.
+        if self.prediction_call_count != 1:
+            return (
+                False,
+                -0.5,
+                f"predict_time_series must be called exactly once before final output. Got {self.prediction_call_count}.",
+            )
+
+        # Check 4: Turn 3 must not invoke any tools.
+        if self.illegal_turn3_tool_call_count > 0:
+            return (
+                False,
+                -0.5,
+                f"Turn 3 may not call tools after prediction results are available. Illegal calls: {self.illegal_turn3_tool_call_count}.",
+            )
         
-        # Check 3: Check if answer is just copying the input data (reward hacking detection)
+        # Check 5: Check if answer is just copying the input data (reward hacking detection)
         if self._is_copying_input(final_answer):
             return False, -1.0, "Answer appears to copy input data. Predictions must be for FUTURE timestamps."
         
@@ -407,6 +487,131 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
     def _expected_prediction_count(self) -> int:
         return int(self.forecast_horizon or 96)
+
+    def _current_turn_stage(self) -> str:
+        if self.prediction_results is not None:
+            return "refinement"
+        if self._has_any_feature_analysis():
+            return "routing"
+        return "diagnostic"
+
+    def _analysis_state_signature(self) -> str:
+        state_flags = [
+            ("basic_statistics", self.basic_statistics is not None),
+            ("within_channel_dynamics", self.within_channel_dynamics is not None),
+            ("forecast_residuals", self.forecast_residuals is not None),
+            ("data_quality", self.data_quality is not None),
+            ("event_summary", self.event_summary is not None),
+        ]
+        active = [name for name, enabled in state_flags if enabled]
+        return "|".join(active) if active else "none"
+
+    def _analysis_coverage_ratio(self) -> float:
+        state_flags = [
+            self.basic_statistics is not None,
+            self.within_channel_dynamics is not None,
+            self.forecast_residuals is not None,
+            self.data_quality is not None,
+            self.event_summary is not None,
+        ]
+        return float(sum(bool(flag) for flag in state_flags) / len(state_flags))
+
+    def _feature_tool_signature(self) -> str:
+        if not self.feature_tool_sequence:
+            return "none"
+        return "->".join(self.feature_tool_sequence)
+
+    @staticmethod
+    def _series_preview(values: list[float], preview_size: int = 3) -> str:
+        if not values:
+            return ""
+        head = ", ".join(f"{float(value):.4f}" for value in values[:preview_size])
+        if len(values) <= preview_size:
+            return head
+        tail = ", ".join(f"{float(value):.4f}" for value in values[-preview_size:])
+        return f"{head} ... {tail}"
+
+    @staticmethod
+    def _finite_or_nan(value: Any) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+        if np.isnan(numeric) or np.isinf(numeric):
+            return float("nan")
+        return numeric
+
+    def _append_turn_debug(
+        self,
+        *,
+        step_index: int,
+        request_id: str,
+        sample_index: Any,
+        turn_stage: str,
+        prompt_text: str,
+        response_text: str,
+        generation_stop_reason: str,
+        tool_call_names: list[str],
+        workflow_status: str,
+        workflow_message: str,
+        reward_extra_info: dict[str, Any],
+    ) -> None:
+        append_chain_debug(
+            "agent_turn_summary",
+            {
+                "request_id": request_id,
+                "sample_index": sample_index,
+                "step_index": int(step_index),
+                "turn_stage": turn_stage,
+                "tool_call_sequence": tool_call_names,
+                "tool_call_count": int(len(tool_call_names)),
+                "feature_tool_signature": self._feature_tool_signature(),
+                "feature_tool_count": int(len(self.feature_tool_sequence)),
+                "analysis_state_signature": self._analysis_state_signature(),
+                "analysis_coverage_ratio": self._analysis_coverage_ratio(),
+                "history_analysis_count": int(len(self.history_analysis)),
+                "prediction_requested_model": self.prediction_requested_model or "",
+                "prediction_model_used": self.prediction_model_used or "",
+                "prediction_model_defaulted": bool(self.prediction_model_defaulted),
+                "prediction_tool_error": self.prediction_tool_error or "",
+                "prediction_call_count": int(self.prediction_call_count),
+                "prediction_step_index": int(self.prediction_step_index or 0),
+                "illegal_turn3_tool_call_count": int(self.illegal_turn3_tool_call_count),
+                "workflow_status": workflow_status,
+                "workflow_violation_reason": workflow_message,
+                "generation_stop_reason": generation_stop_reason,
+                "final_answer_reject_reason": self.final_answer_reject_reason or "",
+                "prompt_char_len": int(len(prompt_text)),
+                "response_char_len": int(len(response_text)),
+                "response_line_count": int(len([line for line in response_text.splitlines() if line.strip()])),
+                "selected_forecast_preview": reward_extra_info.get("selected_forecast_preview", ""),
+                "final_answer_preview": reward_extra_info.get("final_answer_preview", ""),
+                "selected_forecast_orig_mse": self._finite_or_nan(
+                    reward_extra_info.get("selected_forecast_orig_mse")
+                ),
+                "final_vs_selected_mse": self._finite_or_nan(reward_extra_info.get("final_vs_selected_mse")),
+                "refinement_delta_orig_mse": self._finite_or_nan(
+                    reward_extra_info.get("refinement_delta_orig_mse")
+                ),
+                "selected_forecast_len_match": bool(
+                    reward_extra_info.get("selected_forecast_len_match", False)
+                ),
+                "selected_forecast_exact_copy": bool(
+                    reward_extra_info.get("selected_forecast_exact_copy", False)
+                ),
+                "refinement_compare_len": int(reward_extra_info.get("refinement_compare_len", 0) or 0),
+                "refinement_changed_value_count": int(
+                    reward_extra_info.get("refinement_changed_value_count", 0) or 0
+                ),
+                "refinement_first_changed_index": int(
+                    reward_extra_info.get("refinement_first_changed_index", -1) or -1
+                ),
+                "refinement_changed": bool(reward_extra_info.get("refinement_changed", False)),
+                "refinement_improved": bool(reward_extra_info.get("refinement_improved", False)),
+                "refinement_degraded": bool(reward_extra_info.get("refinement_degraded", False)),
+                "raw_response_tail": short_text("\n".join(response_text.splitlines()[-10:]), limit=400),
+            },
+        )
 
     def _final_answer_max_tokens(self) -> int:
         expected = self._expected_prediction_count()
@@ -583,6 +788,119 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             logger.error(f"Error computing final reward: {e}")
             return -0.5
 
+    def _compute_series_metrics(
+        self,
+        candidate_values: list[float],
+        reference_values: list[float],
+    ) -> tuple[float, float, float, float]:
+        if not candidate_values or not reference_values:
+            return (float("nan"), float("nan"), float("nan"), float("nan"))
+
+        min_len = min(len(candidate_values), len(reference_values))
+        if min_len <= 0:
+            return (float("nan"), float("nan"), float("nan"), float("nan"))
+
+        candidate_slice = candidate_values[:min_len]
+        reference_slice = reference_values[:min_len]
+        candidate_arr = np.asarray(candidate_slice, dtype=float)
+        reference_arr = np.asarray(reference_slice, dtype=float)
+
+        orig_mse = float(np.mean((candidate_arr - reference_arr) ** 2))
+        orig_mae = float(np.mean(np.abs(candidate_arr - reference_arr)))
+        norm_candidate, norm_reference = normalize_for_reward(candidate_slice, reference_slice)
+        norm_candidate_arr = np.asarray(norm_candidate, dtype=float)
+        norm_reference_arr = np.asarray(norm_reference, dtype=float)
+        norm_mse = float(np.mean((norm_candidate_arr - norm_reference_arr) ** 2))
+        norm_mae = float(np.mean(np.abs(norm_candidate_arr - norm_reference_arr)))
+        return (orig_mse, orig_mae, norm_mse, norm_mae)
+
+    def _collect_refinement_metrics(self, ground_truth: str) -> dict[str, Any]:
+        gt_values = extract_ground_truth_values(ground_truth) if ground_truth else []
+        selected_values = extract_values_from_time_series_string(self.prediction_results or "") if self.prediction_results else []
+        final_values = extract_values_from_time_series_string(self.final_answer or "") if self.final_answer else []
+
+        selected_orig_mse, selected_orig_mae, selected_norm_mse, selected_norm_mae = self._compute_series_metrics(
+            selected_values,
+            gt_values,
+        )
+        final_vs_selected_mse, final_vs_selected_mae, final_vs_selected_norm_mse, final_vs_selected_norm_mae = (
+            self._compute_series_metrics(final_values, selected_values)
+        )
+
+        refinement_delta_orig_mse = float("nan")
+        refinement_delta_orig_mae = float("nan")
+        if not np.isnan(selected_orig_mse) and self.final_answer and ground_truth:
+            final_orig_mse, final_orig_mae, _, _ = self._compute_series_metrics(final_values, gt_values)
+            if not np.isnan(final_orig_mse):
+                refinement_delta_orig_mse = float(selected_orig_mse - final_orig_mse)
+            if not np.isnan(final_orig_mae):
+                refinement_delta_orig_mae = float(selected_orig_mae - final_orig_mae)
+
+        refinement_changed = False
+        refinement_change_mean_abs = float("nan")
+        refinement_change_max_abs = float("nan")
+        selected_forecast_len_match = bool(selected_values and final_values and len(selected_values) == len(final_values))
+        selected_forecast_exact_copy = False
+        refinement_compare_len = 0
+        refinement_changed_value_count = 0
+        refinement_first_changed_index = -1
+        if selected_values and final_values:
+            refinement_compare_len = min(len(selected_values), len(final_values))
+            if refinement_compare_len > 0:
+                abs_deltas = [
+                    abs(selected_values[idx] - final_values[idx]) for idx in range(refinement_compare_len)
+                ]
+                refinement_change_mean_abs = float(np.mean(abs_deltas))
+                refinement_change_max_abs = float(np.max(abs_deltas))
+                changed_positions = [
+                    idx
+                    for idx in range(refinement_compare_len)
+                    if abs(selected_values[idx] - final_values[idx]) > 1e-8
+                ]
+                refinement_changed_value_count = int(len(changed_positions))
+                if changed_positions:
+                    refinement_first_changed_index = int(changed_positions[0])
+                refinement_changed = bool(changed_positions)
+                if len(selected_values) != len(final_values):
+                    refinement_changed = True
+                    refinement_change_max_abs = max(refinement_change_max_abs, 0.0)
+                selected_forecast_exact_copy = bool(
+                    len(selected_values) == len(final_values) and refinement_changed_value_count == 0
+                )
+
+        refinement_improved = bool(
+            not np.isnan(refinement_delta_orig_mse) and refinement_delta_orig_mse > 1e-8
+        )
+        refinement_degraded = bool(
+            not np.isnan(refinement_delta_orig_mse) and refinement_delta_orig_mse < -1e-8
+        )
+
+        return {
+            "selected_forecast_pred_len": int(len(selected_values)),
+            "selected_forecast_orig_mse": selected_orig_mse,
+            "selected_forecast_orig_mae": selected_orig_mae,
+            "selected_forecast_norm_mse": selected_norm_mse,
+            "selected_forecast_norm_mae": selected_norm_mae,
+            "selected_forecast_preview": self._series_preview(selected_values),
+            "selected_forecast_len_match": bool(selected_forecast_len_match),
+            "selected_forecast_exact_copy": bool(selected_forecast_exact_copy),
+            "final_vs_selected_mse": final_vs_selected_mse,
+            "final_vs_selected_mae": final_vs_selected_mae,
+            "final_vs_selected_norm_mse": final_vs_selected_norm_mse,
+            "final_vs_selected_norm_mae": final_vs_selected_norm_mae,
+            "refinement_delta_orig_mse": refinement_delta_orig_mse,
+            "refinement_delta_orig_mae": refinement_delta_orig_mae,
+            "refinement_compare_len": int(refinement_compare_len),
+            "refinement_changed_value_count": int(refinement_changed_value_count),
+            "refinement_first_changed_index": int(refinement_first_changed_index),
+            "refinement_change_mean_abs": refinement_change_mean_abs,
+            "refinement_change_max_abs": refinement_change_max_abs,
+            "refinement_changed": bool(refinement_changed),
+            "refinement_improved": refinement_improved,
+            "refinement_degraded": refinement_degraded,
+            "final_answer_preview": self._series_preview(final_values),
+        }
+
     async def _append_jsonl_records(self, path: str, records: list[dict[str, Any]]) -> None:
         def _write_records() -> None:
             if not records:
@@ -628,12 +946,17 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         return payloads
 
     async def _execute_tool_call(self, tool_call: FunctionCall, **kwargs) -> Optional[str]:
+        if self.prediction_results is not None:
+            self.illegal_turn3_tool_call_count += 1
+            logger.warning("Tool call %s attempted after prediction stage; rejected.", tool_call.name)
+            return None
+
         if tool_call.name == "predict_time_series":
             if not self._has_any_feature_analysis():
                 logger.warning("predict_time_series called without feature analysis, rejected")
                 return None
 
-            model_name = None
+            requested_model_name = "__missing__"
             if hasattr(tool_call, "arguments") and tool_call.arguments:
                 args = tool_call.arguments
                 if isinstance(args, str):
@@ -642,9 +965,14 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     except json.JSONDecodeError:
                         args = {}
                 if isinstance(args, dict):
-                    model_name = args.get("model_name")
+                    requested_model_name = str(args.get("model_name") or "__missing__").strip().lower()
+            model_name = requested_model_name
             if model_name not in {"chronos2", "arima", "patchtst", "itransformer"}:
                 model_name = "chronos2"
+            self.prediction_requested_model = requested_model_name
+            self.prediction_model_defaulted = bool(requested_model_name != model_name)
+            self.prediction_call_count += 1
+            self.prediction_step_index = self.prediction_step_index or len(self.steps) + 1
             return await self._run_prediction_tool(model_name=model_name)
 
         if tool_call.name == "extract_basic_statistics":
@@ -704,6 +1032,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             )
 
             self.prediction_model_used = model_name
+            self.prediction_tool_error = None
             self.prediction_results = format_predictions_to_string(pred_df, last_ts)
             self.prediction_tool_output = format_prediction_tool_output(
                 pred_df,
@@ -716,14 +1045,49 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             )
 
             logger.info(f"Prediction completed using {model_name} model")
+            append_chain_debug(
+                "prediction_tool_result",
+                {
+                    "model_name": model_name,
+                    "prediction_requested_model": self.prediction_requested_model or "",
+                    "prediction_model_defaulted": bool(self.prediction_model_defaulted),
+                    "prediction_step_index": int(self.prediction_step_index or 0),
+                    "prediction_call_count": int(self.prediction_call_count),
+                    "analysis_state_signature": self._analysis_state_signature(),
+                    "feature_tool_signature": self._feature_tool_signature(),
+                    "prediction_length": int(self.forecast_horizon or 0),
+                    "prediction_preview": self._series_preview(
+                        extract_values_from_time_series_string(self.prediction_results or "")
+                    ),
+                    "success": True,
+                    "error": "",
+                },
+            )
 
             return self.prediction_tool_output
 
         except Exception as e:
             logger.error(f"Error in predict with {model_name}: {e}")
+            self.prediction_tool_error = f"{type(e).__name__}: {e}"
             self.prediction_results = None
             self.prediction_tool_output = None
             self.history_analysis.append(f"Prediction failed ({model_name}): {str(e)}")
+            append_chain_debug(
+                "prediction_tool_result",
+                {
+                    "model_name": model_name,
+                    "prediction_requested_model": self.prediction_requested_model or "",
+                    "prediction_model_defaulted": bool(self.prediction_model_defaulted),
+                    "prediction_step_index": int(self.prediction_step_index or 0),
+                    "prediction_call_count": int(self.prediction_call_count),
+                    "analysis_state_signature": self._analysis_state_signature(),
+                    "feature_tool_signature": self._feature_tool_signature(),
+                    "prediction_length": int(self.forecast_horizon or 0),
+                    "prediction_preview": "",
+                    "success": False,
+                    "error": self.prediction_tool_error,
+                },
+            )
             return None
 
     async def extract_basic_statistics(self, **kwargs) -> float:
@@ -742,6 +1106,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
             analysis_record = format_basic_statistics(features)
             self.history_analysis.append(analysis_record)
+            self.feature_tool_sequence.append("extract_basic_statistics")
 
             logger.info("Basic statistics extraction completed")
             return analysis_record
@@ -765,6 +1130,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
             analysis_record = format_within_channel_dynamics(features)
             self.history_analysis.append(analysis_record)
+            self.feature_tool_sequence.append("extract_within_channel_dynamics")
 
             logger.info("Within-channel dynamics extraction completed")
             return analysis_record
@@ -788,6 +1154,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
             analysis_record = format_forecast_residuals(features)
             self.history_analysis.append(analysis_record)
+            self.feature_tool_sequence.append("extract_forecast_residuals")
 
             logger.info("Forecast residuals extraction completed")
             return analysis_record
@@ -811,6 +1178,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
             analysis_record = format_data_quality(features)
             self.history_analysis.append(analysis_record)
+            self.feature_tool_sequence.append("extract_data_quality")
 
             logger.info("Data quality extraction completed")
             return analysis_record
@@ -834,6 +1202,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
             analysis_record = format_event_summary(features)
             self.history_analysis.append(analysis_record)
+            self.feature_tool_sequence.append("extract_event_summary")
 
             logger.info("Event summary extraction completed")
             return analysis_record

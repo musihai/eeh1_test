@@ -42,6 +42,8 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertIn("### Analysis Summary", prompt)
         self.assertIn("### Prediction Tool Output", prompt)
         self.assertIn("Forecast Values:", prompt)
+        self.assertIn("initial forecast produced by the selected model", prompt)
+        self.assertIn("Do NOT rewrite the forecast arbitrarily", prompt)
         self.assertNotIn("already present earlier in this conversation", prompt)
 
     def test_compact_prediction_tool_output_keeps_single_timestamp_anchor(self) -> None:
@@ -86,9 +88,9 @@ class CompactProtocolTests(unittest.TestCase):
         value_only_score = value_only_result["score"] if isinstance(value_only_result, dict) else value_only_result
         self.assertAlmostEqual(timestamped_score, value_only_score, places=6)
 
-    def test_strict_ablation_disables_auxiliary_rewards(self) -> None:
-        self.assertFalse(ENABLE_CHANGE_POINT_SCORE)
-        self.assertFalse(ENABLE_SEASON_TREND_SCORE)
+    def test_composite_reward_uses_paper_aligned_defaults(self) -> None:
+        self.assertTrue(ENABLE_CHANGE_POINT_SCORE)
+        self.assertTrue(ENABLE_SEASON_TREND_SCORE)
 
         ground_truth = (
             "2017-05-02 00:00:00 10.0000\n"
@@ -109,13 +111,15 @@ class CompactProtocolTests(unittest.TestCase):
             0.7,
             places=6,
         )
-        self.assertEqual(result["reward_main_scale"], "orig")
-        self.assertTrue(result["strict_length_gate"])
+        self.assertEqual(result["reward_main_scale"], "norm")
+        self.assertFalse(result["strict_length_gate"])
         self.assertTrue(result["strict_length_match"])
+        self.assertAlmostEqual(result["change_point_score"], 0.0, places=6)
+        self.assertAlmostEqual(result["season_trend_score"], 0.0, places=6)
         self.assertAlmostEqual(result["orig_mse"], 0.0, places=6)
         self.assertAlmostEqual(result["norm_mse"], 0.0, places=6)
 
-    def test_reward_length_mismatch_triggers_hard_gate(self) -> None:
+    def test_reward_length_mismatch_uses_soft_penalty(self) -> None:
         ground_truth = (
             "2017-05-02 00:00:00 10.0000\n"
             "2017-05-02 01:00:00 20.0000\n"
@@ -123,13 +127,72 @@ class CompactProtocolTests(unittest.TestCase):
         )
         solution = "<answer>\n10.0000\n20.0000\n</answer>"
         result = compute_score(data_source="time_series", solution_str=solution, ground_truth=ground_truth)
-        self.assertTrue(result["length_hard_fail"])
+        self.assertFalse(result["length_hard_fail"])
         self.assertFalse(result["strict_length_match"])
         self.assertEqual(result["format_failure_reason"], "length_mismatch:2!=3")
-        self.assertEqual(result["mse_score"], 0.0)
-        self.assertAlmostEqual(result["score"], -0.55, places=6)
+        self.assertAlmostEqual(result["mse_score"], 0.6, places=6)
+        self.assertAlmostEqual(result["length_penalty"], 0.03, places=6)
+        self.assertAlmostEqual(result["score"], 0.57, places=6)
         self.assertAlmostEqual(result["orig_mse"], 0.0, places=6)
         self.assertAlmostEqual(result["norm_mse"], 0.0, places=6)
+
+    def test_reward_passthroughs_runtime_tool_debug_fields(self) -> None:
+        ground_truth = (
+            "2017-05-02 00:00:00 10.0000\n"
+            "2017-05-02 01:00:00 20.0000\n"
+            "2017-05-02 02:00:00 30.0000"
+        )
+        solution = (
+            "<answer>\n"
+            "2017-05-02 00:00:00 10.0000\n"
+            "2017-05-02 01:00:00 20.0000\n"
+            "2017-05-02 02:00:00 30.0000\n"
+            "</answer>"
+        )
+        result = compute_score(
+            data_source="time_series",
+            solution_str=solution,
+            ground_truth=ground_truth,
+            extra_info={
+                "reward_extra_info": {
+                    "generation_stop_reason": "stop",
+                    "feature_tool_signature": "extract_basic_statistics->extract_event_summary",
+                    "tool_call_sequence": "extract_basic_statistics->extract_event_summary->predict_time_series",
+                    "analysis_state_signature": "basic_statistics|event_summary",
+                    "prediction_requested_model": "itransformer",
+                    "workflow_status": "accepted",
+                    "turn_stage": "refinement",
+                    "selected_forecast_orig_mse": 0.25,
+                    "selected_forecast_len_match": True,
+                    "selected_forecast_exact_copy": False,
+                    "final_vs_selected_mse": 0.05,
+                    "refinement_compare_len": 96,
+                    "refinement_changed_value_count": 4,
+                    "refinement_first_changed_index": 72,
+                    "refinement_changed": True,
+                    "prediction_model_defaulted": False,
+                }
+            },
+        )
+        self.assertEqual(result["generation_stop_reason"], "stop")
+        self.assertEqual(result["feature_tool_signature"], "extract_basic_statistics->extract_event_summary")
+        self.assertEqual(
+            result["tool_call_sequence"],
+            "extract_basic_statistics->extract_event_summary->predict_time_series",
+        )
+        self.assertEqual(result["analysis_state_signature"], "basic_statistics|event_summary")
+        self.assertEqual(result["prediction_requested_model"], "itransformer")
+        self.assertEqual(result["workflow_status"], "accepted")
+        self.assertEqual(result["turn_stage"], "refinement")
+        self.assertAlmostEqual(result["selected_forecast_orig_mse"], 0.25, places=6)
+        self.assertTrue(result["selected_forecast_len_match"])
+        self.assertFalse(result["selected_forecast_exact_copy"])
+        self.assertAlmostEqual(result["final_vs_selected_mse"], 0.05, places=6)
+        self.assertEqual(result["refinement_compare_len"], 96)
+        self.assertEqual(result["refinement_changed_value_count"], 4)
+        self.assertEqual(result["refinement_first_changed_index"], 72)
+        self.assertTrue(result["refinement_changed"])
+        self.assertFalse(result["prediction_model_defaulted"])
 
     def test_system_prompt_avoids_fixed_model_preferences(self) -> None:
         prompt = build_timeseries_system_prompt(data_source="ETTh1", target_column="OT")
