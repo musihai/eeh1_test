@@ -8,8 +8,8 @@ from typing import Any
 import pandas as pd
 
 
-DEFAULT_INPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_v2")
-DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_v2_subset")
+DEFAULT_INPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2")
+DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2_subset")
 
 
 def select_evenly_spaced_rows(dataframe: pd.DataFrame, count: int) -> pd.DataFrame:

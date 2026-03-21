@@ -201,9 +201,9 @@ def summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark chronos2/arima/patchtst/itransformer on RL samples.")
-    parser.add_argument("--train-jsonl", default="dataset/ett_rl_etth1_paper_aligned_ot_curriculum_v2/train.jsonl")
-    parser.add_argument("--val-jsonl", default="dataset/ett_rl_etth1_paper_aligned_ot_curriculum_v2/val.jsonl")
-    parser.add_argument("--test-jsonl", default="dataset/ett_rl_etth1_paper_aligned_ot_curriculum_v2/test.jsonl")
+    parser.add_argument("--train-jsonl", default="dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train_stage123.jsonl")
+    parser.add_argument("--val-jsonl", default="dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/val.jsonl")
+    parser.add_argument("--test-jsonl", default="dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/test.jsonl")
     parser.add_argument("--train-samples", type=int, default=256, help="0 means use all")
     parser.add_argument("--val-samples", type=int, default=256, help="0 means use all")
     parser.add_argument("--test-samples", type=int, default=0, help="0 means skip when --include-test is false")

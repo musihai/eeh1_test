@@ -38,11 +38,12 @@
 下面这些已经明确识别出来，但这次还没继续改：
 
 1. runtime memory 仍然是紧凑状态实现，主要依赖 `history_analysis + selected prediction`，还不是显式的结构化 memory object。
-2. SFT 里的 `route_then_refine` 现在已经显式写出：
-   - `refinement_supervision_type`
-   - `refinement_trigger_reason`
+2. SFT 的 `Turn 3` 目标现在已经显式写出：
+   - `turn3_target_type`
+   - `turn3_trigger_reason`
+   - `refine_ops_signature`
    - `selected_feature_tool_signature`
-   但离线数值目标仍然大多沿用 selected teacher forecast，没有单独合成“refined numeric target”。
+   但当前的 refine target 仍然是基于规则器合成的局部修正，不是论文原文给出的显式数值修正器。
 3. `teacher200` 的 curator 现在已经加入了按 `best_model` 的平衡抽样，但还不是完整的 curriculum-aware curator；难度分桶和 teacher-error 分层还没有一并进入 selection。
 4. RL jsonl 已经带了 difficulty metadata，但在线 trainer 还没有接入按 `difficulty_stage` / `entropy_band` 分桶采样。
 5. 调试聚合已经能看到工具链计数、工具调用序列和 refinement 结果，但更细的 turn-level reasoning 仍然要靠 chain debug 排查。
@@ -66,6 +67,13 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 ```bash
 examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
 ```
+
+当前 profile / launcher 默认值已经和这份 README 对齐：
+
+- RL 默认 train 文件：`dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train_stage123.jsonl`
+- RL 稳定显存配置：`gpu_memory_utilization=0.22`、`max_model_len=8192`、`max_batched_tokens=4096`
+- RL 稳定采样配置：`rollout.n=1`、`temperature=0.3`、`response_length=3072`
+- SFT 默认 parquet：`dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2/{train,val}.parquet`
 
 关键脚本：
 
@@ -135,9 +143,19 @@ python recipe/time_series_forecast/build_etth1_rl_dataset.py \
 
 输出：
 
-- ` dataset/ett_rl_etth1_paper_same2/train.jsonl`
-- ` dataset/ett_rl_etth1_paper_same2/val.jsonl`
-- ` dataset/ett_rl_etth1_paper_same2/test.jsonl`
+- `dataset/ett_rl_etth1_paper_same2/train.jsonl`
+- `dataset/ett_rl_etth1_paper_same2/train_stage1.jsonl`
+- `dataset/ett_rl_etth1_paper_same2/train_stage12.jsonl`
+- `dataset/ett_rl_etth1_paper_same2/train_stage123.jsonl`
+- `dataset/ett_rl_etth1_paper_same2/val.jsonl`
+- `dataset/ett_rl_etth1_paper_same2/test.jsonl`
+
+说明：
+
+- `train_stage1.jsonl`：只含 `curriculum_stage=easy`
+- `train_stage12.jsonl`：含 `easy + medium`
+- `train_stage123.jsonl`：完整 train split
+- 在 Step 2 没有 teacher metadata 时，stage 主要由 entropy 决定；正式 curriculum 以 Step 4 生成的 staged files 为准
 
 ### 3. 第一轮 teacher eval / teacher200（为 teacher error 提供来源）
 
@@ -227,6 +245,12 @@ python recipe/time_series_forecast/build_etth1_rl_dataset.py \
 - `curriculum_stage`
 - `curriculum_band`
 
+同时会为 train split 额外写出：
+
+- `train_stage1.jsonl`
+- `train_stage12.jsonl`
+- `train_stage123.jsonl`
+
 这一步会检查 teacher metadata 覆盖率；如果你还在拿旧的稀疏 `teacher_eval.jsonl` 来灌 curriculum，会直接报错。正常情况下应看到类似：
 
 ```text
@@ -274,10 +298,12 @@ python recipe/time_series_forecast/build_etth1_high_quality_sft.py \
 - `metadata.json` 里的 `train_teacher_eval_records=600`、`val_teacher_eval_records=192`、`test_teacher_eval_records=256`
 - `metadata.json` 里的 `local_worker_device_groups` 是否符合预期
 - `train.parquet` / `val.parquet` 是否带有：
-  - `sft_trajectory_type`
-  - `refinement_supervision_type`
-  - `refinement_trigger_reason`
+  - `turn3_target_type`
+  - `turn3_trigger_reason`
+  - `refine_ops_signature`
   - `selected_feature_tool_signature`
+- `metadata.json` 里的 `train_turn3_target_type_distribution_before_balance` 和 `train_turn3_target_type_distribution`
+  是否显示 train parquet 已做轻量 keep/refine 重平衡
 
 ### 6. 跑 SFT
 
@@ -299,11 +325,19 @@ SFT 输出目录：
 artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same2/
 ```
 
+如果你直接调用 `examples/time_series_forecast/run_qwen3-1.7B_sft.sh` 而不额外覆盖数据路径，脚本默认也会指向这套 `paper_same2` parquet。
+
 RL 要用的模型路径必须指向：
 
 ```bash
 artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same2/<global_step_x>/huggingface
 ```
+
+说明：
+
+- 当前 `build_etth1_sft_dataset.py` 默认会对 `train.parquet` 做轻量 `turn3_target_type` 重平衡
+- 默认目标是让 `local_refine` 在 train split 中至少达到约 `30%`
+- `val.parquet` / `test.parquet` 不做这个重平衡，保留自然分布
 
 ### 7. RL smoke test
 
@@ -343,7 +377,15 @@ bash examples/time_series_forecast/run_qwen3-1.7B.sh \
 
 ### 8. RL 机制验证
 
-这一步才是当前实现该跑的主验证命令。推荐先用 `rollout.n=1` 做低方差验证。
+这一步才是当前实现该跑的主验证命令。推荐先按 curriculum 顺序使用：
+
+1. `train_stage1.jsonl`
+2. `train_stage12.jsonl`
+3. `train_stage123.jsonl`
+
+如果你只是做一次机制验证，也可以直接先用 `train_stage123.jsonl`。推荐先用 `rollout.n=1` 做低方差验证。
+
+如果你直接调用 `examples/time_series_forecast/run_qwen3-1.7B.sh` 而不额外覆盖 `RL_TRAIN_FILES`，脚本默认也会指向 `train_stage123.jsonl`。
 
 ```bash
 cd /data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main
@@ -355,7 +397,7 @@ ray stop --force
 
 DEBUG_CHAIN=0 \
 TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_eval20_paper_same2.jsonl \
-RL_TRAIN_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train.jsonl \
+RL_TRAIN_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train_stage123.jsonl \
 RL_VAL_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/val.jsonl \
 RL_TEMPERATURE=0.3 \
 RL_ROLLOUT_GPU_MEMORY_UTILIZATION=0.22 \
@@ -383,18 +425,25 @@ bash examples/time_series_forecast/run_qwen3-1.7B.sh \
 
 ### 当前“反思修正”监督是怎么构造的
 
-当前实现里，`route_then_refine` 不是凭空出现的，而是由 SFT builder 的启发式规则触发：
+当前实现里，SFT builder 会先拿 `selected_prediction_model` 的 teacher forecast 作为 `Turn 3` 的 base forecast，然后离线构造两类 target：
 
-- 如果选中的 feature tools 包含 `extract_data_quality` 或 `extract_forecast_residuals`，样本会被标成 `route_then_refine`
-- 如果选中的 feature tools 包含 `extract_within_channel_dynamics` 且 `teacher_eval_score_margin <= 0.05`，也会被标成 `route_then_refine`
-- 否则标成 `route_only`
+- `validated_keep`：base forecast 通过检查，最终答案直接保留它
+- `local_refine`：base forecast 存在局部问题，离线规则器生成一个小幅修正后的 target
+
+当前会显式写进 parquet / metadata 的字段主要有：
+
+- `turn3_target_type`
+- `turn3_trigger_reason`
+- `refine_ops_signature`
+- `refine_gain_mse`
+- `refine_gain_mae`
 
 当前 SFT 里 agent 学到的“反思修正”主要是两层：
 
-- 轨迹层：何时应该 `route_only`，何时应该 `route_then_refine`
-- 文本层：`<think>` 中如何解释“我为什么保留 selected forecast”或“我为什么做小幅修正”
+- 轨迹层：何时应该保留 selected forecast，何时应该做局部修正
+- 文本层：`<think>` 中如何解释“为什么保持不变”或“为什么做小幅修正”
 
-需要注意的是：当前离线数值 target 仍然大多直接沿用 selected teacher forecast，所以现在的 refinement supervision 仍然偏“language-guided / decision-guided”，还不是一个单独构造出的数值修正 target。这也是后续如果要继续增强的重点。
+需要注意的是：当前 `local_refine` 仍然是确定性规则器合成的 target，不是论文原文定义的学习式数值修正器。这一块是当前实现和论文之间仍然存在的工程差异。
 
 ### 关键日志
 

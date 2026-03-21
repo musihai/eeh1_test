@@ -380,7 +380,6 @@ class RayAgentTrainer(RayPPOTrainer):
             n,
             default="unknown",
         )
-        reward_main_scale = self._to_str_list(reward_extra_infos_dict.get("reward_main_scale"), n)
         selected_forecast_orig_mse = self._to_float_list(
             reward_extra_infos_dict.get("selected_forecast_orig_mse"),
             n,
@@ -556,7 +555,6 @@ class RayAgentTrainer(RayPPOTrainer):
         format_failure_reason_counter = Counter(reason for reason in format_failure_reason if reason)
         generation_stop_reason_counter = Counter(reason for reason in generation_stop_reason if reason)
         selected_model_counter = Counter(model for model in selected_model if model)
-        reward_main_scale_counter = Counter(scale for scale in reward_main_scale if scale)
         feature_tool_signature_counter = Counter(signature for signature in feature_tool_signature if signature)
         tool_call_sequence_counter = Counter((signature if signature else "none") for signature in tool_call_sequence)
         analysis_state_signature_counter = Counter(signature for signature in analysis_state_signature if signature)
@@ -726,7 +724,6 @@ class RayAgentTrainer(RayPPOTrainer):
             "generation_stop_reason_distribution": {
                 str(k): int(v) for k, v in sorted(generation_stop_reason_counter.items())
             },
-            "reward_main_scale_distribution": {str(k): int(v) for k, v in sorted(reward_main_scale_counter.items())},
             "feature_tool_signature_distribution": {
                 str(k): int(v) for k, v in sorted(feature_tool_signature_counter.items())
             },

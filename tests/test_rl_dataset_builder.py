@@ -7,6 +7,7 @@ import pandas as pd
 from recipe.time_series_forecast.build_etth1_rl_dataset import (
     build_ground_truth,
     build_prompt,
+    build_train_stage_slices,
     build_split_configs,
     compute_teacher_metadata_coverage,
     compute_normalized_permutation_entropy,
@@ -88,6 +89,19 @@ class TestETTh1RLDatasetBuilder(unittest.TestCase):
             },
         )
         self.assertAlmostEqual(coverage, 0.4)
+
+    def test_build_train_stage_slices_emits_stage1_stage12_stage123(self) -> None:
+        records = [
+            {"uid": "a", "curriculum_stage": "easy"},
+            {"uid": "b", "curriculum_stage": "medium"},
+            {"uid": "c", "curriculum_stage": "hard"},
+            {"uid": "d", "curriculum_stage": "unknown"},
+        ]
+        staged = build_train_stage_slices(records)
+        self.assertEqual(list(staged.keys()), ["train_stage1", "train_stage12", "train_stage123"])
+        self.assertEqual([record["uid"] for record in staged["train_stage1"]], ["a"])
+        self.assertEqual([record["uid"] for record in staged["train_stage12"]], ["a", "b"])
+        self.assertEqual([record["uid"] for record in staged["train_stage123"]], ["a", "b", "c", "d"])
 
 
 if __name__ == "__main__":

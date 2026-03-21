@@ -13,11 +13,8 @@ from verl.utils.chain_debug import append_chain_debug, short_text
 # - normalized/log-transformed MSE as the main term
 # - structural alignment and season/trend consistency as shaping terms
 # - format validity and output-length consistency as auxiliary constraints
-ENABLE_CHANGE_POINT_SCORE = os.getenv("TS_ENABLE_CHANGE_POINT_SCORE", "1").lower() in {"1", "true", "yes", "on"}
-ENABLE_SEASON_TREND_SCORE = os.getenv("TS_ENABLE_SEASON_TREND_SCORE", "1").lower() in {"1", "true", "yes", "on"}
-STRICT_RAW_MODE = os.getenv("TS_STRICT_RAW_MODE", "0").lower() in {"1", "true", "yes", "on"}
-STRICT_LENGTH_GATE = os.getenv("TS_STRICT_LENGTH_GATE", "0").lower() in {"1", "true", "yes", "on"}
-REWARD_USE_ORIG_SCALE = os.getenv("TS_REWARD_USE_ORIG_SCALE", "0").lower() in {"1", "true", "yes", "on"}
+ENABLE_CHANGE_POINT_SCORE = True
+ENABLE_SEASON_TREND_SCORE = True
 TURN3_SUCCESS_SAMPLE_RATE = max(int(os.getenv("TS_TURN3_SUCCESS_SAMPLE_RATE", "100") or 100), 1)
 
 
@@ -92,7 +89,6 @@ def append_turn3_generation_debug(
         "output_source": output_source,
         "is_failure": is_failure,
         "was_clipped": was_clipped,
-        "strict_raw_mode": bool(STRICT_RAW_MODE),
         "format_failure_reason": format_failure_reason,
         "has_answer_tag": bool(has_answer_tag),
         "has_answer_open": bool(has_answer_open),
@@ -428,10 +424,9 @@ def compute_format_score(solution_str: str) -> float:
         return -1.0
     
     try:
-        # Check for <answer>...</answer> pattern
-        answer_match = re.search(r'<answer>(.*?)</answer>', solution_str, re.DOTALL)
-        
-        if answer_match:
+        protocol_match = re.fullmatch(r"\s*<think>(.*?)</think>\s*<answer>(.*?)</answer>\s*", solution_str, re.DOTALL)
+
+        if protocol_match and protocol_match.group(1).strip() and protocol_match.group(2).strip():
             return 0.0
         return -1.0
     except Exception as e:
@@ -442,10 +437,21 @@ def compute_format_score(solution_str: str) -> float:
 def infer_format_failure_reason(solution_str: Optional[str]) -> str:
     if solution_str is None:
         return "empty_solution"
+    if "<think>" not in solution_str and "</think>" not in solution_str:
+        return "missing_think_block"
+    if "<think>" not in solution_str:
+        return "missing_think_open_tag"
+    if "</think>" not in solution_str:
+        return "missing_think_close_tag"
     if "<answer>" not in solution_str:
         return "missing_answer_open_tag"
     if "</answer>" not in solution_str:
         return "missing_answer_close_tag"
+    think_text_match = re.search(r"<think>(.*?)</think>", solution_str, re.DOTALL)
+    if not think_text_match:
+        return "invalid_think_block"
+    if not think_text_match.group(1).strip():
+        return "empty_think_block"
     answer_text = extract_answer(solution_str)
     if not answer_text.strip():
         return "empty_answer_block"
@@ -526,9 +532,6 @@ def compute_mse_score(solution_str: str, ground_truth: str) -> float:
     if not gt_values or not pred_values:
         return 0.0
 
-    if STRICT_LENGTH_GATE and len(pred_values) != len(gt_values):
-        return 0.0
-    
     pred_len = len(pred_values)
     gt_len = len(gt_values)
     
@@ -541,8 +544,7 @@ def compute_mse_score(solution_str: str, ground_truth: str) -> float:
     orig_mse = float(mean_squared_error(gt_slice, pred_slice))
     norm_pred, norm_gt = normalize_for_reward(pred_slice, gt_slice)
     norm_mse = float(mean_squared_error(norm_gt, norm_pred))
-    main_mse = orig_mse if REWARD_USE_ORIG_SCALE else norm_mse
-    score = 1.0 / (1.0 + np.log1p(main_mse))
+    score = 1.0 / (1.0 + np.log1p(norm_mse))
 
     return score * 0.6
 
@@ -772,8 +774,6 @@ def compute_score(
     selected_model = str(_resolve_extra_value("prediction_model_used", "selected_model", "output_source") or "unknown")
     output_source = _resolve_extra_value("output_source", "prediction_model_used", "selected_model")
     sample_uid = _resolve_extra_value("uid", "sample_uid")
-    reward_main_scale = "orig" if REWARD_USE_ORIG_SCALE else "norm"
-
     if solution_str is None:
         append_turn3_generation_debug(
             data_source=data_source,
@@ -810,9 +810,6 @@ def compute_score(
                 "sample_uid": sample_uid,
                 "selected_model": selected_model,
                 "output_source": output_source,
-                "strict_raw_mode": bool(STRICT_RAW_MODE),
-                "strict_length_gate": bool(STRICT_LENGTH_GATE),
-                "reward_main_scale": reward_main_scale,
                 "format_score": -1.0,
                 "length_score": 0.0,
                 "length_penalty": 0.0,
@@ -870,9 +867,6 @@ def compute_score(
             "under_generation": False,
             "over_generation": False,
             "exact_generation": False,
-            "strict_raw_mode": bool(STRICT_RAW_MODE),
-            "strict_length_gate": bool(STRICT_LENGTH_GATE),
-            "reward_main_scale": reward_main_scale,
             "length_hard_fail": False,
             "strict_length_match": False,
             **passthrough_extra_info,
@@ -925,8 +919,7 @@ def compute_score(
             length_penalty = compute_length_penalty(pred_len, gt_len)
         length_score = compute_length_score(solution_str, ground_truth)
         if not np.isnan(orig_mse) and not np.isnan(norm_mse):
-            main_mse = orig_mse if REWARD_USE_ORIG_SCALE else norm_mse
-            mse_score = (1.0 / (1.0 + np.log1p(main_mse))) * 0.6
+            mse_score = (1.0 / (1.0 + np.log1p(norm_mse))) * 0.6
         score += length_score
         score += mse_score
         score -= length_penalty
@@ -952,9 +945,6 @@ def compute_score(
             "sample_uid": sample_uid,
             "selected_model": selected_model,
             "output_source": output_source,
-            "strict_raw_mode": bool(STRICT_RAW_MODE),
-            "strict_length_gate": bool(STRICT_LENGTH_GATE),
-            "reward_main_scale": reward_main_scale,
             "format_score": float(format_score),
             "length_score": float(length_score),
             "length_penalty": float(length_penalty),
@@ -1048,9 +1038,6 @@ def compute_score(
         "under_generation": under_generation,
         "over_generation": over_generation,
         "exact_generation": exact_generation,
-        "strict_raw_mode": bool(STRICT_RAW_MODE),
-        "strict_length_gate": bool(STRICT_LENGTH_GATE),
-        "reward_main_scale": reward_main_scale,
         "length_hard_fail": bool(length_hard_fail),
         "strict_length_match": bool(strict_length_match),
         **passthrough_extra_info,

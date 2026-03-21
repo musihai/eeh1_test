@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import unittest
@@ -11,15 +12,63 @@ from recipe.time_series_forecast.utils import compact_prediction_tool_output_fro
 
 
 class TestETTh1SFTDatasetBuilder(unittest.TestCase):
-    def test_convert_small_rl_slice_to_multiturn_parquet(self):
+    def _load_base_sample(self) -> dict:
         source_jsonl = Path("dataset/ett_rl_etth1_paper_same/train.jsonl")
+        with source_jsonl.open("r", encoding="utf-8") as handle:
+            sample = json.loads(next(handle))
+
+        reward_model = sample.get("reward_model", {})
+        teacher_prediction_text = str(reward_model.get("ground_truth", "") or "").strip()
+        sample["reference_teacher_model"] = "chronos2"
+        sample["teacher_eval_second_best_model"] = "patchtst"
+        sample["teacher_eval_score_margin"] = 0.20
+        sample["teacher_prediction_text"] = teacher_prediction_text
+        sample["teacher_prediction_source"] = "reference_teacher"
+        return sample
+
+    def _make_flat_tail_teacher_prediction(self, sample: dict, tail_length: int = 8) -> str:
+        ground_truth = str(sample.get("reward_model", {}).get("ground_truth", "") or "").strip()
+        lines = [line for line in ground_truth.splitlines() if line.strip()]
+        self.assertGreaterEqual(len(lines), tail_length + 1)
+        anchor_tokens = lines[-(tail_length + 1)].split()
+        anchor_value = anchor_tokens[-1]
+
+        rewritten: list[str] = []
+        for idx, line in enumerate(lines):
+            tokens = line.split()
+            if idx >= len(lines) - tail_length:
+                tokens[-1] = anchor_value
+            rewritten.append(" ".join(tokens))
+        return "\n".join(rewritten)
+
+    def _make_spike_teacher_prediction(self, sample: dict, spike_index: int = 24, spike_delta: float = 50.0) -> str:
+        ground_truth = str(sample.get("reward_model", {}).get("ground_truth", "") or "").strip()
+        lines = [line for line in ground_truth.splitlines() if line.strip()]
+        self.assertGreater(len(lines), spike_index)
+
+        rewritten: list[str] = []
+        for idx, line in enumerate(lines):
+            tokens = line.split()
+            if idx == spike_index:
+                tokens[-1] = f"{float(tokens[-1]) + spike_delta:.4f}"
+            rewritten.append(" ".join(tokens))
+        return "\n".join(rewritten)
+
+    def test_convert_small_rl_slice_to_multiturn_parquet(self):
+        sample = self._load_base_sample()
+        sample_b = copy.deepcopy(sample)
+        sample_b["index"] = int(sample.get("index", 0)) + 1
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "mini.jsonl"
             output_path = Path(tmpdir) / "train.parquet"
+            with input_path.open("w", encoding="utf-8") as handle:
+                handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                handle.write(json.dumps(sample_b, ensure_ascii=False) + "\n")
+
             dataframe = convert_jsonl_to_sft_parquet(
-                input_path=source_jsonl,
+                input_path=input_path,
                 output_path=output_path,
-                prediction_mode="ground_truth",
                 max_samples=2,
             )
 
@@ -58,12 +107,21 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             self.assertIn("### Prediction Tool Output", messages[prediction_assistant_index + 2]["content"])
             self.assertIn("<think>", messages[-1]["content"])
             self.assertIn("<answer>", messages[-1]["content"])
-            self.assertIn(loaded.iloc[0]["sft_trajectory_type"], {"route_only", "route_then_refine"})
+            self.assertIn(loaded.iloc[0]["turn3_target_type"], {"validated_keep", "local_refine"})
             self.assertIsInstance(list(loaded.iloc[0]["selected_feature_tools"]), list)
             self.assertIn("selected_feature_tool_count", loaded.columns)
             self.assertIn("selected_feature_tool_signature", loaded.columns)
-            self.assertIn("refinement_supervision_type", loaded.columns)
-            self.assertIn("refinement_trigger_reason", loaded.columns)
+            self.assertIn("turn3_trigger_reason", loaded.columns)
+            self.assertIn("refine_ops_signature", loaded.columns)
+            self.assertIn("refine_changed_value_count", loaded.columns)
+            self.assertIn("refine_first_changed_index", loaded.columns)
+            self.assertIn("refine_last_changed_index", loaded.columns)
+            self.assertIn("refine_changed_span", loaded.columns)
+            self.assertIn("refine_mean_abs_delta", loaded.columns)
+            self.assertIn("refine_max_abs_delta", loaded.columns)
+            self.assertIn("base_prediction_source", loaded.columns)
+            self.assertIn("base_teacher_prediction_text", loaded.columns)
+            self.assertIn("refined_prediction_text", loaded.columns)
             self.assertEqual(
                 loaded.iloc[0]["selected_feature_tool_signature"],
                 "->".join(list(loaded.iloc[0]["selected_feature_tools"])),
@@ -72,23 +130,21 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                 int(loaded.iloc[0]["selected_feature_tool_count"]),
                 len(list(loaded.iloc[0]["selected_feature_tools"])),
             )
-            if loaded.iloc[0]["sft_trajectory_type"] == "route_then_refine":
-                self.assertEqual(loaded.iloc[0]["refinement_supervision_type"], "language_only_refinement_hint")
-            else:
-                self.assertEqual(loaded.iloc[0]["refinement_supervision_type"], "keep_selected_forecast")
+            self.assertEqual(loaded.iloc[0]["selected_prediction_model"], "chronos2")
+            self.assertEqual(loaded.iloc[0]["base_prediction_source"], "reference_teacher_cached")
+            self.assertEqual(loaded.iloc[0]["turn3_target_type"], "validated_keep")
+            self.assertEqual(loaded.iloc[0]["refine_ops_signature"], "none")
+            self.assertAlmostEqual(float(loaded.iloc[0]["refine_gain_mse"]), 0.0, places=6)
+            self.assertEqual(int(loaded.iloc[0]["refine_changed_value_count"]), 0)
+            self.assertEqual(int(loaded.iloc[0]["refine_first_changed_index"]), -1)
             tools = list(loaded.iloc[0]["tools"])
             self.assertEqual(len(tools), len(TIMESERIES_TOOL_SCHEMAS))
             self.assertEqual(tools[0]["function"]["name"], TIMESERIES_TOOL_SCHEMAS[0]["function"]["name"])
             self.assertEqual(tools[-1]["function"]["name"], TIMESERIES_TOOL_SCHEMAS[-1]["function"]["name"])
 
     def test_convert_uses_cached_teacher_prediction_when_present(self):
-        source_jsonl = Path("dataset/ett_rl_etth1_paper_same/train.jsonl")
-
-        with source_jsonl.open("r", encoding="utf-8") as handle:
-            sample = json.loads(next(handle))
-
+        sample = self._load_base_sample()
         sample["reference_teacher_model"] = "chronos2"
-        sample["teacher_prediction_text"] = "2016-01-01 00:00:00 1.0000\n2016-01-01 01:00:00 2.0000"
         sample["teacher_prediction_source"] = "reference_teacher"
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -99,7 +155,6 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             dataframe = convert_jsonl_to_sft_parquet(
                 input_path=jsonl_path,
                 output_path=parquet_path,
-                prediction_mode="reference_teacher",
                 max_samples=1,
             )
 
@@ -114,8 +169,31 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                     model_name="chronos2",
                 ),
             )
-            self.assertIn("1.0000", messages[-1]["content"])
-            self.assertIn("2.0000", messages[-1]["content"])
+            self.assertIn("<think>", messages[-1]["content"])
+            self.assertIn("chronos2", messages[-1]["content"].lower())
+            self.assertEqual(dataframe.iloc[0]["selected_prediction_model"], "chronos2")
+
+    def test_convert_builds_local_refine_target_for_spike_teacher_prediction(self):
+        sample = self._load_base_sample()
+        sample["teacher_eval_score_margin"] = 0.01
+        sample["teacher_prediction_text"] = self._make_spike_teacher_prediction(sample)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jsonl_path = Path(tmpdir) / "spike.jsonl"
+            parquet_path = Path(tmpdir) / "spike.parquet"
+            jsonl_path.write_text(json.dumps(sample, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            dataframe = convert_jsonl_to_sft_parquet(
+                input_path=jsonl_path,
+                output_path=parquet_path,
+                max_samples=1,
+            )
+
+            self.assertEqual(dataframe.iloc[0]["turn3_target_type"], "local_refine")
+            self.assertIn("isolated_spike_smoothing", dataframe.iloc[0]["refine_ops_signature"])
+            self.assertGreater(int(dataframe.iloc[0]["refine_changed_value_count"]), 0)
+            self.assertGreaterEqual(int(dataframe.iloc[0]["refine_first_changed_index"]), 0)
+            self.assertGreater(float(dataframe.iloc[0]["refine_gain_mse"]), 0.0)
 
 
 if __name__ == "__main__":

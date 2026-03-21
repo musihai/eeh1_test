@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import numpy as np
 import pandas as pd
 
 from recipe.time_series_forecast.prompts import (
@@ -38,7 +39,7 @@ from recipe.time_series_forecast.utils import (
 
 
 SUPPORTED_PREDICTION_MODELS = {"patchtst", "itransformer", "arima", "chronos2"}
-DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_v2")
+DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2")
 
 
 @dataclass(frozen=True)
@@ -75,38 +76,6 @@ def _make_tool_call(tool_name: str, arguments: dict[str, Any], call_id: str) -> 
     }
 
 
-def _slice_nonempty_lines(text: str, limit: int | None = None) -> list[str]:
-    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-    if limit is not None:
-        return lines[:limit]
-    return lines
-
-
-def _infer_last_timestamp_from_ground_truth(ground_truth: str) -> str | None:
-    lines = _slice_nonempty_lines(ground_truth, limit=2)
-    if not lines:
-        return None
-
-    first_parts = lines[0].split()
-    if len(first_parts) < 2:
-        return None
-    first_timestamp = pd.to_datetime(f"{first_parts[0]} {first_parts[1]}")
-
-    if len(lines) >= 2:
-        second_parts = lines[1].split()
-        if len(second_parts) >= 2:
-            second_timestamp = pd.to_datetime(f"{second_parts[0]} {second_parts[1]}")
-            freq = second_timestamp - first_timestamp
-            if freq > pd.Timedelta(0):
-                return (first_timestamp - freq).strftime("%Y-%m-%d %H:%M:%S")
-
-    return (first_timestamp - pd.Timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _ground_truth_prediction_text(ground_truth: str, forecast_horizon: int) -> str:
-    return "\n".join(_slice_nonempty_lines(ground_truth, limit=forecast_horizon))
-
-
 async def _predict_with_runtime_tools(
     *,
     historical_data: str,
@@ -114,8 +83,7 @@ async def _predict_with_runtime_tools(
     target_column: str,
     forecast_horizon: int,
     model_name: str,
-    fallback_ground_truth: str,
-) -> tuple[str, str]:
+) -> str:
     context_df = parse_time_series_to_dataframe(
         historical_data,
         series_id=data_source or "ETTh1",
@@ -126,9 +94,10 @@ async def _predict_with_runtime_tools(
         prediction_length=forecast_horizon,
         model_name=model_name,
     )
-    last_timestamp = get_last_timestamp(historical_data) or _infer_last_timestamp_from_ground_truth(fallback_ground_truth)
-    prediction_text = format_predictions_to_string(pred_df, last_timestamp)
-    return prediction_text, "reference_teacher"
+    last_timestamp = get_last_timestamp(historical_data)
+    if not last_timestamp:
+        raise ValueError("Unable to infer the last historical timestamp for teacher prediction formatting.")
+    return format_predictions_to_string(pred_df, last_timestamp)
 
 
 def build_feature_tool_results(values: list[float]) -> list[ToolResult]:
@@ -181,7 +150,9 @@ def build_feature_tool_results(values: list[float]) -> list[ToolResult]:
         selected_tool_names.add("extract_event_summary")
 
     if len(selected_tool_names) == 1:
-        fallback_tool = "extract_event_summary" if abs(float(basic_features.get("acf_seasonal", 0.0))) >= 0.2 else "extract_within_channel_dynamics"
+        fallback_tool = (
+            "extract_event_summary" if abs(float(basic_features.get("acf_seasonal", 0.0))) >= 0.2 else "extract_within_channel_dynamics"
+        )
         selected_tool_names.add(fallback_tool)
 
     return [
@@ -191,13 +162,12 @@ def build_feature_tool_results(values: list[float]) -> list[ToolResult]:
     ]
 
 
-def _to_value_only_prediction_text(prediction_text: str, forecast_horizon: int) -> str:
+def _extract_prediction_values(prediction_text: str) -> list[float]:
     values: list[float] = []
     for line in str(prediction_text or "").splitlines():
         line = line.strip()
         if not line:
             continue
-        # Try last numeric token first (works for timestamp + value).
         parts = line.split()
         parsed = None
         for token in reversed(parts):
@@ -206,7 +176,6 @@ def _to_value_only_prediction_text(prediction_text: str, forecast_horizon: int) 
                 break
             except Exception:
                 continue
-        # Fallback: regex extract the last float-like number.
         if parsed is None:
             matches = re.findall(r"-?\d+(?:\.\d+)?", line)
             if matches:
@@ -214,147 +183,442 @@ def _to_value_only_prediction_text(prediction_text: str, forecast_horizon: int) 
                     parsed = float(matches[-1])
                 except Exception:
                     parsed = None
-        if parsed is not None:
+        if parsed is not None and np.isfinite(parsed):
             values.append(float(parsed))
-
-    if not values:
-        return ""
-
-    trimmed = values[:forecast_horizon]
-    if len(trimmed) < forecast_horizon:
-        trimmed = trimmed + [trimmed[-1]] * (forecast_horizon - len(trimmed))
-    return "\n".join(f"{v:.4f}" for v in trimmed)
+    return values
 
 
-def _infer_trajectory_type(sample: dict[str, Any], selected_feature_tools: list[str]) -> str:
-    score_margin = float(sample.get("teacher_eval_score_margin", 0.0) or 0.0)
-    if "extract_data_quality" in selected_feature_tools or "extract_forecast_residuals" in selected_feature_tools:
-        return "route_then_refine"
-    if "extract_within_channel_dynamics" in selected_feature_tools and score_margin <= 0.05:
-        return "route_then_refine"
-    return "route_only"
+def _require_prediction_values(prediction_text: str, forecast_horizon: int, *, source_name: str) -> list[float]:
+    values = _extract_prediction_values(prediction_text)
+    if len(values) != forecast_horizon:
+        raise ValueError(
+            f"{source_name} prediction length must equal forecast_horizon={forecast_horizon}, got {len(values)}"
+        )
+    return values
+
+
+def _prediction_text_from_values(values: list[float]) -> str:
+    return "\n".join(f"{float(v):.4f}" for v in values)
 
 
 def _feature_tool_signature(selected_feature_tools: list[str]) -> str:
-    if not selected_feature_tools:
-        return "none"
-    return "->".join(selected_feature_tools)
+    return "->".join(selected_feature_tools) if selected_feature_tools else "none"
 
 
-def _build_refinement_supervision(
-    sample: dict[str, Any],
-    selected_feature_tools: list[str],
-    *,
-    model_name: str,
-    prediction_source: str,
-) -> dict[str, str]:
-    trajectory_type = _infer_trajectory_type(sample, selected_feature_tools)
-    score_margin = float(sample.get("teacher_eval_score_margin", 0.0) or 0.0)
+def _median_abs_deviation(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    arr = np.asarray(values, dtype=float)
+    median = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - median)))
+    return mad
 
-    if trajectory_type == "route_then_refine":
-        if "extract_data_quality" in selected_feature_tools or "extract_forecast_residuals" in selected_feature_tools:
-            return {
-                "trajectory_type": trajectory_type,
-                "refinement_supervision_type": "language_only_refinement_hint",
-                "refinement_trigger_reason": "quality_or_residual_signal",
-                "reflection_text": (
-                    f"I start from {model_name.upper()} as the selected forecast and make only a small "
-                    "evidence-based refinement using the quality/residual diagnostics. I keep the selected "
-                    "forecast as the backbone and only adjust local level or shape when the evidence supports it."
-                ),
-            }
+
+def _compute_diff_mad(values: list[float]) -> float:
+    if len(values) < 2:
+        return 1e-6
+    diffs = np.diff(np.asarray(values, dtype=float))
+    median = float(np.median(diffs))
+    mad = float(np.median(np.abs(diffs - median)))
+    return max(mad, 1e-6)
+
+
+def _compute_error_metrics(candidate_values: list[float], ground_truth_values: list[float]) -> tuple[float, float]:
+    min_len = min(len(candidate_values), len(ground_truth_values))
+    if min_len <= 0:
+        return float("inf"), float("inf")
+    candidate = np.asarray(candidate_values[:min_len], dtype=float)
+    reference = np.asarray(ground_truth_values[:min_len], dtype=float)
+    mse = float(np.mean((candidate - reference) ** 2))
+    mae = float(np.mean(np.abs(candidate - reference)))
+    return mse, mae
+
+
+def _detect_isolated_spikes(values: list[float], diff_mad: float) -> list[int]:
+    if len(values) < 3:
+        return []
+    threshold = max(3.0 * diff_mad, 1e-4)
+    spike_indices: list[int] = []
+    for idx in range(1, len(values) - 1):
+        left_delta = values[idx] - values[idx - 1]
+        right_delta = values[idx + 1] - values[idx]
+        if abs(left_delta) <= threshold or abs(right_delta) <= threshold:
+            continue
+        if left_delta * right_delta < 0:
+            spike_indices.append(idx)
+    return spike_indices
+
+
+def _smooth_isolated_spikes(values: list[float]) -> tuple[list[float], list[str]]:
+    smoothed = list(values)
+    diff_mad = _compute_diff_mad(smoothed)
+    spike_indices = _detect_isolated_spikes(smoothed, diff_mad)
+    if not spike_indices:
+        return smoothed, []
+    for idx in spike_indices:
+        smoothed[idx] = 0.5 * (smoothed[idx - 1] + smoothed[idx + 1])
+    return smoothed, ["isolated_spike_smoothing"]
+
+
+def _repair_flat_tail(values: list[float], history_values: list[float]) -> tuple[list[float], list[str]]:
+    if len(values) < 8 or len(history_values) < 8:
+        return list(values), []
+    repaired = list(values)
+    tail_value = repaired[-1]
+    flat_run = 1
+    for idx in range(len(repaired) - 2, -1, -1):
+        if abs(repaired[idx] - tail_value) <= 1e-8:
+            flat_run += 1
+        else:
+            break
+    if flat_run < 6:
+        return repaired, []
+    history_tail = history_values[-flat_run:]
+    if len(history_tail) != flat_run:
+        return repaired, []
+    history_center = float(np.mean(history_tail))
+    tail_center = float(np.mean(repaired[-flat_run:]))
+    adjusted_tail = [tail_center + (float(v) - history_center) for v in history_tail]
+    if np.allclose(np.asarray(adjusted_tail, dtype=float), np.asarray(repaired[-flat_run:], dtype=float), atol=1e-6):
+        return repaired, []
+    repaired[-flat_run:] = adjusted_tail
+    return repaired, ["flat_tail_repair"]
+
+
+def _clip_implausible_amplitude(values: list[float], history_values: list[float]) -> tuple[list[float], list[str]]:
+    if not history_values:
+        return list(values), []
+    history_median = float(np.median(np.asarray(history_values, dtype=float)))
+    history_mad = max(_median_abs_deviation(history_values), 1e-6)
+    lower = history_median - 6.0 * history_mad
+    upper = history_median + 6.0 * history_mad
+    clipped = [float(np.clip(v, lower, upper)) for v in values]
+    if np.allclose(np.asarray(clipped, dtype=float), np.asarray(values, dtype=float), atol=1e-8):
+        return list(values), []
+    return clipped, ["amplitude_clip"]
+
+
+def _adjust_local_level(values: list[float], history_values: list[float]) -> tuple[list[float], list[str]]:
+    window = min(12, len(values), len(history_values))
+    if window < 4:
+        return list(values), []
+
+    adjusted = list(values)
+    pred_tail = np.asarray(adjusted[-window:], dtype=float)
+    history_tail = np.asarray(history_values[-window:], dtype=float)
+    level_gap = float(np.mean(history_tail) - np.mean(pred_tail))
+    history_scale = max(_median_abs_deviation(history_values), 1e-4)
+    if abs(level_gap) <= max(1.5 * history_scale, 1e-4):
+        return adjusted, []
+
+    correction = 0.5 * level_gap
+    adjusted[-window:] = [float(v + correction) for v in adjusted[-window:]]
+    return adjusted, ["local_level_adjust"]
+
+
+def _adjust_local_slope(values: list[float], history_values: list[float]) -> tuple[list[float], list[str]]:
+    window = min(12, len(values), len(history_values))
+    if window < 4:
+        return list(values), []
+
+    adjusted = list(values)
+    pred_tail = np.asarray(adjusted[-window:], dtype=float)
+    history_tail = np.asarray(history_values[-window:], dtype=float)
+    pred_slope = float((pred_tail[-1] - pred_tail[0]) / max(window - 1, 1))
+    history_slope = float((history_tail[-1] - history_tail[0]) / max(window - 1, 1))
+    slope_gap = history_slope - pred_slope
+    slope_scale = max(_compute_diff_mad(history_values), 1e-4)
+    if abs(slope_gap) <= max(2.0 * slope_scale, 1e-4):
+        return adjusted, []
+
+    slope_correction = 0.5 * slope_gap
+    start_index = len(adjusted) - window
+    for offset in range(window):
+        adjusted[start_index + offset] = float(adjusted[start_index + offset] + slope_correction * offset)
+    return adjusted, ["local_slope_adjust"]
+
+
+def _should_attempt_refinement(selected_feature_tools: list[str], score_margin: float) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    if "extract_data_quality" in selected_feature_tools:
+        reasons.append("quality_signal")
+    if "extract_forecast_residuals" in selected_feature_tools:
+        reasons.append("residual_signal")
+    if "extract_within_channel_dynamics" in selected_feature_tools and score_margin <= 0.05:
+        reasons.append("dynamics_small_margin")
+    return bool(reasons), reasons or ["evidence_consistent"]
+
+
+def _apply_local_refinements(values: list[float], history_values: list[float]) -> tuple[list[float], list[str]]:
+    candidate = list(values)
+    ops: list[str] = []
+
+    candidate, spike_ops = _smooth_isolated_spikes(candidate)
+    ops.extend(spike_ops)
+
+    candidate, flat_ops = _repair_flat_tail(candidate, history_values)
+    ops.extend(flat_ops)
+
+    candidate, level_ops = _adjust_local_level(candidate, history_values)
+    ops.extend(level_ops)
+
+    candidate, slope_ops = _adjust_local_slope(candidate, history_values)
+    ops.extend(slope_ops)
+
+    candidate, clip_ops = _clip_implausible_amplitude(candidate, history_values)
+    ops.extend(clip_ops)
+
+    deduped_ops = list(dict.fromkeys(ops))
+    return candidate, deduped_ops
+
+
+def _summarize_refine_delta(base_values: list[float], refined_values: list[float]) -> dict[str, float]:
+    if len(base_values) != len(refined_values):
+        raise ValueError("base_values and refined_values must have the same length")
+    deltas = np.abs(np.asarray(refined_values, dtype=float) - np.asarray(base_values, dtype=float))
+    changed_indices = np.where(deltas > 1e-6)[0]
+    if changed_indices.size == 0:
         return {
-            "trajectory_type": trajectory_type,
-            "refinement_supervision_type": "language_only_refinement_hint",
-            "refinement_trigger_reason": f"dynamics_signal_with_small_teacher_margin<= {score_margin:.4f}",
-            "reflection_text": (
-                f"I start from {model_name.upper()} as the selected forecast and make only a small "
-                "evidence-based refinement because the dynamics diagnostics indicate local uncertainty. "
-                "I preserve the selected forecast and only make constrained local adjustments."
-            ),
+            "refine_changed_value_count": 0,
+            "refine_first_changed_index": -1,
+            "refine_last_changed_index": -1,
+            "refine_changed_span": 0,
+            "refine_mean_abs_delta": 0.0,
+            "refine_max_abs_delta": 0.0,
         }
-
-    if prediction_source == "reference_teacher":
-        reflection_text = (
-            f"The extracted evidence strongly supports {model_name.upper()} for this window, so I keep the "
-            "selected forecast as the final answer without additional numerical adjustment."
-        )
-    else:
-        reflection_text = "The selected forecast is consistent with the evidence, so I keep it as the final answer."
+    first_idx = int(changed_indices[0])
+    last_idx = int(changed_indices[-1])
     return {
-        "trajectory_type": trajectory_type,
-        "refinement_supervision_type": "keep_selected_forecast",
-        "refinement_trigger_reason": "none",
-        "reflection_text": reflection_text,
+        "refine_changed_value_count": int(changed_indices.size),
+        "refine_first_changed_index": first_idx,
+        "refine_last_changed_index": last_idx,
+        "refine_changed_span": int(last_idx - first_idx + 1),
+        "refine_mean_abs_delta": float(np.mean(deltas[changed_indices])),
+        "refine_max_abs_delta": float(np.max(deltas[changed_indices])),
+    }
+
+
+def _is_meaningful_local_refine(
+    *,
+    base_values: list[float],
+    refined_values: list[float],
+    history_values: list[float],
+    base_mse: float,
+    base_mae: float,
+    refined_mse: float,
+    refined_mae: float,
+) -> tuple[bool, dict[str, float]]:
+    delta_summary = _summarize_refine_delta(base_values, refined_values)
+    changed_count = int(delta_summary["refine_changed_value_count"])
+    if changed_count <= 0:
+        return False, delta_summary
+
+    max_changed = min(24, max(4, len(base_values) // 4))
+    max_span = min(32, max(8, len(base_values) // 3))
+    local_enough = (
+        changed_count <= max_changed
+        and int(delta_summary["refine_changed_span"]) <= max_span
+    )
+
+    mse_gain = float(base_mse - refined_mse)
+    mae_gain = float(base_mae - refined_mae)
+    meaningful_gain = (
+        mse_gain > max(1e-6, 0.005 * max(base_mse, 1e-6))
+        or mae_gain > max(1e-6, 0.005 * max(base_mae, 1e-6))
+    )
+    return bool(local_enough and meaningful_gain), delta_summary
+
+
+def _build_reflection_text(model_name: str, turn3_target_type: str, refine_ops: list[str]) -> str:
+    model_tag = model_name.upper()
+    if turn3_target_type == "validated_keep":
+        return f"The {model_tag} base forecast is consistent with the diagnostics, so I keep it unchanged."
+    if "isolated_spike_smoothing" in refine_ops and "flat_tail_repair" in refine_ops:
+        return f"I keep {model_tag} as the base forecast, smooth an isolated spike, and repair the flat tail."
+    if "isolated_spike_smoothing" in refine_ops:
+        return f"I keep {model_tag} as the base forecast and smooth one isolated spike."
+    if "flat_tail_repair" in refine_ops:
+        return f"I keep {model_tag} as the base forecast and repair the flat tail."
+    if "local_level_adjust" in refine_ops:
+        return f"I keep {model_tag} as the base forecast and apply a small local level correction."
+    if "local_slope_adjust" in refine_ops:
+        return f"I keep {model_tag} as the base forecast and apply a small local slope correction."
+    if "amplitude_clip" in refine_ops:
+        return f"I keep {model_tag} as the base forecast and clip one implausible local amplitude jump."
+    return f"I keep {model_tag} as the base forecast and make a small evidence-based local refinement."
+
+
+def _build_turn3_target(
+    *,
+    sample: dict[str, Any],
+    history_values: list[float],
+    base_prediction_text: str,
+    forecast_horizon: int,
+    model_name: str,
+    selected_feature_tools: list[str],
+) -> dict[str, Any]:
+    base_values = _require_prediction_values(base_prediction_text, forecast_horizon, source_name=f"{model_name}_base")
+    reward_model = sample.get("reward_model", {}) if isinstance(sample.get("reward_model"), dict) else {}
+    ground_truth_values = _extract_prediction_values(str(reward_model.get("ground_truth", "") or ""))
+    if len(ground_truth_values) < forecast_horizon:
+        raise ValueError(
+            f"ground_truth length must be at least forecast_horizon={forecast_horizon}, got {len(ground_truth_values)}"
+        )
+    ground_truth_values = ground_truth_values[:forecast_horizon]
+    score_margin = float(sample.get("teacher_eval_score_margin", 0.0) or 0.0)
+    attempt_refine, trigger_reasons = _should_attempt_refinement(selected_feature_tools, score_margin)
+
+    base_mse, base_mae = _compute_error_metrics(base_values, ground_truth_values)
+    best_target_type = "validated_keep"
+    best_values = list(base_values)
+    best_ops: list[str] = []
+    best_mse = base_mse
+    best_mae = base_mae
+    best_delta_summary = _summarize_refine_delta(base_values, base_values)
+    best_trigger_reasons = ["evidence_consistent"]
+
+    if attempt_refine:
+        refined_values, refine_ops = _apply_local_refinements(base_values, history_values)
+    else:
+        refined_values, refine_ops = _apply_local_refinements(base_values, history_values)
+
+    if refine_ops:
+        refined_mse, refined_mae = _compute_error_metrics(refined_values, ground_truth_values)
+        is_meaningful_refine, delta_summary = _is_meaningful_local_refine(
+            base_values=base_values,
+            refined_values=refined_values,
+            history_values=history_values,
+            base_mse=base_mse,
+            base_mae=base_mae,
+            refined_mse=refined_mse,
+            refined_mae=refined_mae,
+        )
+        candidate_trigger_reasons = trigger_reasons if attempt_refine else ["forecast_shape_signal"]
+        if is_meaningful_refine and np.isfinite(refined_mse) and refined_mse < base_mse - 1e-8:
+            best_target_type = "local_refine"
+            best_values = refined_values
+            best_ops = refine_ops
+            best_mse = refined_mse
+            best_mae = refined_mae
+            best_delta_summary = delta_summary
+            best_trigger_reasons = candidate_trigger_reasons
+    trigger_reasons = best_trigger_reasons
+
+    refine_gain_mse = float(base_mse - best_mse)
+    refine_gain_mae = float(base_mae - best_mae)
+    refine_ops_signature = "none" if not best_ops else "->".join(best_ops)
+    trigger_reason = "none" if not trigger_reasons else "->".join(dict.fromkeys(trigger_reasons))
+
+    return {
+        "turn3_target_type": best_target_type,
+        "refine_ops": list(dict.fromkeys(best_ops)),
+        "refine_ops_signature": refine_ops_signature,
+        "refine_gain_mse": refine_gain_mse,
+        "refine_gain_mae": refine_gain_mae,
+        "turn3_trigger_reason": trigger_reason,
+        "base_teacher_prediction_text": _prediction_text_from_values(base_values),
+        "refined_prediction_text": _prediction_text_from_values(best_values),
+        "reflection_text": _build_reflection_text(model_name, best_target_type, best_ops),
+        **best_delta_summary,
     }
 
 
 def build_final_answer(
-    prediction_text: str,
-    forecast_horizon: int,
+    prediction_values: list[float],
     reflection_text: str,
 ) -> str:
-    value_only_prediction_text = _to_value_only_prediction_text(prediction_text, forecast_horizon=forecast_horizon)
-    return f"<think>{reflection_text}</think>\n<answer>\n{value_only_prediction_text}\n</answer>"
+    return f"<think>{reflection_text}</think>\n<answer>\n{_prediction_text_from_values(prediction_values)}\n</answer>"
 
 
-def build_sft_record(sample: dict[str, Any], prediction_mode: str = "preferred") -> dict[str, Any]:
+def _resolve_prediction_text(
+    *,
+    sample: dict[str, Any],
+    historical_data: str,
+    data_source: str,
+    target_column: str,
+    forecast_horizon: int,
+    model_name: str,
+    allow_cached_reference: bool,
+) -> tuple[str, str]:
+    if allow_cached_reference:
+        cached_teacher_prediction = str(sample.get("teacher_prediction_text", "") or "").strip()
+        if cached_teacher_prediction:
+            return cached_teacher_prediction, "reference_teacher_cached"
+    prediction_text = asyncio.run(
+        _predict_with_runtime_tools(
+            historical_data=historical_data,
+            data_source=data_source,
+            target_column=target_column,
+            forecast_horizon=forecast_horizon,
+            model_name=model_name,
+        )
+    )
+    return prediction_text, "reference_teacher_runtime"
+
+
+def build_sft_record(sample: dict[str, Any]) -> dict[str, Any]:
     raw_prompt = sample["raw_prompt"][0]["content"]
     reward_model = sample.get("reward_model", {}) if isinstance(sample.get("reward_model"), dict) else {}
-    ground_truth = str(reward_model.get("ground_truth", "") or "")
     task_spec = parse_task_prompt(raw_prompt, data_source=sample.get("data_source"))
     data_source = task_spec.data_source or str(sample.get("data_source") or "ETTh1")
     target_column = task_spec.target_column or "OT"
     lookback_window = int(task_spec.lookback_window or 96)
     forecast_horizon = int(task_spec.forecast_horizon or 96)
     historical_data = task_spec.historical_data or raw_prompt
-    _, values = parse_time_series_string(historical_data, target_column=target_column)
-    if not values:
+    _, history_values = parse_time_series_string(historical_data, target_column=target_column)
+    if not history_values:
         raise ValueError("No valid ETTh1 values found in raw_prompt")
 
-    feature_results = build_feature_tool_results(values)
+    feature_results = build_feature_tool_results(history_values)
     selected_feature_tools = [result.tool_name for result in feature_results]
     history_analysis = [result.tool_output for result in feature_results]
-    teacher_model = _normalize_teacher_model(sample.get("reference_teacher_model"))
-    cached_teacher_prediction = str(sample.get("teacher_prediction_text", "") or "").strip()
-    cached_prediction_source = str(sample.get("teacher_prediction_source", "reference_teacher") or "reference_teacher")
 
-    prediction_text = ""
-    prediction_source = "ground_truth"
-    if prediction_mode not in {"ground_truth", "reference_teacher", "preferred"}:
-        raise ValueError(f"Unsupported prediction_mode: {prediction_mode}")
-    if prediction_mode in {"reference_teacher", "preferred"} and cached_teacher_prediction:
-        prediction_text = cached_teacher_prediction
-        prediction_source = cached_prediction_source
-    if prediction_mode in {"reference_teacher", "preferred"}:
-        if not prediction_text:
-            try:
-                prediction_text, prediction_source = asyncio.run(
-                    _predict_with_runtime_tools(
-                        historical_data=historical_data,
-                        data_source=data_source,
-                        target_column=target_column,
-                        forecast_horizon=forecast_horizon,
-                        model_name=teacher_model,
-                        fallback_ground_truth=ground_truth,
-                    )
-                )
-            except Exception:
-                if prediction_mode == "reference_teacher":
-                    raise
-    if not prediction_text:
-        prediction_text = _ground_truth_prediction_text(ground_truth, forecast_horizon)
-        prediction_source = "ground_truth"
+    reference_teacher_model = _normalize_teacher_model(sample.get("reference_teacher_model"))
+    second_teacher_model = _normalize_teacher_model(sample.get("teacher_eval_second_best_model"))
 
-    refinement_supervision = _build_refinement_supervision(
-        sample,
-        selected_feature_tools,
-        model_name=teacher_model,
-        prediction_source=prediction_source,
+    try:
+        base_prediction_text, base_prediction_source = _resolve_prediction_text(
+            sample=sample,
+            historical_data=historical_data,
+            data_source=data_source,
+            target_column=target_column,
+            forecast_horizon=forecast_horizon,
+            model_name=reference_teacher_model,
+            allow_cached_reference=True,
+        )
+        selected_prediction_model = reference_teacher_model
+    except Exception:
+        if second_teacher_model == reference_teacher_model:
+            raise
+        base_prediction_text, base_prediction_source = _resolve_prediction_text(
+            sample=sample,
+            historical_data=historical_data,
+            data_source=data_source,
+            target_column=target_column,
+            forecast_horizon=forecast_horizon,
+            model_name=second_teacher_model,
+            allow_cached_reference=False,
+        )
+        selected_prediction_model = second_teacher_model
+        base_prediction_source = "second_teacher_runtime"
+
+    turn3_target = _build_turn3_target(
+        sample=sample,
+        history_values=history_values,
+        base_prediction_text=base_prediction_text,
+        forecast_horizon=forecast_horizon,
+        model_name=selected_prediction_model,
+        selected_feature_tools=selected_feature_tools,
     )
+    final_prediction_values = _require_prediction_values(
+        turn3_target["refined_prediction_text"],
+        forecast_horizon,
+        source_name="turn3_target",
+    )
+
     tool_prediction_text = compact_prediction_tool_output_from_string(
-        prediction_text,
-        model_name=teacher_model,
+        base_prediction_text,
+        model_name=selected_prediction_model,
     )
 
     system_prompt = build_timeseries_system_prompt(data_source=data_source, target_column=target_column)
@@ -386,7 +650,7 @@ def build_sft_record(sample: dict[str, Any], prediction_mode: str = "preferred")
         time_series_data=historical_data,
         history_analysis=history_analysis,
         prediction_results=tool_prediction_text,
-        prediction_model_used=teacher_model,
+        prediction_model_used=selected_prediction_model,
         conversation_has_tool_history=True,
     )
 
@@ -404,7 +668,7 @@ def build_sft_record(sample: dict[str, Any], prediction_mode: str = "preferred")
     ]
     prediction_tool_call = _make_tool_call(
         tool_name="predict_time_series",
-        arguments={"model_name": teacher_model},
+        arguments={"model_name": selected_prediction_model},
         call_id="call_predict_time_series",
     )
 
@@ -432,9 +696,8 @@ def build_sft_record(sample: dict[str, Any], prediction_mode: str = "preferred")
         {
             "role": "assistant",
             "content": build_final_answer(
-                prediction_text,
-                forecast_horizon=forecast_horizon,
-                reflection_text=refinement_supervision["reflection_text"],
+                final_prediction_values,
+                reflection_text=turn3_target["reflection_text"],
             ),
         },
     ]
@@ -448,15 +711,28 @@ def build_sft_record(sample: dict[str, Any], prediction_mode: str = "preferred")
         "target_column": target_column,
         "forecast_horizon": forecast_horizon,
         "lookback_window": lookback_window,
-        "reference_teacher_model": teacher_model,
-        "prediction_source": prediction_source,
+        "reference_teacher_model": reference_teacher_model,
+        "selected_prediction_model": selected_prediction_model,
+        "base_prediction_source": base_prediction_source,
         "selected_feature_tools": selected_feature_tools,
         "selected_feature_tool_count": len(selected_feature_tools),
         "selected_feature_tool_signature": _feature_tool_signature(selected_feature_tools),
-        "sft_trajectory_type": refinement_supervision["trajectory_type"],
-        "refinement_supervision_type": refinement_supervision["refinement_supervision_type"],
-        "refinement_trigger_reason": refinement_supervision["refinement_trigger_reason"],
+        "turn3_target_type": turn3_target["turn3_target_type"],
+        "turn3_trigger_reason": turn3_target["turn3_trigger_reason"],
+        "refine_ops": turn3_target["refine_ops"],
+        "refine_ops_signature": turn3_target["refine_ops_signature"],
+        "refine_gain_mse": turn3_target["refine_gain_mse"],
+        "refine_gain_mae": turn3_target["refine_gain_mae"],
+        "refine_changed_value_count": turn3_target["refine_changed_value_count"],
+        "refine_first_changed_index": turn3_target["refine_first_changed_index"],
+        "refine_last_changed_index": turn3_target["refine_last_changed_index"],
+        "refine_changed_span": turn3_target["refine_changed_span"],
+        "refine_mean_abs_delta": turn3_target["refine_mean_abs_delta"],
+        "refine_max_abs_delta": turn3_target["refine_max_abs_delta"],
+        "base_teacher_prediction_text": turn3_target["base_teacher_prediction_text"],
+        "refined_prediction_text": turn3_target["refined_prediction_text"],
         "teacher_eval_best_score": sample.get("teacher_eval_best_score"),
+        "teacher_eval_second_best_model": sample.get("teacher_eval_second_best_model"),
         "teacher_eval_second_best_score": sample.get("teacher_eval_second_best_score"),
         "teacher_eval_score_margin": sample.get("teacher_eval_score_margin"),
         "teacher_eval_scores": sample.get("teacher_eval_scores"),
@@ -467,7 +743,6 @@ def convert_jsonl_to_sft_parquet(
     *,
     input_path: str | Path,
     output_path: str | Path,
-    prediction_mode: str = "preferred",
     max_samples: int = -1,
 ) -> pd.DataFrame:
     input_path = Path(input_path)
@@ -481,7 +756,7 @@ def convert_jsonl_to_sft_parquet(
             if not line.strip():
                 continue
             sample = json.loads(line)
-            records.append(build_sft_record(sample, prediction_mode=prediction_mode))
+            records.append(build_sft_record(sample))
             if (line_idx + 1) % 500 == 0:
                 print(f"Processed {line_idx + 1} samples from {input_path}")
 
@@ -510,6 +785,45 @@ def _distribution_from_series(values: Iterable[Any]) -> dict[str, int]:
     return {str(k): int(v) for k, v in sorted(counter.items())}
 
 
+def _rebalance_train_turn3_targets(
+    dataframe: pd.DataFrame,
+    *,
+    min_local_refine_ratio: float,
+) -> pd.DataFrame:
+    if dataframe.empty or min_local_refine_ratio <= 0:
+        return dataframe
+    if "turn3_target_type" not in dataframe.columns:
+        return dataframe
+
+    local_refine_mask = dataframe["turn3_target_type"] == "local_refine"
+    validated_keep_mask = dataframe["turn3_target_type"] == "validated_keep"
+    local_refine_df = dataframe.loc[local_refine_mask].copy()
+    validated_keep_df = dataframe.loc[validated_keep_mask].copy()
+    other_df = dataframe.loc[~(local_refine_mask | validated_keep_mask)].copy()
+
+    local_count = len(local_refine_df)
+    keep_count = len(validated_keep_df)
+    if local_count <= 0 or keep_count <= 0:
+        return dataframe
+
+    max_keep_count = int(np.floor(local_count * (1.0 - min_local_refine_ratio) / min_local_refine_ratio))
+    max_keep_count = max(max_keep_count, 0)
+    if keep_count <= max_keep_count:
+        return dataframe
+
+    validated_keep_df = validated_keep_df.sort_values("sample_index").reset_index(drop=True)
+    if max_keep_count <= 0:
+        rebalanced_keep_df = validated_keep_df.iloc[0:0].copy()
+    else:
+        take_positions = np.linspace(0, keep_count - 1, num=max_keep_count, dtype=int)
+        rebalanced_keep_df = validated_keep_df.iloc[take_positions].copy()
+
+    balanced = pd.concat([local_refine_df, rebalanced_keep_df, other_df], ignore_index=True)
+    if "sample_index" in balanced.columns:
+        balanced = balanced.sort_values("sample_index").reset_index(drop=True)
+    return balanced
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build ETTh1 OT multi-turn SFT parquet from RL jsonl samples.")
     parser.add_argument(
@@ -532,15 +846,15 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_OUTPUT_DIR),
         help="Output directory for parquet files.",
     )
-    parser.add_argument(
-        "--prediction-mode",
-        choices=["ground_truth", "reference_teacher", "preferred"],
-        default="preferred",
-        help="How to populate Turn 2 prediction tool outputs.",
-    )
     parser.add_argument("--max-train-samples", type=int, default=-1, help="Limit train sample count for debugging.")
     parser.add_argument("--max-val-samples", type=int, default=-1, help="Limit val sample count for debugging.")
     parser.add_argument("--max-test-samples", type=int, default=-1, help="Limit test sample count for debugging.")
+    parser.add_argument(
+        "--train-min-local-refine-ratio",
+        type=float,
+        default=0.30,
+        help="Minimum desired local_refine ratio in train parquet. Set <=0 to disable train rebalancing.",
+    )
     return parser.parse_args()
 
 
@@ -549,16 +863,24 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_df = convert_jsonl_to_sft_parquet(
+    train_df_raw = convert_jsonl_to_sft_parquet(
         input_path=args.train_jsonl,
         output_path=output_dir / "train.parquet",
-        prediction_mode=args.prediction_mode,
         max_samples=args.max_train_samples,
     )
+    train_df = _rebalance_train_turn3_targets(
+        train_df_raw,
+        min_local_refine_ratio=float(args.train_min_local_refine_ratio),
+    )
+    if len(train_df) != len(train_df_raw) or not train_df.equals(train_df_raw):
+        train_df.to_parquet(output_dir / "train.parquet", index=False)
+        print(
+            f"Rebalanced train.parquet turn3_target_type distribution: "
+            f"{_distribution_from_series(train_df['turn3_target_type'])}"
+        )
     val_df = convert_jsonl_to_sft_parquet(
         input_path=args.val_jsonl,
         output_path=output_dir / "val.parquet",
-        prediction_mode=args.prediction_mode,
         max_samples=args.max_val_samples,
     )
 
@@ -569,48 +891,50 @@ def main() -> None:
         test_df = convert_jsonl_to_sft_parquet(
             input_path=test_path,
             output_path=output_dir / "test.parquet",
-            prediction_mode=args.prediction_mode,
             max_samples=args.max_test_samples,
         )
         test_count = len(test_df)
 
     metadata_kwargs = dict(
+        train_samples_before_balance=len(train_df_raw),
         train_samples=len(train_df),
         val_samples=len(val_df),
         test_samples=test_count,
-        prediction_mode=args.prediction_mode,
+        train_min_local_refine_ratio=float(args.train_min_local_refine_ratio),
         source_train_jsonl=str(Path(args.train_jsonl)),
         source_val_jsonl=str(Path(args.val_jsonl)),
         source_test_jsonl=str(test_path),
+        train_turn3_target_type_distribution_before_balance=_distribution_from_series(train_df_raw["turn3_target_type"]),
         train_reference_teacher_model_distribution=_distribution_from_series(train_df["reference_teacher_model"]),
-        train_sft_trajectory_type_distribution=_distribution_from_series(train_df["sft_trajectory_type"]),
-        train_refinement_supervision_type_distribution=_distribution_from_series(train_df["refinement_supervision_type"]),
-        train_refinement_trigger_reason_distribution=_distribution_from_series(train_df["refinement_trigger_reason"]),
+        train_selected_prediction_model_distribution=_distribution_from_series(train_df["selected_prediction_model"]),
+        train_turn3_target_type_distribution=_distribution_from_series(train_df["turn3_target_type"]),
+        train_turn3_trigger_reason_distribution=_distribution_from_series(train_df["turn3_trigger_reason"]),
+        train_refine_ops_signature_distribution=_distribution_from_series(train_df["refine_ops_signature"]),
         train_selected_feature_tool_signature_distribution=_distribution_from_series(
             train_df["selected_feature_tool_signature"]
         ),
-        train_prediction_source_distribution=_distribution_from_series(train_df["prediction_source"]),
+        train_base_prediction_source_distribution=_distribution_from_series(train_df["base_prediction_source"]),
         val_reference_teacher_model_distribution=_distribution_from_series(val_df["reference_teacher_model"]),
-        val_sft_trajectory_type_distribution=_distribution_from_series(val_df["sft_trajectory_type"]),
-        val_refinement_supervision_type_distribution=_distribution_from_series(val_df["refinement_supervision_type"]),
-        val_refinement_trigger_reason_distribution=_distribution_from_series(val_df["refinement_trigger_reason"]),
+        val_selected_prediction_model_distribution=_distribution_from_series(val_df["selected_prediction_model"]),
+        val_turn3_target_type_distribution=_distribution_from_series(val_df["turn3_target_type"]),
+        val_turn3_trigger_reason_distribution=_distribution_from_series(val_df["turn3_trigger_reason"]),
+        val_refine_ops_signature_distribution=_distribution_from_series(val_df["refine_ops_signature"]),
         val_selected_feature_tool_signature_distribution=_distribution_from_series(
             val_df["selected_feature_tool_signature"]
         ),
-        val_prediction_source_distribution=_distribution_from_series(val_df["prediction_source"]),
+        val_base_prediction_source_distribution=_distribution_from_series(val_df["base_prediction_source"]),
     )
     if test_df is not None and len(test_df) > 0:
         metadata_kwargs.update(
             test_reference_teacher_model_distribution=_distribution_from_series(test_df["reference_teacher_model"]),
-            test_sft_trajectory_type_distribution=_distribution_from_series(test_df["sft_trajectory_type"]),
-            test_refinement_supervision_type_distribution=_distribution_from_series(
-                test_df["refinement_supervision_type"]
-            ),
-            test_refinement_trigger_reason_distribution=_distribution_from_series(test_df["refinement_trigger_reason"]),
+            test_selected_prediction_model_distribution=_distribution_from_series(test_df["selected_prediction_model"]),
+            test_turn3_target_type_distribution=_distribution_from_series(test_df["turn3_target_type"]),
+            test_turn3_trigger_reason_distribution=_distribution_from_series(test_df["turn3_trigger_reason"]),
+            test_refine_ops_signature_distribution=_distribution_from_series(test_df["refine_ops_signature"]),
             test_selected_feature_tool_signature_distribution=_distribution_from_series(
                 test_df["selected_feature_tool_signature"]
             ),
-            test_prediction_source_distribution=_distribution_from_series(test_df["prediction_source"]),
+            test_base_prediction_source_distribution=_distribution_from_series(test_df["base_prediction_source"]),
         )
 
     _write_metadata(

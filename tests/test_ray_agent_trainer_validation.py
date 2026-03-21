@@ -110,7 +110,6 @@ class TestValidationRewardManager(unittest.TestCase):
             "strict_length_match": [True, False, False],
             "trainer_seq_score": [0.7, -1.0, -0.55],
             "selected_model": ["itransformer", "itransformer", "chronos2"],
-            "reward_main_scale": ["orig", "orig", "orig"],
             "generation_stop_reason": ["stop", "length", "stop"],
             "selected_forecast_orig_mse": [0.2, 0.8, 1.7],
             "selected_forecast_len_match": [True, False, True],

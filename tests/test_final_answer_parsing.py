@@ -34,7 +34,7 @@ class FinalAnswerParsingTest(unittest.TestCase):
 
     def test_rejects_truncated_answer_block(self) -> None:
         agent = self._make_agent()
-        text = f"<answer>\n{self._numeric_answer_lines(95)}\n</answer>"
+        text = f"<think>x</think><answer>\n{self._numeric_answer_lines(95)}\n</answer>"
         answer, penalty = agent._extract_final_answer(text)
         self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
@@ -45,7 +45,7 @@ class FinalAnswerParsingTest(unittest.TestCase):
         timestamped_lines = "\n".join(
             f"2026-03-20 {idx:02d}:00:00 {30.0 + idx / 1000:.4f}" for idx in range(24)
         )
-        text = f"<answer>\n{timestamped_lines}\n</answer>"
+        text = f"<think>x</think><answer>\n{timestamped_lines}\n</answer>"
         answer, penalty = agent._extract_final_answer(text)
         self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
@@ -57,11 +57,11 @@ class FinalAnswerParsingTest(unittest.TestCase):
         answer, penalty = agent._extract_final_answer(text)
         self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
-        self.assertEqual(agent.final_answer_reject_reason, "missing_answer_block")
+        self.assertEqual(agent.final_answer_reject_reason, "missing_think_block")
 
     def test_rejects_missing_close_tag(self) -> None:
         agent = self._make_agent()
-        text = f"<answer>\n{self._numeric_answer_lines(96)}"
+        text = f"<think>x</think><answer>\n{self._numeric_answer_lines(96)}"
         answer, penalty = agent._extract_final_answer(text)
         self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
@@ -72,7 +72,23 @@ class FinalAnswerParsingTest(unittest.TestCase):
         answer, penalty = agent._extract_final_answer("I think chronos2 is a good fit for this window.")
         self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
-        self.assertEqual(agent.final_answer_reject_reason, "missing_answer_block")
+        self.assertEqual(agent.final_answer_reject_reason, "missing_think_block")
+
+    def test_rejects_missing_think_block(self) -> None:
+        agent = self._make_agent()
+        text = f"<answer>\n{self._numeric_answer_lines(96)}\n</answer>"
+        answer, penalty = agent._extract_final_answer(text)
+        self.assertIsNone(answer)
+        self.assertEqual(penalty, 0.0)
+        self.assertEqual(agent.final_answer_reject_reason, "missing_think_block")
+
+    def test_rejects_extra_text_outside_tags(self) -> None:
+        agent = self._make_agent()
+        text = f"<think>x</think><answer>\n{self._numeric_answer_lines(96)}\n</answer>\nextra"
+        answer, penalty = agent._extract_final_answer(text)
+        self.assertIsNone(answer)
+        self.assertEqual(penalty, 0.0)
+        self.assertEqual(agent.final_answer_reject_reason, "extra_text_outside_tags")
 
     def test_final_turn_sampling_params_add_stop_and_cap_tokens(self) -> None:
         agent = self._make_agent()
@@ -80,6 +96,8 @@ class FinalAnswerParsingTest(unittest.TestCase):
         self.assertEqual(params["stop"], ["</answer>"])
         self.assertTrue(params["include_stop_str_in_output"])
         self.assertEqual(params["max_tokens"], 1024)
+        self.assertAlmostEqual(params["temperature"], 0.2, places=6)
+        self.assertAlmostEqual(params["top_p"], 0.9, places=6)
 
     def test_non_final_turn_sampling_params_are_unchanged(self) -> None:
         agent = self._make_agent()

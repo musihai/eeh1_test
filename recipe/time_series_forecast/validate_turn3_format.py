@@ -54,10 +54,18 @@ def extract_candidate_answer_text(record: dict[str, Any]) -> tuple[str, str]:
 def check_answer_format(text: str, expected_len: int = 96) -> tuple[bool, str, int]:
     if not text:
         return False, "empty_assistant_content", 0
+    if "<think>" not in text:
+        return False, "missing_think_open_tag", 0
+    if "</think>" not in text:
+        return False, "missing_think_close_tag", 0
     if "<answer>" not in text:
         return False, "missing_answer_open_tag", 0
     if "</answer>" not in text:
         return False, "missing_answer_close_tag", 0
+
+    protocol_match = re.fullmatch(r"\s*<think>.*?</think>\s*<answer>(.*?)</answer>\s*", text, re.DOTALL)
+    if not protocol_match:
+        return False, "extra_text_outside_tags", 0
 
     match = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL)
     if not match:

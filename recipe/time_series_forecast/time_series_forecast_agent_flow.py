@@ -624,6 +624,14 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         if self.prediction_results:
             params["stop"] = ["</answer>"]
             params["include_stop_str_in_output"] = True
+            if "temperature" in params:
+                params["temperature"] = min(float(params["temperature"]), 0.2)
+            else:
+                params["temperature"] = 0.2
+            if "top_p" in params:
+                params["top_p"] = min(float(params["top_p"]), 0.9)
+            else:
+                params["top_p"] = 0.9
             existing_max_tokens = params.get("max_tokens", params.get("max_new_tokens"))
             final_turn_max_tokens = self._final_answer_max_tokens()
             if existing_max_tokens is None:
@@ -705,21 +713,40 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             Tuple of (answer_text, format_penalty).
         """
         self.final_answer_reject_reason = None
-        match = re.search(r'<answer>(.*?)</answer>', response_text, re.DOTALL)
-        if match:
-            candidate = match.group(1).strip()
-            if self._looks_like_forecast_answer(candidate):
-                return candidate, 0.0
-            self.final_answer_reject_reason = self._infer_final_answer_reject_reason(candidate)
+        if "<think>" not in response_text and "</think>" not in response_text:
+            self.final_answer_reject_reason = "missing_think_block"
+            return None, 0.0
+        if "<think>" not in response_text:
+            self.final_answer_reject_reason = "missing_think_open_tag"
+            return None, 0.0
+        if "</think>" not in response_text:
+            self.final_answer_reject_reason = "missing_think_close_tag"
+            return None, 0.0
+
+        think_match = re.search(r"<think>(.*?)</think>", response_text, re.DOTALL)
+        if not think_match or not think_match.group(1).strip():
+            self.final_answer_reject_reason = "empty_think_block"
             return None, 0.0
 
         if "<answer>" in response_text and "</answer>" not in response_text:
             self.final_answer_reject_reason = "missing_answer_close_tag"
-        elif "</answer>" in response_text and "<answer>" not in response_text:
+            return None, 0.0
+        if "</answer>" in response_text and "<answer>" not in response_text:
             self.final_answer_reject_reason = "missing_answer_open_tag"
-        else:
+            return None, 0.0
+        if "<answer>" not in response_text and "</answer>" not in response_text:
             self.final_answer_reject_reason = "missing_answer_block"
+            return None, 0.0
 
+        protocol_match = re.fullmatch(r"\s*<think>.*?</think>\s*<answer>(.*?)</answer>\s*", response_text, re.DOTALL)
+        if not protocol_match:
+            self.final_answer_reject_reason = "extra_text_outside_tags"
+            return None, 0.0
+
+        candidate = protocol_match.group(1).strip()
+        if self._looks_like_forecast_answer(candidate):
+            return candidate, 0.0
+        self.final_answer_reject_reason = self._infer_final_answer_reject_reason(candidate)
         return None, 0.0
 
     async def _build_parse_failure_output(self, system_prompt: str, **kwargs) -> AgentFlowOutput:
@@ -780,7 +807,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             # Use the compute_score function from reward.py
             result = compute_score(
                 data_source="time_series",
-                solution_str=f"<answer>{final_answer}</answer>",
+                solution_str=f"<think>Validated final forecast.</think><answer>{final_answer}</answer>",
                 ground_truth=ground_truth
             )
             return float(result["score"] if isinstance(result, dict) else result)

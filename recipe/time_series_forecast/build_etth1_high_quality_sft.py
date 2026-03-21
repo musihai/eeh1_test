@@ -77,7 +77,7 @@ def evenly_spaced_records(records: Sequence[dict[str, Any]], count: int) -> list
 
 
 def prediction_solution(prediction_text: str) -> str:
-    return f"<answer>\n{prediction_text}\n</answer>"
+    return f"<think>Teacher forecast candidate.</think><answer>\n{prediction_text}\n</answer>"
 
 
 def quality_score(best_score: float, margin: float) -> float:
@@ -1202,7 +1202,6 @@ def main() -> None:
             convert_jsonl_to_sft_parquet(
                 input_path=curated_jsonl_path,
                 output_path=parquet_path,
-                prediction_mode="reference_teacher",
             )
             teacher_distribution: dict[str, int] = {}
             for record in curated_records:

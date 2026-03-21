@@ -42,7 +42,7 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertIn("### Analysis Summary", prompt)
         self.assertIn("### Prediction Tool Output", prompt)
         self.assertIn("Forecast Values:", prompt)
-        self.assertIn("initial forecast produced by the selected model", prompt)
+        self.assertIn("base forecast produced by the selected model", prompt)
         self.assertIn("Do NOT rewrite the forecast arbitrarily", prompt)
         self.assertNotIn("already present earlier in this conversation", prompt)
 
@@ -67,13 +67,13 @@ class CompactProtocolTests(unittest.TestCase):
             "2017-05-02 02:00:00 13.0010"
         )
         timestamped_solution = (
-            "<answer>\n"
+            "<think>x</think><answer>\n"
             "2017-05-02 00:00:00 12.3450\n"
             "2017-05-02 01:00:00 12.6780\n"
             "2017-05-02 02:00:00 13.0010\n"
             "</answer>"
         )
-        value_only_solution = "<answer>\n12.3450\n12.6780\n13.0010\n</answer>"
+        value_only_solution = "<think>x</think><answer>\n12.3450\n12.6780\n13.0010\n</answer>"
         timestamped_result = compute_score(
             data_source="time_series",
             solution_str=timestamped_solution,
@@ -98,7 +98,7 @@ class CompactProtocolTests(unittest.TestCase):
             "2017-05-02 02:00:00 30.0000"
         )
         solution = (
-            "<answer>\n"
+            "<think>x</think><answer>\n"
             "2017-05-02 00:00:00 10.0000\n"
             "2017-05-02 01:00:00 20.0000\n"
             "2017-05-02 02:00:00 30.0000\n"
@@ -111,8 +111,6 @@ class CompactProtocolTests(unittest.TestCase):
             0.7,
             places=6,
         )
-        self.assertEqual(result["reward_main_scale"], "norm")
-        self.assertFalse(result["strict_length_gate"])
         self.assertTrue(result["strict_length_match"])
         self.assertAlmostEqual(result["change_point_score"], 0.0, places=6)
         self.assertAlmostEqual(result["season_trend_score"], 0.0, places=6)
@@ -125,7 +123,7 @@ class CompactProtocolTests(unittest.TestCase):
             "2017-05-02 01:00:00 20.0000\n"
             "2017-05-02 02:00:00 30.0000"
         )
-        solution = "<answer>\n10.0000\n20.0000\n</answer>"
+        solution = "<think>x</think><answer>\n10.0000\n20.0000\n</answer>"
         result = compute_score(data_source="time_series", solution_str=solution, ground_truth=ground_truth)
         self.assertFalse(result["length_hard_fail"])
         self.assertFalse(result["strict_length_match"])
@@ -143,7 +141,7 @@ class CompactProtocolTests(unittest.TestCase):
             "2017-05-02 02:00:00 30.0000"
         )
         solution = (
-            "<answer>\n"
+            "<think>x</think><answer>\n"
             "2017-05-02 00:00:00 10.0000\n"
             "2017-05-02 01:00:00 20.0000\n"
             "2017-05-02 02:00:00 30.0000\n"

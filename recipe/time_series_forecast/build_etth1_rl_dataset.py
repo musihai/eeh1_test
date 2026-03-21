@@ -305,6 +305,17 @@ def write_jsonl(records: Iterable[dict], output_path: Path) -> int:
     return count
 
 
+def build_train_stage_slices(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    stage1 = [record for record in records if record.get("curriculum_stage") == "easy"]
+    stage12 = [record for record in records if record.get("curriculum_stage") in {"easy", "medium"}]
+    stage123 = list(records)
+    return {
+        "train_stage1": stage1,
+        "train_stage12": stage12,
+        "train_stage123": stage123,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rebuild ETTh1 RL jsonl datasets from ETTh1.csv.")
     parser.add_argument("--csv-path", default=str(DEFAULT_CSV_PATH), help="Path to ETTh1.csv.")
@@ -423,6 +434,17 @@ def main() -> None:
         print(
             f"[RL-DATA] split={split.name} rows={split.num_rows} samples={count} -> {output_path}"
         )
+
+        if split.name == "train":
+            staged_slices = build_train_stage_slices(records)
+            for stage_name, stage_records in staged_slices.items():
+                stage_output_path = output_dir / f"{stage_name}.jsonl"
+                stage_count = write_jsonl(stage_records, stage_output_path)
+                metadata[f"{stage_name}_samples"] = stage_count
+                metadata[f"{stage_name}_stage_distribution"] = dict(
+                    sorted(Counter(str(record.get("curriculum_stage", "unknown")) for record in stage_records).items())
+                )
+                print(f"[RL-DATA] {stage_name} samples={stage_count} -> {stage_output_path}")
 
     metadata_path = output_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

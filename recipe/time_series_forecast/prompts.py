@@ -75,11 +75,11 @@ After seeing feature results in "Analysis History", call `predict_time_series` w
 - 'itransformer': useful when the window shows regime changes or longer-range dependencies
 
 **Turn 3 - Final Output**:
-Use the selected model prediction as the initial forecast. Reflect on the diagnostic evidence, make only small evidence-based refinements when necessary, and output the final forecast.
+Use the selected model prediction as the base forecast. Reflect on the diagnostic evidence, keep it unchanged if it is already consistent, and make only small local evidence-based refinements when necessary before outputting the final forecast.
 
 ## Output Format (Turn 3 only)
 Your response MUST contain ONLY the two tags below, in this order, with no extra text before/between/after them.
-Your final forecast must be based on the selected model prediction shown in "Prediction Tool Output". Do not invent an unrelated forecast.
+Your final forecast must be based on the selected model prediction shown in "Prediction Tool Output". Do not invent an unrelated forecast or ignore the selected-model forecast.
 <think>[Reflect on the selected forecast and note whether a small refinement is needed]</think>
 <answer>
 12.3450
@@ -132,8 +132,8 @@ def get_runtime_turn_info(
     if not has_predictions:
         return 2, "Call predict_time_series with your chosen model (e.g., 'chronos2')."
     return 3, (
-        "Output your final answer in <think>...</think><answer>...</answer> format using the selected model prediction as the initial forecast. "
-        "If you refine it, keep the change small and evidence-based. "
+        "Output your final answer in <think>...</think><answer>...</answer> format using the selected model prediction as the base forecast. "
+        "Keep it unchanged if it is already consistent; if you refine it, keep the change small, local, and evidence-based. "
         "Do NOT output any text outside these tags. <answer> must contain exactly 96 lines, one numeric value per line, no timestamps. "
         "Stop immediately after the 96th value. Do not generate a 97th value. "
         "After the 96th value, immediately close with </answer>, and do not output any text after it. "
@@ -170,16 +170,17 @@ def build_runtime_user_prompt(
 
 **Instructions**:
 1. Do NOT call more tools.
-2. Treat "Prediction Tool Output" as the initial forecast produced by the selected model.
-3. Reflect briefly on whether this initial forecast is consistent with the compact analysis summary.
-4. If refinement is needed, keep it small, local, and evidence-based. Do NOT rewrite the forecast arbitrarily.
-5. Output the final forecast generated from that selected-model forecast.
-6. Output ONLY <think>...</think> and <answer>...</answer>. Do not include anything else.
-7. <answer> must contain EXACTLY {forecast_horizon} lines.
-8. Each line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
-9. Stop immediately after the {forecast_horizon}th value, and do NOT generate any extra value.
-10. After the {forecast_horizon}th value, immediately output </answer>, with no extra text after it.
-11. Keep <think> to ONE short sentence.
+2. Treat "Prediction Tool Output" as the base forecast produced by the selected model.
+3. Reflect briefly on whether this base forecast is consistent with the compact analysis summary.
+4. If the base forecast is already consistent, keep it unchanged. If refinement is needed, keep it small, local, and evidence-based.
+5. Do NOT rewrite the forecast arbitrarily or ignore the selected-model forecast.
+6. Output the final forecast generated from that selected-model forecast.
+7. Output ONLY <think>...</think> and <answer>...</answer>. Do not include anything else.
+8. <answer> must contain EXACTLY {forecast_horizon} lines.
+9. Each line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
+10. Stop immediately after the {forecast_horizon}th value, and do NOT generate any extra value.
+11. After the {forecast_horizon}th value, immediately output </answer>, with no extra text after it.
+12. Keep <think> to ONE short sentence.
 
 <think>[One short sentence reflecting whether the selected-model forecast should be kept or slightly refined]</think>
 
