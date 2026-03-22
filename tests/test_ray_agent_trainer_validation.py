@@ -126,6 +126,8 @@ class TestValidationRewardManager(unittest.TestCase):
             "refinement_degraded": [False, False, False],
             "analysis_coverage_ratio": [1.0, 0.4, 0.8],
             "feature_tool_count": [3, 1, 2],
+            "required_feature_tool_count": [3, 3, 2],
+            "missing_required_feature_tool_count": [0, 2, 0],
             "prediction_call_count": [1, 1, 1],
             "tool_call_count": [4, 0, 3],
             "history_analysis_count": [3, 0, 2],
@@ -135,6 +137,11 @@ class TestValidationRewardManager(unittest.TestCase):
             "feature_tool_signature": [
                 "extract_basic_statistics->extract_event_summary->extract_data_quality",
                 "extract_data_quality",
+                "extract_basic_statistics->extract_within_channel_dynamics",
+            ],
+            "required_feature_tool_signature": [
+                "extract_basic_statistics->extract_event_summary->extract_data_quality",
+                "extract_basic_statistics->extract_event_summary->extract_data_quality",
                 "extract_basic_statistics->extract_within_channel_dynamics",
             ],
             "tool_call_sequence": [
@@ -192,6 +199,8 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertAlmostEqual(agg_row["prediction_model_defaulted_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["analysis_coverage_ratio_mean"], (1.0 + 0.4 + 0.8) / 3.0, places=6)
             self.assertAlmostEqual(agg_row["feature_tool_count_mean"], 2.0, places=6)
+            self.assertAlmostEqual(agg_row["required_feature_tool_count_mean"], 8.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["missing_required_feature_tool_count_mean"], 2.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["tool_call_count_mean"], 7.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["history_analysis_count_mean"], 5.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["no_tool_call_ratio"], 1.0 / 3.0, places=6)
@@ -200,6 +209,13 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertEqual(agg_row["prediction_tool_error_count"], 1)
             self.assertEqual(agg_row["selected_model_distribution"], {"chronos2": 1, "itransformer": 2})
             self.assertEqual(agg_row["prediction_requested_model_distribution"], {"__missing__": 1, "chronos2": 1, "itransformer": 1})
+            self.assertEqual(
+                agg_row["required_feature_tool_signature_distribution"],
+                {
+                    "extract_basic_statistics->extract_event_summary->extract_data_quality": 2,
+                    "extract_basic_statistics->extract_within_channel_dynamics": 1,
+                },
+            )
             self.assertEqual(
                 agg_row["tool_call_sequence_distribution"],
                 {
@@ -231,6 +247,12 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertEqual(near_miss_row["refinement_first_changed_index"], 72)
             self.assertEqual(near_miss_row["tool_call_count"], 3)
             self.assertEqual(near_miss_row["history_analysis_count"], 2)
+            self.assertEqual(near_miss_row["required_feature_tool_count"], 2)
+            self.assertEqual(near_miss_row["missing_required_feature_tool_count"], 0)
+            self.assertEqual(
+                near_miss_row["required_feature_tool_signature"],
+                "extract_basic_statistics->extract_within_channel_dynamics",
+            )
             self.assertEqual(
                 near_miss_row["tool_call_sequence"],
                 "extract_basic_statistics->extract_within_channel_dynamics->predict_time_series",

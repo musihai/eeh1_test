@@ -6,14 +6,13 @@ from pathlib import Path
 
 import pandas as pd
 
-from recipe.time_series_forecast.build_etth1_sft_dataset import convert_jsonl_to_sft_parquet
-from recipe.time_series_forecast.prompts import TIMESERIES_TOOL_SCHEMAS
+from recipe.time_series_forecast.build_etth1_sft_dataset import _build_turn3_target, convert_jsonl_to_sft_parquet
 from recipe.time_series_forecast.utils import compact_prediction_tool_output_from_string
 
 
 class TestETTh1SFTDatasetBuilder(unittest.TestCase):
     def _load_base_sample(self) -> dict:
-        source_jsonl = Path("dataset/ett_rl_etth1_paper_same/train.jsonl")
+        source_jsonl = Path("dataset/ett_rl_etth1_paper_same2/train.jsonl")
         with source_jsonl.open("r", encoding="utf-8") as handle:
             sample = json.loads(next(handle))
 
@@ -78,9 +77,8 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             loaded = pd.read_parquet(output_path)
             self.assertEqual(len(loaded), 2)
             self.assertIn("messages", loaded.columns)
-            self.assertIn("tools", loaded.columns)
-            self.assertIn("enable_thinking", loaded.columns)
-            self.assertFalse(bool(loaded.iloc[0]["enable_thinking"]))
+            self.assertNotIn("tools", loaded.columns)
+            self.assertNotIn("enable_thinking", loaded.columns)
 
             messages = loaded.iloc[0]["messages"]
             roles = [message["role"] for message in messages]
@@ -105,7 +103,6 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             self.assertEqual(messages[prediction_assistant_index]["content"], "")
             self.assertIn("### Analysis Summary", messages[prediction_assistant_index - 1]["content"])
             self.assertIn("### Prediction Tool Output", messages[prediction_assistant_index + 2]["content"])
-            self.assertIn("<think>", messages[-1]["content"])
             self.assertIn("<answer>", messages[-1]["content"])
             self.assertIn(loaded.iloc[0]["turn3_target_type"], {"validated_keep", "local_refine"})
             self.assertIsInstance(list(loaded.iloc[0]["selected_feature_tools"]), list)
@@ -137,10 +134,6 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             self.assertAlmostEqual(float(loaded.iloc[0]["refine_gain_mse"]), 0.0, places=6)
             self.assertEqual(int(loaded.iloc[0]["refine_changed_value_count"]), 0)
             self.assertEqual(int(loaded.iloc[0]["refine_first_changed_index"]), -1)
-            tools = list(loaded.iloc[0]["tools"])
-            self.assertEqual(len(tools), len(TIMESERIES_TOOL_SCHEMAS))
-            self.assertEqual(tools[0]["function"]["name"], TIMESERIES_TOOL_SCHEMAS[0]["function"]["name"])
-            self.assertEqual(tools[-1]["function"]["name"], TIMESERIES_TOOL_SCHEMAS[-1]["function"]["name"])
 
     def test_convert_uses_cached_teacher_prediction_when_present(self):
         sample = self._load_base_sample()
@@ -169,8 +162,16 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                     model_name="chronos2",
                 ),
             )
-            self.assertIn("<think>", messages[-1]["content"])
-            self.assertIn("chronos2", messages[-1]["content"].lower())
+            self.assertEqual(
+                messages[-1]["content"],
+                "<answer>\n"
+                + "\n".join(
+                    line.split()[-1]
+                    for line in str(sample["teacher_prediction_text"]).splitlines()
+                    if line.strip()
+                )
+                + "\n</answer>",
+            )
             self.assertEqual(dataframe.iloc[0]["selected_prediction_model"], "chronos2")
 
     def test_convert_builds_local_refine_target_for_spike_teacher_prediction(self):
@@ -194,6 +195,24 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             self.assertGreater(int(dataframe.iloc[0]["refine_changed_value_count"]), 0)
             self.assertGreaterEqual(int(dataframe.iloc[0]["refine_first_changed_index"]), 0)
             self.assertGreater(float(dataframe.iloc[0]["refine_gain_mse"]), 0.0)
+
+    def test_build_turn3_target_does_not_refine_without_evidence(self):
+        sample = self._load_base_sample()
+        sample["teacher_eval_score_margin"] = 0.20
+        spike_prediction = self._make_spike_teacher_prediction(sample)
+
+        turn3_target = _build_turn3_target(
+            sample=sample,
+            history_values=[float(idx) for idx in range(128)],
+            base_prediction_text=spike_prediction,
+            forecast_horizon=96,
+            model_name="chronos2",
+            selected_feature_tools=["extract_basic_statistics"],
+        )
+
+        self.assertEqual(turn3_target["turn3_target_type"], "validated_keep")
+        self.assertEqual(turn3_target["refine_ops_signature"], "none")
+        self.assertEqual(int(turn3_target["refine_changed_value_count"]), 0)
 
 
 if __name__ == "__main__":

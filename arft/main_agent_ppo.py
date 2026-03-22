@@ -116,6 +116,36 @@ def main(config):
     run_ppo_agent(config)
 
 
+def _build_ray_init_kwargs(config):
+    """Build ray.init kwargs with stable training defaults.
+
+    Notes:
+    - The Ray dashboard is not required for local PPO training and can fail startup
+      due to localhost port conflicts, so default it off unless the user explicitly
+      enables it in config.
+    - TRANSFER_QUEUE_ENABLE must be injected before ray.init so workers inherit it.
+    """
+    default_runtime_env = get_ppo_ray_runtime_env()
+    raw_ray_init_kwargs = OmegaConf.to_container(config.ray_kwargs.get("ray_init", {}), resolve=True) or {}
+    raw_ray_init_kwargs = dict(raw_ray_init_kwargs)
+    runtime_env_kwargs = raw_ray_init_kwargs.get("runtime_env", {}) or {}
+    runtime_env = OmegaConf.to_container(
+        OmegaConf.merge(default_runtime_env, OmegaConf.create(runtime_env_kwargs)),
+        resolve=True,
+    ) or {}
+    runtime_env = dict(runtime_env)
+
+    runtime_env_vars = dict(runtime_env.get("env_vars", {}) or {})
+    if bool(config.transfer_queue.get("enable", False)):
+        runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
+    if runtime_env_vars:
+        runtime_env["env_vars"] = runtime_env_vars
+
+    raw_ray_init_kwargs["runtime_env"] = runtime_env
+    raw_ray_init_kwargs.setdefault("include_dashboard", False)
+    return OmegaConf.create(raw_ray_init_kwargs)
+
+
 # Define a function to run the PPO-like training process
 def run_ppo_agent(config) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
@@ -131,19 +161,9 @@ def run_ppo_agent(config) -> None:
         # Set environment variables in the runtime environment to control tokenizer parallelism,
         # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
         # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
-        default_runtime_env = get_ppo_ray_runtime_env()
-        ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
-        runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
-        runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
-        ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_kwargs = _build_ray_init_kwargs(config)
         print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
-
-    if config.transfer_queue.enable:
-            # Add runtime environment variables for transfer queue
-            runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
-            runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
-            runtime_env_kwargs["env_vars"] = runtime_env_vars
+        ray.init(**OmegaConf.to_container(ray_init_kwargs, resolve=True))
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete

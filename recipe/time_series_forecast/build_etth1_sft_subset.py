@@ -7,9 +7,14 @@ from typing import Any
 
 import pandas as pd
 
+from recipe.time_series_forecast.dataset_identity import (
+    DATASET_KIND_RUNTIME_SFT_PARQUET,
+    DATASET_KIND_RUNTIME_SFT_SUBSET,
+    validate_metadata_file,
+)
 
-DEFAULT_INPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2")
-DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2_subset")
+DEFAULT_INPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same3")
+DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same3_subset")
 
 
 def select_evenly_spaced_rows(dataframe: pd.DataFrame, count: int) -> pd.DataFrame:
@@ -54,6 +59,10 @@ def build_subset(
     val_samples: int,
     test_samples: int,
 ) -> dict[str, int]:
+    input_metadata, input_metadata_path = validate_metadata_file(
+        input_dir / "metadata.json",
+        expected_kind=DATASET_KIND_RUNTIME_SFT_PARQUET,
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     counts: dict[str, int] = {}
@@ -76,8 +85,12 @@ def build_subset(
 
     write_metadata(
         output_dir,
+        dataset_kind=DATASET_KIND_RUNTIME_SFT_SUBSET,
+        pipeline_stage="runtime_multiturn_sft_subset",
         selection_method="evenly_spaced_by_sample_index",
         source_dir=str(input_dir),
+        source_metadata_path=str(input_metadata_path),
+        source_pipeline_stage=str(input_metadata.get("pipeline_stage") or ""),
         train_samples=counts.get("train_samples", 0),
         val_samples=counts.get("val_samples", 0),
         test_samples=counts.get("test_samples", 0),

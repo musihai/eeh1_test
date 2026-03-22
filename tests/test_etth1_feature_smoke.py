@@ -14,6 +14,7 @@ from recipe.time_series_forecast.utils import (
     extract_event_summary,
     extract_forecast_residuals,
     extract_within_channel_dynamics,
+    format_predictions_to_string,
     parse_time_series_string,
     parse_time_series_to_dataframe,
 )
@@ -33,7 +34,7 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
             "Requirements:\n"
             "1) Extract feature evidence before selecting a forecasting model.\n"
             "2) Choose one model from the enabled experts and then predict.\n"
-            "3) Follow the required output protocol with <think> and <answer>.\n"
+            "3) Follow the required output protocol with <answer> only.\n"
             "Historical Data:\n"
             + "\n".join(lines)
         )
@@ -69,6 +70,9 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
         )
         self.assertEqual(len(df), 96)
         self.assertEqual(list(df.columns), ["id", "timestamp", "target"])
+        if protocol_kind == "value_only":
+            self.assertEqual(str(df.iloc[0]["timestamp"]), "2000-01-01 00:00:00")
+            self.assertEqual(str(df.iloc[1]["timestamp"]), "2000-01-01 01:00:00")
 
         feature_sets = [
             extract_basic_statistics(values),
@@ -87,7 +91,7 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
 
     def test_paper_aligned_value_only_protocol(self) -> None:
         self._run_dataset_case(
-            "dataset/ett_rl_etth1_paper_same/train.jsonl",
+            "dataset/ett_rl_etth1_paper_same2/train.jsonl",
             protocol_kind="value_only",
         )
 
@@ -104,6 +108,14 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
         self.assertEqual(patchtst_cfg.get("target"), "OT")
         self.assertEqual(itransformer_cfg.get("target"), "OT")
         self.assertEqual(TimeSeriesForecastAgentFlow.__name__, "TimeSeriesForecastAgentFlow")
+
+    def test_format_predictions_without_last_timestamp_uses_fixed_anchor(self) -> None:
+        pred_df = pd.DataFrame({"target_0.5": [1.25, 2.5]})
+        text = format_predictions_to_string(pred_df, last_timestamp=None)
+        self.assertEqual(
+            text,
+            "2000-01-01 01:00:00 1.2500\n2000-01-01 02:00:00 2.5000",
+        )
 
 
 if __name__ == "__main__":

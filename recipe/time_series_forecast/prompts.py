@@ -47,7 +47,7 @@ def build_timeseries_system_prompt(
     target_name = target_column or "OT"
     dataset_name = data_source or "ETTh1"
 
-    return f"""You are a time series forecasting agent. This is a MULTI-TURN interaction.
+    return f"""You are a time series forecasting agent.
 
 ## Dataset Description
 {dataset_description}
@@ -57,52 +57,12 @@ def build_timeseries_system_prompt(
 - Forecast target: {target_name}
 - Task type: single-variable forecasting
 
-## Workflow (MUST follow this order across turns)
-
-**Turn 1 - Feature Extraction ONLY**:
-Call one or more feature extraction tools. Do NOT call predict_time_series yet.
-- `extract_basic_statistics`: median, MAD, autocorrelation, spectral features, CUSUM, distribution shape
-- `extract_within_channel_dynamics`: changepoints, slopes, peaks, monotone runs
-- `extract_forecast_residuals`: simple autoregressive residual diagnostics
-- `extract_data_quality`: quantization, saturation, constant stretches, dropout
-- `extract_event_summary`: rise/fall/flat/oscillation segment summary
-
-**Turn 2 - Prediction**:
-After seeing feature results in "Analysis History", call `predict_time_series` with the chosen model:
-- 'patchtst': useful when the window is smooth and shows strong local periodicity
-- 'arima': useful when trend/seasonality is stable and mostly linear
-- 'chronos2': useful fallback for irregular or noisy windows
-- 'itransformer': useful when the window shows regime changes or longer-range dependencies
-
-**Turn 3 - Final Output**:
-Use the selected model prediction as the base forecast. Reflect on the diagnostic evidence, keep it unchanged if it is already consistent, and make only small local evidence-based refinements when necessary before outputting the final forecast.
-
-## Output Format (Turn 3 only)
-Your response MUST contain ONLY the two tags below, in this order, with no extra text before/between/after them.
-Your final forecast must be based on the selected model prediction shown in "Prediction Tool Output". Do not invent an unrelated forecast or ignore the selected-model forecast.
-<think>[Reflect on the selected forecast and note whether a small refinement is needed]</think>
-<answer>
-12.3450
-...
-</answer>
-
-STRICT OUTPUT CONSTRAINTS (Turn 3):
-- <answer> must contain EXACTLY 96 lines.
-- Each line must be a single numeric value (float), no timestamp.
-- One value per line; no table, no bullets, no prose.
-- Stop immediately after the 96th value.
-- Do NOT generate a 97th value.
-- After the 96th value, immediately output </answer>.
-- Do not omit closing </answer>.
-- Do not output any text after </answer>.
-- Do not output markdown/code fences.
-- Keep <think> to ONE short sentence.
-
 ## CRITICAL RULES
-- Turn 1: Feature extraction ONLY. Do NOT call predict_time_series.
-- Turn 2: Call predict_time_series ONLY after features are extracted.
-- Turn 3: Output answer ONLY after predictions are available.
-- Do NOT output anything outside <think> and <answer>. Missing <answer> tags is incorrect.
+- Follow the CURRENT user turn instructions only.
+- Use tool calls only when tool schemas are available in the current turn.
+- If no tool schema is available, NEVER emit `<tool_call>`.
+- When the user asks for the final forecast, output ONLY the required `<answer>...</answer>` block.
+- Never add markdown, bullets, or explanatory prose outside the requested output format.
 """
 
 
@@ -123,21 +83,29 @@ def truncate_time_series_data(data: str, head: int = 5, tail: int = 5) -> str:
 def get_runtime_turn_info(
     history_analysis: Sequence[str] | None,
     prediction_results: Optional[str],
+    forecast_horizon: int = 96,
+    required_feature_tools: Sequence[str] | None = None,
+    completed_feature_tools: Sequence[str] | None = None,
 ) -> tuple[int, str]:
-    has_features = bool(history_analysis)
     has_predictions = bool(prediction_results)
+    required = [str(name) for name in (required_feature_tools or []) if str(name).strip()]
+    completed = {str(name) for name in (completed_feature_tools or []) if str(name).strip()}
+    missing = [name for name in required if name not in completed]
 
-    if not has_features:
-        return 1, "Call feature extraction tools (e.g., extract_basic_statistics). Do NOT call predict_time_series yet."
+    if not has_predictions and missing:
+        if len(missing) == 1:
+            return 1, f"Call the remaining feature extraction tool `{missing[0]}`. Do NOT call predict_time_series yet."
+        missing_text = ", ".join(f"`{name}`" for name in missing)
+        return 1, f"Call the remaining feature extraction tools in parallel when possible: {missing_text}. Do NOT call predict_time_series yet."
     if not has_predictions:
         return 2, "Call predict_time_series with your chosen model (e.g., 'chronos2')."
     return 3, (
-        "Output your final answer in <think>...</think><answer>...</answer> format using the selected model prediction as the base forecast. "
+        "Output your final answer in <answer>...</answer> format using the selected model prediction as the base forecast. "
         "Keep it unchanged if it is already consistent; if you refine it, keep the change small, local, and evidence-based. "
-        "Do NOT output any text outside these tags. <answer> must contain exactly 96 lines, one numeric value per line, no timestamps. "
-        "Stop immediately after the 96th value. Do not generate a 97th value. "
-        "After the 96th value, immediately close with </answer>, and do not output any text after it. "
-        "Keep <think> to one short sentence."
+        f"Do NOT output any text outside <answer>. <answer> must contain exactly {forecast_horizon} lines, one numeric value per line, no timestamps. "
+        f"Stop immediately after the {forecast_horizon}th value. Do not generate any extra value. "
+        f"After the {forecast_horizon}th value, immediately close with </answer>, and do not output any text after it. "
+        "Do not emit <think>."
     )
 
 
@@ -151,11 +119,22 @@ def build_runtime_user_prompt(
     history_analysis: Sequence[str] | None = None,
     prediction_results: Optional[str] = None,
     prediction_model_used: Optional[str] = None,
-    conversation_has_tool_history: bool = False,
+    required_feature_tools: Sequence[str] | None = None,
+    completed_feature_tools: Sequence[str] | None = None,
 ) -> str:
     history_records = list(history_analysis or [])
+    required_tools = [str(name) for name in (required_feature_tools or []) if str(name).strip()]
+    completed_tools = [str(name) for name in (completed_feature_tools or []) if str(name).strip()]
+    completed_tool_set = set(completed_tools)
+    missing_tools = [name for name in required_tools if name not in completed_tool_set]
     history_text = "\n".join(history_records) if history_records else "No previous analysis performed."
-    turn_num, action = get_runtime_turn_info(history_records, prediction_results)
+    turn_num, action = get_runtime_turn_info(
+        history_records,
+        prediction_results,
+        forecast_horizon=forecast_horizon,
+        required_feature_tools=required_tools,
+        completed_feature_tools=completed_tools,
+    )
 
     if prediction_results:
         model_line = f"### Selected Forecast Model: {prediction_model_used}\n" if prediction_model_used else ""
@@ -170,23 +149,48 @@ def build_runtime_user_prompt(
 
 **Instructions**:
 1. Do NOT call more tools.
-2. Treat "Prediction Tool Output" as the base forecast produced by the selected model.
-3. Reflect briefly on whether this base forecast is consistent with the compact analysis summary.
+2. No tool schema is available in this turn. Any <tool_call> output is invalid.
+3. Treat "Prediction Tool Output" as the base forecast produced by the selected model.
 4. If the base forecast is already consistent, keep it unchanged. If refinement is needed, keep it small, local, and evidence-based.
 5. Do NOT rewrite the forecast arbitrarily or ignore the selected-model forecast.
-6. Output the final forecast generated from that selected-model forecast.
-7. Output ONLY <think>...</think> and <answer>...</answer>. Do not include anything else.
-8. <answer> must contain EXACTLY {forecast_horizon} lines.
-9. Each line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
-10. Stop immediately after the {forecast_horizon}th value, and do NOT generate any extra value.
-11. After the {forecast_horizon}th value, immediately output </answer>, with no extra text after it.
-12. Keep <think> to ONE short sentence.
-
-<think>[One short sentence reflecting whether the selected-model forecast should be kept or slightly refined]</think>
+6. Output ONLY <answer>...</answer>. Do not include anything else.
+7. <answer> must contain EXACTLY {forecast_horizon} lines.
+8. Each line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
+9. Stop immediately after the {forecast_horizon}th value, and do NOT generate any extra value.
+10. After the {forecast_horizon}th value, immediately output </answer>, with no extra text after it.
 
 <answer>
-[Final prediction after reflection and refinement]
+[Final prediction after optional small refinement]
 </answer>"""
+
+    if missing_tools:
+        required_text = ", ".join(required_tools) if required_tools else "extract_basic_statistics"
+        completed_text = ", ".join(completed_tools) if completed_tools else "none"
+        missing_text = ", ".join(missing_tools)
+        return f"""**[Turn {turn_num}] Action: {action}**
+### Lookback Window: {lookback_window} rows
+### Forecast Horizon: {forecast_horizon} rows
+### Historical Data
+{time_series_data}
+
+### Analysis History
+{history_text}
+
+### Required Diagnostic Tools
+{required_text}
+
+### Completed Diagnostic Tools
+{completed_text}
+
+### Remaining Diagnostic Tools
+{missing_text}
+
+**Instructions**:
+- Stay in Turn 1 until ALL required diagnostic tools have been called.
+- Call the remaining diagnostic tools in this turn.
+- If multiple required tools remain, emit multiple tool calls in the same assistant turn.
+- Do NOT call predict_time_series until every required diagnostic tool above has been executed.
+"""
 
     if history_records:
         return f"""**[Turn {turn_num}] Action: {action}**
@@ -196,8 +200,16 @@ def build_runtime_user_prompt(
 ### Analysis Summary
 {history_text}
 
+### Completed Diagnostic Tools
+{", ".join(completed_tools) if completed_tools else "none"}
+
 **Instructions**:
 - Do NOT call feature extraction tools again.
+- Choose the model from the completed diagnostics, not from a fixed prior.
+- `patchtst`: smooth windows with strong local periodicity.
+- `arima`: stable linear trend and seasonality.
+- `chronos2`: irregular or noisy windows as a robust fallback.
+- `itransformer`: regime changes or longer-range dependencies.
 - Call predict_time_series exactly once with your chosen model_name.
 """
 
@@ -215,8 +227,8 @@ def build_runtime_user_prompt(
 {prediction_text}
 
 **Check your current state and act accordingly:**
-- If "Analysis History" is empty -> Call feature extraction tools. Do NOT call predict_time_series yet.
-- If "Analysis History" has features but "Model Predictions" is empty -> Call predict_time_series with model_name.
+- If any required diagnostic tools are still missing -> Call the remaining feature extraction tools. Do NOT call predict_time_series yet.
+- Only after all required diagnostic tools are completed and "Model Predictions" is empty -> Call predict_time_series with model_name.
 """
 
 # OpenAI-compatible tool schemas for TimeSeriesForecast actions.
@@ -225,8 +237,8 @@ PREDICT_TIMESERIES_TOOL_SCHEMA = {
     "function": {
         "name": "predict_time_series",
         "description": (
-            "PREREQUISITE: You must have called feature extraction tools first (check 'Analysis History' is not empty). "
-            "Do NOT call this on Turn 1 - extract features first! "
+            "PREREQUISITE: You must have completed all required feature extraction tools before calling this tool. "
+            "Do NOT call this until the runtime user message indicates the diagnostic stage is complete. "
             "Models: 'patchtst' (smooth windows with local periodicity), "
             "'arima' (stable trend/seasonality), 'chronos2' (irregular or noisy windows), "
             "'itransformer' (regime changes or longer-range dependencies). "

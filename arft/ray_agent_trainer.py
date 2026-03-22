@@ -43,23 +43,19 @@ from tqdm import tqdm
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
-from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
+from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from arft.metric_utils import (
-    compute_data_metrics,
     compute_throughout_metrics,
-    compute_timing_metrics,
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import extract_reward
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.debug import marked_timer
-from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
@@ -441,6 +437,16 @@ class RayAgentTrainer(RayPPOTrainer):
             n,
             default=float("nan"),
         )
+        required_feature_tool_count = self._to_float_list(
+            reward_extra_infos_dict.get("required_feature_tool_count"),
+            n,
+            default=float("nan"),
+        )
+        missing_required_feature_tool_count = self._to_float_list(
+            reward_extra_infos_dict.get("missing_required_feature_tool_count"),
+            n,
+            default=float("nan"),
+        )
         prediction_call_count = self._to_float_list(
             reward_extra_infos_dict.get("prediction_call_count"),
             n,
@@ -471,6 +477,11 @@ class RayAgentTrainer(RayPPOTrainer):
         )
         feature_tool_signature = self._to_str_list(
             reward_extra_infos_dict.get("feature_tool_signature"),
+            n,
+            default="none",
+        )
+        required_feature_tool_signature = self._to_str_list(
+            reward_extra_infos_dict.get("required_feature_tool_signature"),
             n,
             default="none",
         )
@@ -556,6 +567,9 @@ class RayAgentTrainer(RayPPOTrainer):
         generation_stop_reason_counter = Counter(reason for reason in generation_stop_reason if reason)
         selected_model_counter = Counter(model for model in selected_model if model)
         feature_tool_signature_counter = Counter(signature for signature in feature_tool_signature if signature)
+        required_feature_tool_signature_counter = Counter(
+            signature for signature in required_feature_tool_signature if signature
+        )
         tool_call_sequence_counter = Counter((signature if signature else "none") for signature in tool_call_sequence)
         analysis_state_signature_counter = Counter(signature for signature in analysis_state_signature if signature)
         prediction_requested_model_counter = Counter(model for model in prediction_requested_model if model)
@@ -592,6 +606,14 @@ class RayAgentTrainer(RayPPOTrainer):
         ]
         feature_tool_count_values = [
             float(v) for v in feature_tool_count if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        required_feature_tool_count_values = [
+            float(v) for v in required_feature_tool_count if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        missing_required_feature_tool_count_values = [
+            float(v)
+            for v in missing_required_feature_tool_count
+            if isinstance(v, (int, float)) and np.isfinite(v)
         ]
         prediction_call_count_values = [
             float(v) for v in prediction_call_count if isinstance(v, (int, float)) and np.isfinite(v)
@@ -690,6 +712,12 @@ class RayAgentTrainer(RayPPOTrainer):
             "feature_tool_count_mean": float(np.mean(feature_tool_count_values))
             if feature_tool_count_values
             else float("nan"),
+            "required_feature_tool_count_mean": float(np.mean(required_feature_tool_count_values))
+            if required_feature_tool_count_values
+            else float("nan"),
+            "missing_required_feature_tool_count_mean": float(np.mean(missing_required_feature_tool_count_values))
+            if missing_required_feature_tool_count_values
+            else float("nan"),
             "prediction_call_count_mean": float(np.mean(prediction_call_count_values))
             if prediction_call_count_values
             else float("nan"),
@@ -726,6 +754,9 @@ class RayAgentTrainer(RayPPOTrainer):
             },
             "feature_tool_signature_distribution": {
                 str(k): int(v) for k, v in sorted(feature_tool_signature_counter.items())
+            },
+            "required_feature_tool_signature_distribution": {
+                str(k): int(v) for k, v in sorted(required_feature_tool_signature_counter.items())
             },
             "tool_call_sequence_distribution": {
                 str(k): int(v) for k, v in sorted(tool_call_sequence_counter.items())
@@ -815,6 +846,12 @@ class RayAgentTrainer(RayPPOTrainer):
                 if np.isfinite(analysis_coverage_ratio[i])
                 else float("nan"),
                 "feature_tool_count": int(feature_tool_count[i]) if np.isfinite(feature_tool_count[i]) else -1,
+                "required_feature_tool_count": int(required_feature_tool_count[i])
+                if np.isfinite(required_feature_tool_count[i])
+                else -1,
+                "missing_required_feature_tool_count": int(missing_required_feature_tool_count[i])
+                if np.isfinite(missing_required_feature_tool_count[i])
+                else -1,
                 "prediction_call_count": int(prediction_call_count[i]) if np.isfinite(prediction_call_count[i]) else -1,
                 "tool_call_count": int(tool_call_count[i]) if np.isfinite(tool_call_count[i]) else -1,
                 "history_analysis_count": int(history_analysis_count[i])
@@ -826,6 +863,9 @@ class RayAgentTrainer(RayPPOTrainer):
                 "prediction_requested_model": prediction_requested_model[i] if prediction_requested_model[i] else "",
                 "prediction_model_defaulted": bool(prediction_model_defaulted[i]),
                 "feature_tool_signature": feature_tool_signature[i] if feature_tool_signature[i] else "",
+                "required_feature_tool_signature": required_feature_tool_signature[i]
+                if required_feature_tool_signature[i]
+                else "",
                 "tool_call_sequence": tool_call_sequence[i] if tool_call_sequence[i] else "none",
                 "analysis_state_signature": analysis_state_signature[i] if analysis_state_signature[i] else "",
                 "workflow_status": workflow_status[i] if workflow_status[i] else "",

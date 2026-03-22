@@ -11,11 +11,12 @@ from typing import Any, Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from recipe.time_series_forecast.dataset_identity import DATASET_KIND_RL_JSONL
 from recipe.time_series_forecast.utils import extract_data_quality
 
 
 DEFAULT_CSV_PATH = Path("dataset/ETT-small/ETTh1.csv")
-DEFAULT_OUTPUT_DIR = Path("dataset/ett_rl_etth1_paper_same")
+DEFAULT_OUTPUT_DIR = Path("dataset/ett_rl_etth1_paper_same2")
 
 # These row counts reproduce the historical split sizes that the rest of the
 # repo was built around:
@@ -54,7 +55,7 @@ def build_prompt(
         "Requirements:\n"
         "1) Extract feature evidence before selecting a forecasting model.\n"
         "2) Choose one model from the enabled experts and then predict.\n"
-        "3) In Turn 3, refine the selected model forecast if needed and follow the required output protocol with <think> and <answer>.\n"
+        "3) In Turn 3, refine the selected model forecast if needed and follow the required output protocol with <answer>.\n"
         "Historical Data:\n"
         f"{value_lines}"
     )
@@ -373,6 +374,8 @@ def main() -> None:
     }
 
     metadata: dict[str, object] = {
+        "dataset_kind": DATASET_KIND_RL_JSONL,
+        "pipeline_stage": "curriculum_rl" if any(teacher_metadata_paths.values()) else "base_rl",
         "source_csv": str(csv_path),
         "target_column": args.target_column,
         "lookback_window": args.lookback_window,

@@ -51,8 +51,30 @@ RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
 source "$RESOLVED_PROFILE_PATH"
 
 CONFIG_PATH="${CONFIG_PATH:-${RL_CONFIG_PATH:-$PROJECT_DIR/recipe/time_series_forecast/base.yaml}}"
-TRAIN_FILES="${TRAIN_FILES:-${RL_TRAIN_FILES:-$PROJECT_DIR/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train_stage123.jsonl}}"
-VAL_FILES="${VAL_FILES:-${RL_VAL_FILES:-$PROJECT_DIR/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/val.jsonl}}"
+resolve_consistent_env_value() {
+    local label="$1"
+    shift
+    local resolved=""
+    local env_name
+    local candidate
+    for env_name in "$@"; do
+        candidate="${!env_name:-}"
+        if [ -z "$candidate" ]; then
+            continue
+        fi
+        if [ -n "$resolved" ] && [ "$candidate" != "$resolved" ]; then
+            echo "Conflicting ${label} values:" >&2
+            printf '  %s=%s\n' "$env_name" "$candidate" >&2
+            printf '  resolved=%s\n' "$resolved" >&2
+            exit 1
+        fi
+        resolved="$candidate"
+    done
+    printf '%s\n' "$resolved"
+}
+
+TRAIN_FILES="$(resolve_consistent_env_value 'RL train jsonl' TRAIN_FILES RL_TRAIN_FILES)"
+VAL_FILES="$(resolve_consistent_env_value 'RL val jsonl' VAL_FILES RL_VAL_FILES)"
 REWARD_FN_PATH="${REWARD_FN_PATH:-${RL_REWARD_FN_PATH:-$PROJECT_DIR/recipe/time_series_forecast/reward.py}}"
 REWARD_FN_NAME="${REWARD_FN_NAME:-${RL_REWARD_FN_NAME:-compute_score}}"
 MODEL_PATH="${MODEL_PATH:-}"
@@ -60,6 +82,39 @@ if [ -z "$MODEL_PATH" ]; then
     echo "MODEL_PATH is required. Export MODEL_PATH to your base chat model checkpoint."
     exit 1
 fi
+if [ -z "$TRAIN_FILES" ] || [ -z "$VAL_FILES" ]; then
+    echo "RL dataset paths are required." >&2
+    echo "Set both TRAIN_FILES and VAL_FILES, or export RL_TRAIN_FILES and RL_VAL_FILES explicitly." >&2
+    exit 1
+fi
+if [ ! -f "$TRAIN_FILES" ]; then
+    echo "RL train jsonl not found: $TRAIN_FILES" >&2
+    exit 1
+fi
+if [ ! -f "$VAL_FILES" ]; then
+    echo "RL val jsonl not found: $VAL_FILES" >&2
+    exit 1
+fi
+TRAIN_DIR="$(cd "$(dirname "$TRAIN_FILES")" && pwd)"
+VAL_DIR="$(cd "$(dirname "$VAL_FILES")" && pwd)"
+if [ "$TRAIN_DIR" != "$VAL_DIR" ]; then
+    echo "RL train/val jsonl must come from the same dataset directory." >&2
+    echo "train dir: $TRAIN_DIR" >&2
+    echo "val dir:   $VAL_DIR" >&2
+    exit 1
+fi
+RL_METADATA_PATH="$TRAIN_DIR/metadata.json"
+python3 - "$RL_METADATA_PATH" <<'PY'
+import sys
+from recipe.time_series_forecast.dataset_identity import DATASET_KIND_RL_JSONL, validate_metadata_file
+
+metadata_path = sys.argv[1]
+payload, _ = validate_metadata_file(metadata_path, expected_kind=DATASET_KIND_RL_JSONL)
+print(
+    f"[RL DATASET] kind={payload.get('dataset_kind')} stage={payload.get('pipeline_stage', '')} "
+    f"metadata={metadata_path}"
+)
+PY
 
 PROJECT_NAME="${PROJECT_NAME:-${RL_PROJECT_NAME:-TimeSeriesForecast}}"
 EXP_NAME="${EXP_NAME:-${RL_EXP_NAME:-etth1_ot_qwen3_1_7b}}"

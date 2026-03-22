@@ -54,6 +54,9 @@ def append_turn3_generation_debug(
     raw_mae: float,
     length_hard_fail: bool,
     strict_length_match: bool,
+    format_parse_mode: str,
+    raw_protocol_reject_reason: str,
+    was_recovered: bool,
     format_failure_reason: str,
     has_answer_tag: bool,
     has_answer_open: bool,
@@ -78,7 +81,7 @@ def append_turn3_generation_debug(
         if pred_len > 0
         else float("nan")
     )
-    was_clipped = bool(format_failure_reason == "missing_answer_close_tag")
+    was_clipped = bool(raw_protocol_reject_reason == "missing_answer_close_tag")
     under_generation = bool(gt_len > 0 and pred_len < gt_len)
     over_generation = bool(gt_len > 0 and pred_len > gt_len)
     exact_generation = bool(gt_len > 0 and pred_len == gt_len)
@@ -106,6 +109,9 @@ def append_turn3_generation_debug(
         "over_generation": over_generation,
         "exact_generation": exact_generation,
         "format_score": float(format_score),
+        "format_parse_mode": format_parse_mode,
+        "raw_protocol_reject_reason": raw_protocol_reject_reason,
+        "was_recovered": bool(was_recovered),
         "length_score": float(length_score),
         "length_penalty": float(length_penalty),
         "mse_score": float(mse_score),
@@ -233,6 +239,182 @@ def extract_answer(text: str) -> str:
     """Extract content within <answer> tags."""
     match = re.search(r'<answer>(.*?)</answer>', text, re.DOTALL)
     return match.group(1).strip() if match else text
+
+
+def normalized_nonempty_lines(text: str) -> List[str]:
+    return [line.strip() for line in str(text).splitlines() if line.strip()]
+
+
+def extract_forecast_block(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    cleaned = (
+        str(text)
+        .replace("<|im_end|>", "\n")
+        .replace("<answer>", "\n")
+        .replace("</answer>", "\n")
+        .strip()
+    )
+    lines = cleaned.splitlines()
+    collected: List[str] = []
+    started = False
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        is_timestamp_value = re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+-?\d+\.?\d*$", line) is not None
+        is_numeric_value = re.match(r"^-?\d+\.?\d*$", line) is not None
+        if not started:
+            if is_timestamp_value or is_numeric_value:
+                started = True
+                collected.append(line)
+            continue
+
+        if is_timestamp_value or is_numeric_value:
+            collected.append(line)
+            continue
+
+        break
+
+    if not collected:
+        return None
+    return "\n".join(collected)
+
+
+def canonicalize_forecast_values(values: List[float], expected_len: int) -> str:
+    return "\n".join(f"{float(value):.4f}" for value in values[:expected_len])
+
+
+def looks_like_forecast_answer(answer_text: Optional[str], expected_len: int) -> bool:
+    if not answer_text:
+        return False
+    lines = normalized_nonempty_lines(answer_text)
+    values = extract_values_from_time_series_string(answer_text)
+    if len(lines) != expected_len or len(values) != expected_len:
+        return False
+    for line in lines:
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", line) is None:
+            return False
+    return True
+
+
+def infer_answer_shape_failure(answer_text: str, expected_len: int) -> str:
+    lines = normalized_nonempty_lines(answer_text)
+    values = extract_values_from_time_series_string(answer_text)
+    if not lines:
+        return "empty_answer_block"
+    if len(lines) != expected_len:
+        return f"invalid_answer_shape:lines={len(lines)},expected={expected_len}"
+    if len(values) != expected_len:
+        return f"invalid_answer_shape:values={len(values)},expected={expected_len}"
+    for line in lines:
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", line) is None:
+            return "invalid_answer_shape:non_numeric_line"
+    return "invalid_answer_shape:unknown"
+
+
+def is_plain_forecast_block_response(response_text: Optional[str]) -> bool:
+    forecast_block = extract_forecast_block(response_text)
+    if not forecast_block or response_text is None:
+        return False
+
+    cleaned = (
+        str(response_text)
+        .replace("<|im_end|>", "\n")
+        .replace("<think>", "\n")
+        .replace("</think>", "\n")
+        .replace("<answer>", "\n")
+        .replace("</answer>", "\n")
+        .strip()
+    )
+    return normalized_nonempty_lines(cleaned) == normalized_nonempty_lines(forecast_block)
+
+
+def extract_strict_protocol_answer(solution_str: Optional[str], expected_len: int) -> Tuple[Optional[str], Optional[str]]:
+    if solution_str is None:
+        return None, "empty_solution"
+
+    if "<answer>" in solution_str and "</answer>" not in solution_str:
+        return None, "missing_answer_close_tag"
+    if "</answer>" in solution_str and "<answer>" not in solution_str:
+        return None, "missing_answer_open_tag"
+    if "<answer>" not in solution_str and "</answer>" not in solution_str:
+        return None, "missing_answer_block"
+
+    protocol_match = re.fullmatch(
+        r"\s*(?:<think>.*?</think>\s*)?<answer>(.*?)</answer>\s*",
+        solution_str,
+        re.DOTALL,
+    )
+    if not protocol_match:
+        return None, "extra_text_outside_tags"
+
+    candidate = protocol_match.group(1).strip()
+    if looks_like_forecast_answer(candidate, expected_len):
+        return candidate, None
+    return None, infer_answer_shape_failure(candidate, expected_len)
+
+
+def recover_protocol_answer(
+    solution_str: Optional[str],
+    reject_reason: str,
+    expected_len: int,
+) -> Tuple[Optional[str], Optional[str]]:
+    if not solution_str:
+        return None, None
+    if "<tool_call>" in solution_str or "</tool_call>" in solution_str:
+        return None, None
+
+    candidate_sources: List[Tuple[str, str]] = []
+    answer_match = re.search(r"<answer>(.*?)</answer>", solution_str, re.DOTALL)
+    if answer_match:
+        candidate_sources.append(("answer_block", answer_match.group(1)))
+    elif "<answer>" in solution_str:
+        candidate_sources.append(("answer_block", solution_str.split("<answer>", 1)[1]))
+
+    if is_plain_forecast_block_response(solution_str):
+        forecast_block = extract_forecast_block(solution_str)
+        if forecast_block:
+            candidate_sources.append(("plain_forecast_block", forecast_block))
+
+    seen_sources: set[str] = set()
+    for source_name, source_text in candidate_sources:
+        normalized_source = source_text.strip()
+        if not normalized_source or normalized_source in seen_sources:
+            continue
+        seen_sources.add(normalized_source)
+
+        values = extract_values_from_time_series_string(normalized_source)
+        if len(values) < expected_len:
+            continue
+
+        canonical_answer = canonicalize_forecast_values(values, expected_len)
+        if not looks_like_forecast_answer(canonical_answer, expected_len):
+            continue
+
+        return canonical_answer, f"recovered_{reject_reason}_{source_name}"
+
+    return None, None
+
+
+def parse_final_answer_protocol(
+    solution_str: Optional[str],
+    expected_len: int,
+    *,
+    allow_recovery: bool = True,
+) -> Tuple[Optional[str], str, Optional[str]]:
+    strict_answer, reject_reason = extract_strict_protocol_answer(solution_str, expected_len)
+    if strict_answer is not None:
+        return strict_answer, "strict_protocol", None
+
+    reject_reason = reject_reason or "unknown_format_failure"
+    if allow_recovery:
+        recovered_answer, parse_mode = recover_protocol_answer(solution_str, reject_reason, expected_len)
+        if recovered_answer is not None and parse_mode is not None:
+            return recovered_answer, parse_mode, reject_reason
+
+    return None, f"rejected_{reject_reason}", reject_reason
 
 
 def extract_tail_lines(text: Optional[str], max_lines: int = 10) -> List[str]:
@@ -413,7 +595,7 @@ def normalize_for_reward(x_list: List[float], y_list: List[float]) -> Tuple[List
     return x_result.tolist(), y_result.tolist()
 
 
-def compute_format_score(solution_str: str) -> float:
+def compute_format_score(solution_str: str, expected_len: Optional[int] = None) -> float:
     """
     Check if the solution follows the required format with <answer> tags.
     
@@ -424,9 +606,11 @@ def compute_format_score(solution_str: str) -> float:
         return -1.0
     
     try:
-        protocol_match = re.fullmatch(r"\s*<think>(.*?)</think>\s*<answer>(.*?)</answer>\s*", solution_str, re.DOTALL)
-
-        if protocol_match and protocol_match.group(1).strip() and protocol_match.group(2).strip():
+        inferred_len = int(expected_len or 0)
+        if inferred_len <= 0:
+            inferred_len = len(extract_values_from_time_series_string(solution_str or ""))
+        answer_text, _, _ = parse_final_answer_protocol(solution_str, max(inferred_len, 1), allow_recovery=True)
+        if answer_text is not None:
             return 0.0
         return -1.0
     except Exception as e:
@@ -434,28 +618,16 @@ def compute_format_score(solution_str: str) -> float:
         return -1.0
 
 
-def infer_format_failure_reason(solution_str: Optional[str]) -> str:
+def infer_format_failure_reason(solution_str: Optional[str], expected_len: Optional[int] = None) -> str:
     if solution_str is None:
         return "empty_solution"
-    if "<think>" not in solution_str and "</think>" not in solution_str:
-        return "missing_think_block"
-    if "<think>" not in solution_str:
-        return "missing_think_open_tag"
-    if "</think>" not in solution_str:
-        return "missing_think_close_tag"
-    if "<answer>" not in solution_str:
-        return "missing_answer_open_tag"
-    if "</answer>" not in solution_str:
-        return "missing_answer_close_tag"
-    think_text_match = re.search(r"<think>(.*?)</think>", solution_str, re.DOTALL)
-    if not think_text_match:
-        return "invalid_think_block"
-    if not think_text_match.group(1).strip():
-        return "empty_think_block"
-    answer_text = extract_answer(solution_str)
-    if not answer_text.strip():
-        return "empty_answer_block"
-    return "unknown_format_failure"
+    inferred_len = int(expected_len or 0)
+    if inferred_len <= 0:
+        inferred_len = len(extract_values_from_time_series_string(solution_str or ""))
+    answer_text, _, reject_reason = parse_final_answer_protocol(solution_str, max(inferred_len, 1), allow_recovery=True)
+    if answer_text is not None:
+        return "ok"
+    return reject_reason or "unknown_format_failure"
 
 
 def compute_length_score(solution_str: str, ground_truth: str) -> float:
@@ -735,6 +907,9 @@ def compute_score(
         "final_answer_step_index",
         "feature_tool_count",
         "feature_tool_signature",
+        "required_feature_tool_count",
+        "required_feature_tool_signature",
+        "missing_required_feature_tool_count",
         "analysis_state_signature",
         "analysis_coverage_ratio",
         "history_analysis_count",
@@ -796,6 +971,9 @@ def compute_score(
             raw_mae=float("nan"),
             length_hard_fail=False,
             strict_length_match=False,
+            format_parse_mode="rejected_empty_solution",
+            raw_protocol_reject_reason="empty_solution",
+            was_recovered=False,
             format_failure_reason="empty_solution",
             has_answer_tag=False,
             has_answer_open=False,
@@ -834,6 +1012,9 @@ def compute_score(
                 "raw_model_output_head": "",
                 "parsed_answer_text_head": "",
                 "parsed_values": [],
+                "format_parse_mode": "rejected_empty_solution",
+                "raw_protocol_reject_reason": "empty_solution",
+                "was_recovered": False,
                 "format_failure_reason": "empty_solution",
                 "length_hard_fail": False,
                 "strict_length_match": False,
@@ -854,6 +1035,9 @@ def compute_score(
             "norm_mae": float("nan"),
             "raw_mse": float("nan"),
             "raw_mae": float("nan"),
+            "format_parse_mode": "rejected_empty_solution",
+            "raw_protocol_reject_reason": "empty_solution",
+            "was_recovered": False,
             "format_failure_reason": "empty_solution",
             "pred_len": 0,
             "gt_len": 0,
@@ -875,10 +1059,22 @@ def compute_score(
     has_answer_tag = bool(re.search(r"<answer>(.*?)</answer>", solution_str or "", re.DOTALL))
     has_answer_open = bool("<answer>" in (solution_str or ""))
     has_answer_close = bool("</answer>" in (solution_str or ""))
-    pred_values = extract_values_from_time_series_string(solution_str)
+    raw_pred_values = extract_values_from_time_series_string(solution_str or "")
     gt_values = extract_ground_truth_values(ground_truth)
-    pred_len = len(pred_values)
     gt_len = len(gt_values)
+    protocol_expected_len = gt_len if gt_len > 0 else max(len(raw_pred_values), 1)
+    canonical_answer, format_parse_mode, raw_protocol_reject_reason = parse_final_answer_protocol(
+        solution_str,
+        protocol_expected_len,
+        allow_recovery=True,
+    )
+    scoring_solution = (
+        f"<answer>\n{canonical_answer}\n</answer>"
+        if canonical_answer is not None
+        else solution_str
+    )
+    pred_values = extract_values_from_time_series_string(scoring_solution)
+    pred_len = len(pred_values)
     len_gap = abs(pred_len - gt_len) if gt_len > 0 else pred_len
     under_generation = bool(gt_len > 0 and pred_len < gt_len)
     over_generation = bool(gt_len > 0 and pred_len > gt_len)
@@ -888,7 +1084,7 @@ def compute_score(
     change_point_score = 0.0
     season_trend_score = 0.0
 
-    format_score = compute_format_score(solution_str)
+    format_score = 0.0 if canonical_answer is not None else -1.0
     length_score = 0.0
     length_penalty = 0.0
     mse_score = 0.0
@@ -897,9 +1093,13 @@ def compute_score(
     norm_mse: float = float("nan")
     norm_mae: float = float("nan")
     format_failure_reason = "ok"
+    was_recovered = bool(format_parse_mode.startswith("recovered_"))
+    missing_answer_close_tag = bool(raw_protocol_reject_reason == "missing_answer_close_tag")
 
     if format_score < 0:
-        format_failure_reason = infer_format_failure_reason(solution_str)
+        format_failure_reason = raw_protocol_reject_reason or infer_format_failure_reason(
+            solution_str, expected_len=protocol_expected_len
+        )
     elif gt_len > 0 and pred_len > 0:
         min_len = min(pred_len, gt_len)
         pred_slice = pred_values[:min_len]
@@ -917,7 +1117,7 @@ def compute_score(
         if gt_len > 0 and pred_len != gt_len:
             format_failure_reason = f"length_mismatch:{pred_len}!={gt_len}"
             length_penalty = compute_length_penalty(pred_len, gt_len)
-        length_score = compute_length_score(solution_str, ground_truth)
+        length_score = compute_length_score(scoring_solution, ground_truth)
         if not np.isnan(orig_mse) and not np.isnan(norm_mse):
             mse_score = (1.0 / (1.0 + np.log1p(norm_mse))) * 0.6
         score += length_score
@@ -926,14 +1126,14 @@ def compute_score(
 
     if ENABLE_CHANGE_POINT_SCORE and format_score >= 0:
         try:
-            change_point_score = compute_change_point_score(solution_str, ground_truth)
+            change_point_score = compute_change_point_score(scoring_solution, ground_truth)
             score += change_point_score
         except Exception as e:
             print(f"[DEBUG] Error in compute_change_point_score: {e}")
 
     if ENABLE_SEASON_TREND_SCORE and format_score >= 0:
         try:
-            season_trend_score = compute_season_trend_score(solution_str, ground_truth)
+            season_trend_score = compute_season_trend_score(scoring_solution, ground_truth)
             score += season_trend_score
         except Exception as e:
             print(f"[DEBUG] Error in compute_season_trend_score: {e}")
@@ -975,6 +1175,9 @@ def compute_score(
             "raw_model_output_tail_10_lines": extract_tail_lines(solution_str, 10),
             "parsed_answer_tail_10_lines": extract_tail_lines(extract_answer(solution_str), 10),
             "parsed_values": pred_values[:50],
+            "format_parse_mode": format_parse_mode,
+            "raw_protocol_reject_reason": raw_protocol_reject_reason or "",
+            "was_recovered": was_recovered,
             "format_failure_reason": format_failure_reason,
             "length_hard_fail": bool(length_hard_fail),
             "strict_length_match": bool(strict_length_match),
@@ -1002,6 +1205,9 @@ def compute_score(
         raw_mae=orig_mae,
         length_hard_fail=bool(length_hard_fail),
         strict_length_match=bool(strict_length_match),
+        format_parse_mode=format_parse_mode,
+        raw_protocol_reject_reason=raw_protocol_reject_reason or "",
+        was_recovered=was_recovered,
         format_failure_reason=format_failure_reason,
         has_answer_tag=has_answer_tag,
         has_answer_open=has_answer_open,
@@ -1025,14 +1231,17 @@ def compute_score(
         "norm_mae": norm_mae,
         "raw_mse": orig_mse,
         "raw_mae": orig_mae,
+        "format_parse_mode": format_parse_mode,
+        "raw_protocol_reject_reason": raw_protocol_reject_reason or "",
+        "was_recovered": was_recovered,
         "format_failure_reason": format_failure_reason,
         "pred_len": int(pred_len),
         "gt_len": int(gt_len),
         "has_answer_tag": bool(has_answer_tag),
         "has_answer_open": bool(has_answer_open),
         "has_answer_close": bool(has_answer_close),
-        "missing_answer_close_tag": bool(format_failure_reason == "missing_answer_close_tag"),
-        "was_clipped": bool(format_failure_reason == "missing_answer_close_tag"),
+        "missing_answer_close_tag": missing_answer_close_tag,
+        "was_clipped": missing_answer_close_tag,
         "selected_model": selected_model,
         "len_gap": int(len_gap),
         "under_generation": under_generation,

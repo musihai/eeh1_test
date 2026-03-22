@@ -13,10 +13,15 @@ import numpy as np
 import pandas as pd
 
 from recipe.time_series_forecast.prompts import (
-    TIMESERIES_TOOL_SCHEMAS,
     build_runtime_user_prompt,
     build_timeseries_system_prompt,
 )
+from recipe.time_series_forecast.dataset_identity import (
+    DATASET_KIND_RUNTIME_SFT_PARQUET,
+    DATASET_KIND_TEACHER_CURATED_SFT,
+    validate_sibling_metadata,
+)
+from recipe.time_series_forecast.diagnostic_policy import select_feature_tool_names
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
 from recipe.time_series_forecast.utils import (
     compact_prediction_tool_output_from_string,
@@ -115,45 +120,7 @@ def build_feature_tool_results(values: list[float]) -> list[ToolResult]:
         "extract_event_summary": format_event_summary(event_features),
     }
 
-    selected_tool_names = {"extract_basic_statistics"}
-
-    strong_dynamics = (
-        float(dynamics_features.get("changepoint_count", 0.0)) >= 1.0
-        or float(dynamics_features.get("peak_count", 0.0)) >= 3.0
-        or float(dynamics_features.get("slope_second_diff_max", 0.0)) >= max(float(basic_features.get("mad", 0.0)), 1e-3)
-        or float(dynamics_features.get("monotone_duration", 0.0)) >= 0.35
-    )
-    residual_difficulty = (
-        abs(float(residual_features.get("residual_acf1", 0.0))) >= 0.2
-        or float(residual_features.get("residual_exceed_ratio", 0.0)) >= 0.08
-        or float(residual_features.get("residual_concentration", 0.0)) >= 0.35
-    )
-    quality_issue = (
-        float(quality_features.get("quality_quantization_score", 0.0)) >= 0.25
-        or float(quality_features.get("quality_saturation_ratio", 0.0)) >= 0.08
-        or float(quality_features.get("quality_constant_channel_ratio", 0.0)) > 0.0
-        or float(quality_features.get("quality_dropout_ratio", 0.0)) > 0.0
-    )
-    eventful_window = (
-        float(event_features.get("event_segment_count", 0.0)) >= 4.0
-        or int(float(event_features.get("event_dominant_pattern", 0.0))) == 3
-        or abs(float(basic_features.get("acf_seasonal", 0.0))) >= 0.25
-    )
-
-    if strong_dynamics:
-        selected_tool_names.add("extract_within_channel_dynamics")
-    if residual_difficulty:
-        selected_tool_names.add("extract_forecast_residuals")
-    if quality_issue:
-        selected_tool_names.add("extract_data_quality")
-    if eventful_window:
-        selected_tool_names.add("extract_event_summary")
-
-    if len(selected_tool_names) == 1:
-        fallback_tool = (
-            "extract_event_summary" if abs(float(basic_features.get("acf_seasonal", 0.0))) >= 0.2 else "extract_within_channel_dynamics"
-        )
-        selected_tool_names.add(fallback_tool)
+    selected_tool_names = set(select_feature_tool_names(values))
 
     return [
         ToolResult(tool_name=name, tool_output=tool_outputs[name])
@@ -338,7 +305,11 @@ def _adjust_local_slope(values: list[float], history_values: list[float]) -> tup
     return adjusted, ["local_slope_adjust"]
 
 
-def _should_attempt_refinement(selected_feature_tools: list[str], score_margin: float) -> tuple[bool, list[str]]:
+def _should_attempt_refinement(
+    selected_feature_tools: list[str],
+    score_margin: float,
+    candidate_refinements: Sequence[tuple[list[float], list[str]]],
+) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     if "extract_data_quality" in selected_feature_tools:
         reasons.append("quality_signal")
@@ -346,30 +317,48 @@ def _should_attempt_refinement(selected_feature_tools: list[str], score_margin: 
         reasons.append("residual_signal")
     if "extract_within_channel_dynamics" in selected_feature_tools and score_margin <= 0.05:
         reasons.append("dynamics_small_margin")
+    candidate_ops = {op for _values, ops in candidate_refinements for op in ops}
+    if score_margin <= 0.05:
+        if "isolated_spike_smoothing" in candidate_ops:
+            reasons.append("prediction_spike_signal")
+        if "flat_tail_repair" in candidate_ops:
+            reasons.append("prediction_flat_tail_signal")
+        if "local_level_adjust" in candidate_ops:
+            reasons.append("prediction_level_signal")
+        if "local_slope_adjust" in candidate_ops:
+            reasons.append("prediction_slope_signal")
+        if "amplitude_clip" in candidate_ops:
+            reasons.append("prediction_amplitude_signal")
     return bool(reasons), reasons or ["evidence_consistent"]
 
 
-def _apply_local_refinements(values: list[float], history_values: list[float]) -> tuple[list[float], list[str]]:
-    candidate = list(values)
-    ops: list[str] = []
-
-    candidate, spike_ops = _smooth_isolated_spikes(candidate)
-    ops.extend(spike_ops)
-
-    candidate, flat_ops = _repair_flat_tail(candidate, history_values)
-    ops.extend(flat_ops)
-
-    candidate, level_ops = _adjust_local_level(candidate, history_values)
-    ops.extend(level_ops)
-
-    candidate, slope_ops = _adjust_local_slope(candidate, history_values)
-    ops.extend(slope_ops)
-
-    candidate, clip_ops = _clip_implausible_amplitude(candidate, history_values)
-    ops.extend(clip_ops)
-
-    deduped_ops = list(dict.fromkeys(ops))
-    return candidate, deduped_ops
+def _generate_local_refinement_candidates(
+    values: list[float],
+    history_values: list[float],
+) -> list[tuple[list[float], list[str]]]:
+    candidate_builders = [
+        lambda current: _smooth_isolated_spikes(current),
+        lambda current: _repair_flat_tail(current, history_values),
+        lambda current: _adjust_local_level(current, history_values),
+        lambda current: _adjust_local_slope(current, history_values),
+        lambda current: _clip_implausible_amplitude(current, history_values),
+    ]
+    candidates: list[tuple[list[float], list[str]]] = []
+    seen_signatures: set[tuple[str, tuple[float, ...]]] = set()
+    for builder in candidate_builders:
+        candidate_values, candidate_ops = builder(list(values))
+        deduped_ops = list(dict.fromkeys(candidate_ops))
+        if not deduped_ops:
+            continue
+        signature = (
+            "->".join(deduped_ops),
+            tuple(round(float(value), 6) for value in candidate_values),
+        )
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        candidates.append((candidate_values, deduped_ops))
+    return candidates
 
 
 def _summarize_refine_delta(base_values: list[float], refined_values: list[float]) -> dict[str, float]:
@@ -429,25 +418,6 @@ def _is_meaningful_local_refine(
     return bool(local_enough and meaningful_gain), delta_summary
 
 
-def _build_reflection_text(model_name: str, turn3_target_type: str, refine_ops: list[str]) -> str:
-    model_tag = model_name.upper()
-    if turn3_target_type == "validated_keep":
-        return f"The {model_tag} base forecast is consistent with the diagnostics, so I keep it unchanged."
-    if "isolated_spike_smoothing" in refine_ops and "flat_tail_repair" in refine_ops:
-        return f"I keep {model_tag} as the base forecast, smooth an isolated spike, and repair the flat tail."
-    if "isolated_spike_smoothing" in refine_ops:
-        return f"I keep {model_tag} as the base forecast and smooth one isolated spike."
-    if "flat_tail_repair" in refine_ops:
-        return f"I keep {model_tag} as the base forecast and repair the flat tail."
-    if "local_level_adjust" in refine_ops:
-        return f"I keep {model_tag} as the base forecast and apply a small local level correction."
-    if "local_slope_adjust" in refine_ops:
-        return f"I keep {model_tag} as the base forecast and apply a small local slope correction."
-    if "amplitude_clip" in refine_ops:
-        return f"I keep {model_tag} as the base forecast and clip one implausible local amplitude jump."
-    return f"I keep {model_tag} as the base forecast and make a small evidence-based local refinement."
-
-
 def _build_turn3_target(
     *,
     sample: dict[str, Any],
@@ -466,7 +436,12 @@ def _build_turn3_target(
         )
     ground_truth_values = ground_truth_values[:forecast_horizon]
     score_margin = float(sample.get("teacher_eval_score_margin", 0.0) or 0.0)
-    attempt_refine, trigger_reasons = _should_attempt_refinement(selected_feature_tools, score_margin)
+    candidate_refinements = _generate_local_refinement_candidates(base_values, history_values)
+    attempt_refine, trigger_reasons = _should_attempt_refinement(
+        selected_feature_tools,
+        score_margin,
+        candidate_refinements,
+    )
 
     base_mse, base_mae = _compute_error_metrics(base_values, ground_truth_values)
     best_target_type = "validated_keep"
@@ -478,23 +453,20 @@ def _build_turn3_target(
     best_trigger_reasons = ["evidence_consistent"]
 
     if attempt_refine:
-        refined_values, refine_ops = _apply_local_refinements(base_values, history_values)
-    else:
-        refined_values, refine_ops = _apply_local_refinements(base_values, history_values)
-
-    if refine_ops:
-        refined_mse, refined_mae = _compute_error_metrics(refined_values, ground_truth_values)
-        is_meaningful_refine, delta_summary = _is_meaningful_local_refine(
-            base_values=base_values,
-            refined_values=refined_values,
-            history_values=history_values,
-            base_mse=base_mse,
-            base_mae=base_mae,
-            refined_mse=refined_mse,
-            refined_mae=refined_mae,
-        )
-        candidate_trigger_reasons = trigger_reasons if attempt_refine else ["forecast_shape_signal"]
-        if is_meaningful_refine and np.isfinite(refined_mse) and refined_mse < base_mse - 1e-8:
+        candidate_trigger_reasons = trigger_reasons
+        for refined_values, refine_ops in candidate_refinements:
+            refined_mse, refined_mae = _compute_error_metrics(refined_values, ground_truth_values)
+            is_meaningful_refine, delta_summary = _is_meaningful_local_refine(
+                base_values=base_values,
+                refined_values=refined_values,
+                history_values=history_values,
+                base_mse=base_mse,
+                base_mae=base_mae,
+                refined_mse=refined_mse,
+                refined_mae=refined_mae,
+            )
+            if not is_meaningful_refine or not np.isfinite(refined_mse) or refined_mse >= best_mse - 1e-8:
+                continue
             best_target_type = "local_refine"
             best_values = refined_values
             best_ops = refine_ops
@@ -518,16 +490,12 @@ def _build_turn3_target(
         "turn3_trigger_reason": trigger_reason,
         "base_teacher_prediction_text": _prediction_text_from_values(base_values),
         "refined_prediction_text": _prediction_text_from_values(best_values),
-        "reflection_text": _build_reflection_text(model_name, best_target_type, best_ops),
         **best_delta_summary,
     }
 
 
-def build_final_answer(
-    prediction_values: list[float],
-    reflection_text: str,
-) -> str:
-    return f"<think>{reflection_text}</think>\n<answer>\n{_prediction_text_from_values(prediction_values)}\n</answer>"
+def build_final_answer(prediction_values: list[float]) -> str:
+    return f"<answer>\n{_prediction_text_from_values(prediction_values)}\n</answer>"
 
 
 def _resolve_prediction_text(
@@ -630,7 +598,8 @@ def build_sft_record(sample: dict[str, Any]) -> dict[str, Any]:
         time_series_data=historical_data,
         history_analysis=[],
         prediction_results=None,
-        conversation_has_tool_history=False,
+        required_feature_tools=selected_feature_tools,
+        completed_feature_tools=[],
     )
     turn_2_prompt = build_runtime_user_prompt(
         data_source=data_source,
@@ -640,7 +609,8 @@ def build_sft_record(sample: dict[str, Any]) -> dict[str, Any]:
         time_series_data=historical_data,
         history_analysis=history_analysis,
         prediction_results=None,
-        conversation_has_tool_history=True,
+        required_feature_tools=selected_feature_tools,
+        completed_feature_tools=selected_feature_tools,
     )
     turn_3_prompt = build_runtime_user_prompt(
         data_source=data_source,
@@ -651,7 +621,8 @@ def build_sft_record(sample: dict[str, Any]) -> dict[str, Any]:
         history_analysis=history_analysis,
         prediction_results=tool_prediction_text,
         prediction_model_used=selected_prediction_model,
-        conversation_has_tool_history=True,
+        required_feature_tools=selected_feature_tools,
+        completed_feature_tools=selected_feature_tools,
     )
 
     feature_tool_calls = [
@@ -695,17 +666,12 @@ def build_sft_record(sample: dict[str, Any]) -> dict[str, Any]:
         {"role": "user", "content": turn_3_prompt},
         {
             "role": "assistant",
-            "content": build_final_answer(
-                final_prediction_values,
-                reflection_text=turn3_target["reflection_text"],
-            ),
+            "content": build_final_answer(final_prediction_values),
         },
     ]
 
     return {
         "messages": messages,
-        "tools": TIMESERIES_TOOL_SCHEMAS,
-        "enable_thinking": False,
         "sample_index": int(sample.get("index", -1)),
         "data_source": data_source,
         "target_column": target_column,
@@ -828,17 +794,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build ETTh1 OT multi-turn SFT parquet from RL jsonl samples.")
     parser.add_argument(
         "--train-jsonl",
-        default="dataset/ett_rl_etth1_paper_same/train.jsonl",
+        default="dataset/ett_rl_etth1_paper_same2/train.jsonl",
         help="RL train jsonl path.",
     )
     parser.add_argument(
         "--val-jsonl",
-        default="dataset/ett_rl_etth1_paper_same/val.jsonl",
+        default="dataset/ett_rl_etth1_paper_same2/val.jsonl",
         help="RL val jsonl path.",
     )
     parser.add_argument(
         "--test-jsonl",
-        default="dataset/ett_rl_etth1_paper_same/test.jsonl",
+        default="dataset/ett_rl_etth1_paper_same2/test.jsonl",
         help="Optional RL test jsonl path.",
     )
     parser.add_argument(
@@ -862,6 +828,23 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    source_metadata_paths: list[Path] = []
+    for split_path in (Path(args.train_jsonl), Path(args.val_jsonl), Path(args.test_jsonl)):
+        if not split_path.exists():
+            continue
+        _, source_metadata_path = validate_sibling_metadata(
+            split_path,
+            expected_kind=DATASET_KIND_TEACHER_CURATED_SFT,
+        )
+        source_metadata_paths.append(source_metadata_path)
+    if source_metadata_paths:
+        unique_source_metadata_paths = {str(path) for path in source_metadata_paths}
+        if len(unique_source_metadata_paths) != 1:
+            raise ValueError(
+                "All source curated jsonl splits must come from the same teacher-curated dataset directory. "
+                f"Got metadata files: {sorted(unique_source_metadata_paths)}"
+            )
 
     train_df_raw = convert_jsonl_to_sft_parquet(
         input_path=args.train_jsonl,
@@ -896,6 +879,8 @@ def main() -> None:
         test_count = len(test_df)
 
     metadata_kwargs = dict(
+        dataset_kind=DATASET_KIND_RUNTIME_SFT_PARQUET,
+        pipeline_stage="runtime_multiturn_sft",
         train_samples_before_balance=len(train_df_raw),
         train_samples=len(train_df),
         val_samples=len(val_df),
@@ -904,6 +889,7 @@ def main() -> None:
         source_train_jsonl=str(Path(args.train_jsonl)),
         source_val_jsonl=str(Path(args.val_jsonl)),
         source_test_jsonl=str(test_path),
+        source_curated_metadata_path=str(source_metadata_paths[0]) if source_metadata_paths else "",
         train_turn3_target_type_distribution_before_balance=_distribution_from_series(train_df_raw["turn3_target_type"]),
         train_reference_teacher_model_distribution=_distribution_from_series(train_df["reference_teacher_model"]),
         train_selected_prediction_model_distribution=_distribution_from_series(train_df["selected_prediction_model"]),

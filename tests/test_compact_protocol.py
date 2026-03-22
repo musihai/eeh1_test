@@ -21,7 +21,8 @@ class CompactProtocolTests(unittest.TestCase):
             time_series_data="1.0000\n2.0000\n3.0000",
             history_analysis=["Basic Statistics:\n  Median: 2.0000"],
             prediction_results=None,
-            conversation_has_tool_history=True,
+            required_feature_tools=["extract_basic_statistics"],
+            completed_feature_tools=["extract_basic_statistics"],
         )
         self.assertIn("### Analysis Summary", prompt)
         self.assertIn("Median: 2.0000", prompt)
@@ -37,14 +38,34 @@ class CompactProtocolTests(unittest.TestCase):
             history_analysis=["Basic Statistics:\n  Median: 2.0000"],
             prediction_results="Start Timestamp: 2017-05-02 00:00:00\nFrequency Hours: 1\nForecast Values:\n4.0000",
             prediction_model_used="patchtst",
-            conversation_has_tool_history=True,
+            required_feature_tools=["extract_basic_statistics"],
+            completed_feature_tools=["extract_basic_statistics"],
         )
         self.assertIn("### Analysis Summary", prompt)
         self.assertIn("### Prediction Tool Output", prompt)
         self.assertIn("Forecast Values:", prompt)
         self.assertIn("base forecast produced by the selected model", prompt)
         self.assertIn("Do NOT rewrite the forecast arbitrarily", prompt)
+        self.assertIn("No tool schema is available in this turn", prompt)
+        self.assertIn("Output ONLY <answer>...</answer>", prompt)
         self.assertNotIn("already present earlier in this conversation", prompt)
+
+    def test_turn_one_prompt_requires_remaining_diagnostic_tools(self) -> None:
+        prompt = build_runtime_user_prompt(
+            data_source="ETTh1",
+            target_column="OT",
+            lookback_window=96,
+            forecast_horizon=96,
+            time_series_data="1.0000\n2.0000\n3.0000",
+            history_analysis=["Basic Statistics:\n  Median: 2.0000"],
+            prediction_results=None,
+            required_feature_tools=["extract_basic_statistics", "extract_event_summary"],
+            completed_feature_tools=["extract_basic_statistics"],
+        )
+        self.assertIn("### Remaining Diagnostic Tools", prompt)
+        self.assertIn("extract_event_summary", prompt)
+        self.assertIn("emit multiple tool calls in the same assistant turn", prompt)
+        self.assertIn("Do NOT call predict_time_series", prompt)
 
     def test_compact_prediction_tool_output_keeps_single_timestamp_anchor(self) -> None:
         prediction_text = (
@@ -73,7 +94,7 @@ class CompactProtocolTests(unittest.TestCase):
             "2017-05-02 02:00:00 13.0010\n"
             "</answer>"
         )
-        value_only_solution = "<think>x</think><answer>\n12.3450\n12.6780\n13.0010\n</answer>"
+        value_only_solution = "<answer>\n12.3450\n12.6780\n13.0010\n</answer>"
         timestamped_result = compute_score(
             data_source="time_series",
             solution_str=timestamped_solution,
@@ -117,22 +138,59 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(result["orig_mse"], 0.0, places=6)
         self.assertAlmostEqual(result["norm_mse"], 0.0, places=6)
 
-    def test_reward_length_mismatch_uses_soft_penalty(self) -> None:
+    def test_reward_rejects_under_generation_against_ground_truth_length(self) -> None:
         ground_truth = (
             "2017-05-02 00:00:00 10.0000\n"
             "2017-05-02 01:00:00 20.0000\n"
             "2017-05-02 02:00:00 30.0000"
         )
-        solution = "<think>x</think><answer>\n10.0000\n20.0000\n</answer>"
+        solution = "<answer>\n10.0000\n20.0000\n</answer>"
         result = compute_score(data_source="time_series", solution_str=solution, ground_truth=ground_truth)
         self.assertFalse(result["length_hard_fail"])
         self.assertFalse(result["strict_length_match"])
-        self.assertEqual(result["format_failure_reason"], "length_mismatch:2!=3")
-        self.assertAlmostEqual(result["mse_score"], 0.6, places=6)
-        self.assertAlmostEqual(result["length_penalty"], 0.03, places=6)
-        self.assertAlmostEqual(result["score"], 0.57, places=6)
-        self.assertAlmostEqual(result["orig_mse"], 0.0, places=6)
-        self.assertAlmostEqual(result["norm_mse"], 0.0, places=6)
+        self.assertEqual(result["format_failure_reason"], "invalid_answer_shape:lines=2,expected=3")
+        self.assertAlmostEqual(result["score"], -1.0, places=6)
+
+    def test_reward_accepts_answer_only_protocol(self) -> None:
+        ground_truth = (
+            "2017-05-02 00:00:00 12.3450\n"
+            "2017-05-02 01:00:00 12.6780\n"
+            "2017-05-02 02:00:00 13.0010"
+        )
+        solution = "<answer>\n12.3450\n12.6780\n13.0010\n</answer>"
+        result = compute_score(data_source="time_series", solution_str=solution, ground_truth=ground_truth)
+        self.assertEqual(result["format_failure_reason"], "ok")
+        self.assertEqual(result["format_parse_mode"], "strict_protocol")
+        self.assertFalse(result["was_recovered"])
+        self.assertAlmostEqual(result["score"], 0.7, places=6)
+
+    def test_reward_recovers_missing_answer_close_tag_and_keeps_clip_signal(self) -> None:
+        ground_truth = (
+            "2017-05-02 00:00:00 12.3450\n"
+            "2017-05-02 01:00:00 12.6780\n"
+            "2017-05-02 02:00:00 13.0010"
+        )
+        solution = "<think>x</think><answer>\n12.3450\n12.6780\n13.0010\n"
+        result = compute_score(data_source="time_series", solution_str=solution, ground_truth=ground_truth)
+        self.assertEqual(result["format_failure_reason"], "ok")
+        self.assertEqual(result["format_parse_mode"], "recovered_missing_answer_close_tag_answer_block")
+        self.assertTrue(result["was_recovered"])
+        self.assertTrue(result["missing_answer_close_tag"])
+        self.assertTrue(result["was_clipped"])
+        self.assertAlmostEqual(result["score"], 0.7, places=6)
+
+    def test_reward_recovers_overlong_answer_by_canonicalizing_to_ground_truth_length(self) -> None:
+        ground_truth = (
+            "2017-05-02 00:00:00 12.3450\n"
+            "2017-05-02 01:00:00 12.6780\n"
+            "2017-05-02 02:00:00 13.0010"
+        )
+        solution = "<answer>\n12.3450\n12.6780\n13.0010\n14.0000\n</answer>"
+        result = compute_score(data_source="time_series", solution_str=solution, ground_truth=ground_truth)
+        self.assertEqual(result["format_failure_reason"], "ok")
+        self.assertEqual(result["format_parse_mode"], "recovered_invalid_answer_shape:lines=4,expected=3_answer_block")
+        self.assertTrue(result["was_recovered"])
+        self.assertAlmostEqual(result["score"], 0.7, places=6)
 
     def test_reward_passthroughs_runtime_tool_debug_fields(self) -> None:
         ground_truth = (
@@ -194,9 +252,10 @@ class CompactProtocolTests(unittest.TestCase):
 
     def test_system_prompt_avoids_fixed_model_preferences(self) -> None:
         prompt = build_timeseries_system_prompt(data_source="ETTh1", target_column="OT")
-        self.assertNotIn("Usually strong for ETTh1-like seasonal univariate patterns", prompt)
-        self.assertNotIn("usually less preferred", prompt)
-        self.assertIn("smooth and shows strong local periodicity", prompt)
+        self.assertNotIn("12.3450", prompt)
+        self.assertIn("Follow the CURRENT user turn instructions only.", prompt)
+        self.assertIn("If no tool schema is available, NEVER emit `<tool_call>`.", prompt)
+        self.assertIn("output ONLY the required `<answer>...</answer>` block", prompt)
 
     def test_dataframe_prediction_tool_output_uses_compact_format(self) -> None:
         pred_df = pd.DataFrame(

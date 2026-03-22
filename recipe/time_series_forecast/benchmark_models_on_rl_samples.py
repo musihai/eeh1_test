@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from recipe.time_series_forecast.build_etth1_high_quality_sft import LocalTeacherPredictor
+from recipe.time_series_forecast.dataset_identity import DATASET_KIND_RL_JSONL, validate_sibling_metadata
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
 from recipe.time_series_forecast.utils import parse_time_series_to_dataframe
 
@@ -201,9 +202,9 @@ def summarize(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark chronos2/arima/patchtst/itransformer on RL samples.")
-    parser.add_argument("--train-jsonl", default="dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train_stage123.jsonl")
-    parser.add_argument("--val-jsonl", default="dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/val.jsonl")
-    parser.add_argument("--test-jsonl", default="dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/test.jsonl")
+    parser.add_argument("--train-jsonl", default="", help="Explicit RL train jsonl path.")
+    parser.add_argument("--val-jsonl", default="", help="Explicit RL val jsonl path.")
+    parser.add_argument("--test-jsonl", default="", help="Optional RL test jsonl path.")
     parser.add_argument("--train-samples", type=int, default=256, help="0 means use all")
     parser.add_argument("--val-samples", type=int, default=256, help="0 means use all")
     parser.add_argument("--test-samples", type=int, default=0, help="0 means skip when --include-test is false")
@@ -239,10 +240,23 @@ def build_markdown(summary: dict[str, Any]) -> str:
 
 def main() -> None:
     args = parse_args()
+    if not args.train_jsonl or not args.val_jsonl:
+        raise ValueError("Both --train-jsonl and --val-jsonl are required. Do not rely on implicit dataset defaults.")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     models = [item.strip().lower() for item in args.models.split(",") if item.strip()]
+    source_metadata_paths: set[str] = set()
+    for split_path in (args.train_jsonl, args.val_jsonl, args.test_jsonl):
+        if not split_path:
+            continue
+        _, metadata_path = validate_sibling_metadata(split_path, expected_kind=DATASET_KIND_RL_JSONL)
+        source_metadata_paths.add(str(metadata_path))
+    if len(source_metadata_paths) > 1:
+        raise ValueError(
+            "Benchmark inputs must come from the same RL dataset directory. "
+            f"Got metadata files: {sorted(source_metadata_paths)}"
+        )
 
     split_specs: list[SplitSpec] = [
         SplitSpec("train", Path(args.train_jsonl), args.train_samples or 12060),

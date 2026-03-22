@@ -18,7 +18,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from recipe.time_series_forecast.build_etth1_sft_dataset import convert_jsonl_to_sft_parquet
+from recipe.time_series_forecast.build_etth1_sft_dataset import (
+    _distribution_from_series,
+    _rebalance_train_turn3_targets,
+    build_sft_record,
+    convert_jsonl_to_sft_parquet,
+)
+from recipe.time_series_forecast.dataset_identity import (
+    DATASET_KIND_RL_JSONL,
+    DATASET_KIND_TEACHER_CURATED_SFT,
+    validate_sibling_metadata,
+)
 from recipe.time_series_forecast.reward import compute_score
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
 from recipe.time_series_forecast.utils import (
@@ -30,10 +40,10 @@ from recipe.time_series_forecast.utils import (
 )
 
 
-DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_teacher200_paper_same")
-DEFAULT_TRAIN_JSONL = Path("dataset/ett_rl_etth1_paper_same/train.jsonl")
-DEFAULT_VAL_JSONL = Path("dataset/ett_rl_etth1_paper_same/val.jsonl")
-DEFAULT_TEST_JSONL = Path("dataset/ett_rl_etth1_paper_same/test.jsonl")
+DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_teacher200_paper_same2")
+DEFAULT_TRAIN_JSONL = Path("dataset/ett_rl_etth1_paper_same2/train.jsonl")
+DEFAULT_VAL_JSONL = Path("dataset/ett_rl_etth1_paper_same2/val.jsonl")
+DEFAULT_TEST_JSONL = Path("dataset/ett_rl_etth1_paper_same2/test.jsonl")
 DEFAULT_MODEL_SERVICE_URL = os.environ.get("MODEL_SERVICE_URL", "http://localhost:8994")
 PYTORCH_TEACHER_MODELS = {"patchtst", "itransformer"}
 
@@ -77,7 +87,7 @@ def evenly_spaced_records(records: Sequence[dict[str, Any]], count: int) -> list
 
 
 def prediction_solution(prediction_text: str) -> str:
-    return f"<think>Teacher forecast candidate.</think><answer>\n{prediction_text}\n</answer>"
+    return f"<answer>\n{prediction_text}\n</answer>"
 
 
 def quality_score(best_score: float, margin: float) -> float:
@@ -817,11 +827,11 @@ def _select_bucketed_evaluations(
     return sorted(final_items, key=lambda item: int(item["sample_index"]))
 
 
-def select_curated_evaluations(
+def _select_curated_evaluations_by_model_balance(
     evaluations: Sequence[dict[str, Any]],
     target_count: int,
     *,
-    balance_by_best_model: bool = True,
+    balance_by_best_model: bool,
 ) -> list[dict[str, Any]]:
     if target_count <= 0 or len(evaluations) <= target_count:
         return sorted(evaluations, key=lambda item: int(item["sample_index"]))
@@ -860,6 +870,118 @@ def select_curated_evaluations(
 
     final_items = list(selected_by_index.values())[:target_count]
     return sorted(final_items, key=lambda item: int(item["sample_index"]))
+
+
+def select_curated_evaluations(
+    evaluations: Sequence[dict[str, Any]],
+    target_count: int,
+    *,
+    balance_by_best_model: bool = True,
+    min_local_refine_ratio: float = 0.0,
+) -> list[dict[str, Any]]:
+    if target_count <= 0 or len(evaluations) <= target_count:
+        return sorted(evaluations, key=lambda item: int(item["sample_index"]))
+
+    if min_local_refine_ratio <= 0:
+        return _select_curated_evaluations_by_model_balance(
+            evaluations,
+            target_count,
+            balance_by_best_model=balance_by_best_model,
+        )
+
+    local_refine_pool = [
+        item for item in evaluations if str(item.get("turn3_target_type") or "") == "local_refine"
+    ]
+    if not local_refine_pool:
+        return _select_curated_evaluations_by_model_balance(
+            evaluations,
+            target_count,
+            balance_by_best_model=balance_by_best_model,
+        )
+
+    local_refine_target = int(math.ceil(target_count * min_local_refine_ratio))
+    local_refine_target = min(local_refine_target, len(local_refine_pool), target_count)
+    if local_refine_target <= 0:
+        return _select_curated_evaluations_by_model_balance(
+            evaluations,
+            target_count,
+            balance_by_best_model=balance_by_best_model,
+        )
+
+    selected_by_index: dict[int, dict[str, Any]] = {}
+    for item in _select_curated_evaluations_by_model_balance(
+        local_refine_pool,
+        local_refine_target,
+        balance_by_best_model=balance_by_best_model,
+    ):
+        selected_by_index[int(item["sample_index"])] = item
+
+    remaining_target = max(0, target_count - len(selected_by_index))
+    if remaining_target > 0:
+        remaining_pool = [
+            item
+            for item in evaluations
+            if int(item["sample_index"]) not in selected_by_index
+        ]
+        for item in _select_curated_evaluations_by_model_balance(
+            remaining_pool,
+            remaining_target,
+            balance_by_best_model=balance_by_best_model,
+        ):
+            selected_by_index[int(item["sample_index"])] = item
+
+    final_items = list(selected_by_index.values())[:target_count]
+    return sorted(final_items, key=lambda item: int(item["sample_index"]))
+
+
+def annotate_turn3_targets(
+    samples: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    annotated: list[dict[str, Any]] = []
+    annotation_errors: list[dict[str, Any]] = []
+    for sample in samples:
+        enriched = dict(sample)
+        try:
+            sft_record = build_sft_record(sample)
+        except Exception as exc:
+            enriched["turn3_target_type"] = "validated_keep"
+            enriched["turn3_trigger_reason"] = "annotation_error"
+            enriched["refine_ops_signature"] = "none"
+            enriched["refine_gain_mse"] = 0.0
+            enriched["refine_gain_mae"] = 0.0
+            enriched["turn3_annotation_error"] = f"{type(exc).__name__}: {exc}"
+            annotation_errors.append(
+                {
+                    "sample_index": int(sample.get("index", -1)),
+                    "uid": sample.get("uid"),
+                    "reference_teacher_model": sample.get("reference_teacher_model"),
+                    "teacher_prediction_source": sample.get("teacher_prediction_source"),
+                    "error": enriched["turn3_annotation_error"],
+                }
+            )
+            annotated.append(enriched)
+            continue
+
+        for key in (
+            "turn3_target_type",
+            "turn3_trigger_reason",
+            "refine_ops_signature",
+            "refine_gain_mse",
+            "refine_gain_mae",
+            "refine_changed_value_count",
+            "refine_first_changed_index",
+            "refine_last_changed_index",
+            "refine_changed_span",
+            "refine_mean_abs_delta",
+            "refine_max_abs_delta",
+            "selected_feature_tool_signature",
+            "selected_feature_tool_count",
+            "selected_prediction_model",
+            "base_prediction_source",
+        ):
+            enriched[key] = sft_record.get(key)
+        annotated.append(enriched)
+    return annotated, annotation_errors
 
 
 def merge_evaluations_into_samples(
@@ -937,7 +1059,15 @@ def process_split(
     num_workers: int = 1,
     local_batch_size: int = 32,
     resume_eval: bool = True,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    train_min_local_refine_ratio: float = 0.0,
+    max_turn3_annotation_error_count: int = 0,
+    max_turn3_annotation_error_ratio: float = 0.0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    if eval_count > 0 and candidate_count > eval_count:
+        raise ValueError(
+            f"split={split_name}: candidate_count ({candidate_count}) may not exceed eval_count ({eval_count}) "
+            "when eval_count is limited, because every curated candidate must have teacher-eval metadata."
+        )
     eval_path = output_dir / f"{split_name}_teacher_eval.jsonl"
     curated_eval_path = output_dir / f"{split_name}_teacher_eval_curated.jsonl"
     curated_path = output_dir / f"{split_name}_curated.jsonl"
@@ -1000,21 +1130,81 @@ def process_split(
     evaluation_by_index.update({int(item["sample_index"]): item for item in pending_evaluations})
     evaluations = [evaluation_by_index[sample_index] for sample_index in sorted(eval_indices) if sample_index in evaluation_by_index]
 
-    selected_evaluations = select_curated_evaluations(
-        evaluations,
-        target_count,
-        balance_by_best_model=True,
-    )
-    selected_indices = {int(item["sample_index"]) for item in selected_evaluations}
     candidate_records = evenly_spaced_records(records, candidate_count) if candidate_count > 0 else list(records)
     candidate_by_index = {int(record.get("index", -1)): record for record in candidate_records}
-    record_by_index = {int(record.get("index", -1)): record for record in records}
-    selected_records = [
-        candidate_by_index.get(sample_index, record_by_index[sample_index])
-        for sample_index in sorted(selected_indices)
-        if sample_index in record_by_index
+    candidate_indices = {int(record.get("index", -1)) for record in candidate_records}
+    candidate_evaluations = [
+        item for item in evaluations if int(item["sample_index"]) in candidate_indices
     ]
-    selected_records = merge_evaluations_into_samples(selected_records, selected_evaluations)
+    candidate_samples = merge_evaluations_into_samples(candidate_records, candidate_evaluations)
+    annotated_candidate_samples, annotation_errors = annotate_turn3_targets(candidate_samples)
+    annotation_error_path = output_dir / f"{split_name}_turn3_annotation_errors.jsonl"
+    if annotation_errors:
+        write_jsonl(annotation_error_path, annotation_errors)
+    annotation_error_count = len(annotation_errors)
+    annotation_error_ratio = float(annotation_error_count / len(candidate_samples)) if candidate_samples else 0.0
+    if annotation_error_count > 0:
+        print(
+            f"[HQ-SFT] split={split_name} turn3 annotation errors: "
+            f"{annotation_error_count}/{len(candidate_samples)} ({annotation_error_ratio:.2%})"
+        )
+    if (
+        annotation_error_count > int(max_turn3_annotation_error_count)
+        or annotation_error_ratio > float(max_turn3_annotation_error_ratio)
+    ):
+        preview = "; ".join(
+            f"index={item.get('sample_index')} error={item.get('error')}"
+            for item in annotation_errors[:3]
+        )
+        raise RuntimeError(
+            f"split={split_name} exceeded turn3 annotation error budget: "
+            f"errors={annotation_error_count}, ratio={annotation_error_ratio:.2%}, "
+            f"max_count={int(max_turn3_annotation_error_count)}, "
+            f"max_ratio={float(max_turn3_annotation_error_ratio):.2%}. "
+            f"Examples: {preview}"
+        )
+    annotated_by_index = {
+        int(item.get("index", -1)): item
+        for item in annotated_candidate_samples
+    }
+    annotated_candidate_evaluations: list[dict[str, Any]] = []
+    for evaluation in candidate_evaluations:
+        sample_index = int(evaluation["sample_index"])
+        annotated_sample = annotated_by_index.get(sample_index, {})
+        enriched_evaluation = dict(evaluation)
+        for key in (
+            "turn3_target_type",
+            "turn3_trigger_reason",
+            "refine_ops_signature",
+            "refine_gain_mse",
+            "refine_gain_mae",
+            "refine_changed_value_count",
+            "refine_first_changed_index",
+            "refine_last_changed_index",
+            "refine_changed_span",
+            "refine_mean_abs_delta",
+            "refine_max_abs_delta",
+            "selected_feature_tool_signature",
+            "selected_feature_tool_count",
+            "selected_prediction_model",
+            "base_prediction_source",
+        ):
+            if key in annotated_sample:
+                enriched_evaluation[key] = annotated_sample[key]
+        annotated_candidate_evaluations.append(enriched_evaluation)
+
+    selected_evaluations = select_curated_evaluations(
+        annotated_candidate_evaluations,
+        target_count,
+        balance_by_best_model=True,
+        min_local_refine_ratio=float(train_min_local_refine_ratio) if split_name == "train" else 0.0,
+    )
+    selected_indices = {int(item["sample_index"]) for item in selected_evaluations}
+    selected_records = [
+        annotated_by_index[sample_index]
+        for sample_index in sorted(selected_indices)
+        if sample_index in annotated_by_index
+    ]
 
     write_jsonl(eval_path, evaluations)
     write_jsonl(curated_eval_path, selected_evaluations)
@@ -1023,7 +1213,14 @@ def process_split(
         f"[HQ-SFT] split={split_name} eval_rows={len(evaluations)} reused={len(reused_evaluations)} "
         f"selected={len(selected_records)}"
     )
-    return selected_records, evaluations
+    annotation_summary = {
+        "candidate_samples": int(len(candidate_samples)),
+        "turn3_annotation_error_count": int(annotation_error_count),
+        "turn3_annotation_error_ratio": float(annotation_error_ratio),
+    }
+    if annotation_errors:
+        annotation_summary["turn3_annotation_errors_path"] = str(annotation_error_path)
+    return selected_records, evaluations, annotation_summary
 
 
 def parse_models(value: str) -> list[str]:
@@ -1065,6 +1262,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-candidate-samples", type=int, default=600, help="Train candidate pool size.")
     parser.add_argument("--val-candidate-samples", type=int, default=192, help="Validation candidate pool size.")
     parser.add_argument("--test-candidate-samples", type=int, default=256, help="Test candidate pool size.")
+    parser.add_argument(
+        "--train-min-local-refine-ratio",
+        type=float,
+        default=0.30,
+        help="Minimum desired local_refine ratio in train parquet. Set <=0 to disable train rebalancing.",
+    )
+    parser.add_argument(
+        "--max-turn3-annotation-error-count",
+        type=int,
+        default=0,
+        help="Maximum allowed Turn-3 annotation failures per split before aborting. Default: 0.",
+    )
+    parser.add_argument(
+        "--max-turn3-annotation-error-ratio",
+        type=float,
+        default=0.0,
+        help="Maximum allowed Turn-3 annotation failure ratio per split before aborting. Default: 0.0.",
+    )
     parser.add_argument("--max-concurrency", type=int, default=2, help="Concurrent teacher evaluation count.")
     parser.add_argument("--num-workers", type=int, default=1, help="Local teacher-eval worker process count.")
     parser.add_argument(
@@ -1115,6 +1330,8 @@ def main() -> None:
     )
 
     metadata: dict[str, Any] = {
+        "dataset_kind": DATASET_KIND_TEACHER_CURATED_SFT,
+        "pipeline_stage": "teacher200_curated",
         "selection_method": "teacher_reward_scoring_with_bucketed_time_coverage_and_teacher_error_logging",
         "teacher_models": models,
         "max_concurrency": args.max_concurrency,
@@ -1132,6 +1349,25 @@ def main() -> None:
             raise FileNotFoundError(
                 f"Missing source RL jsonl for split={split_name}: {path}. "
                 "Restore the RL dataset or pass the correct split path explicitly."
+            )
+
+    source_metadata_paths: list[Path] = []
+    for split_name, path, _eval_count, _candidate_count, target_count in split_specs:
+        if target_count <= 0 or not path.exists():
+            continue
+        source_metadata, source_metadata_path = validate_sibling_metadata(
+            path,
+            expected_kind=DATASET_KIND_RL_JSONL,
+        )
+        metadata[f"source_{split_name}_metadata_path"] = str(source_metadata_path)
+        metadata[f"source_{split_name}_pipeline_stage"] = str(source_metadata.get("pipeline_stage") or "")
+        source_metadata_paths.append(source_metadata_path)
+    if source_metadata_paths:
+        unique_source_metadata_paths = {str(path) for path in source_metadata_paths}
+        if len(unique_source_metadata_paths) != 1:
+            raise ValueError(
+                "All source RL jsonl splits must come from the same dataset directory. "
+                f"Got metadata files: {sorted(unique_source_metadata_paths)}"
             )
 
     predictor_devices = [item.strip() for item in str(args.predictor_devices or "").split(",") if item.strip()]
@@ -1174,7 +1410,7 @@ def main() -> None:
                     f"Source RL jsonl for split={split_name} is empty: {path}. "
                     "Cannot build teacher-scored SFT data from an empty split."
                 )
-            curated_records, full_evaluations = process_split(
+            curated_records, full_evaluations, annotation_summary = process_split(
                 split_name=split_name,
                 records=records,
                 models=models,
@@ -1189,6 +1425,9 @@ def main() -> None:
                 num_workers=args.num_workers,
                 local_batch_size=args.local_batch_size,
                 resume_eval=bool(args.resume_teacher_eval),
+                train_min_local_refine_ratio=float(args.train_min_local_refine_ratio),
+                max_turn3_annotation_error_count=int(args.max_turn3_annotation_error_count),
+                max_turn3_annotation_error_ratio=float(args.max_turn3_annotation_error_ratio),
                 model_service_url=args.model_service_url,
                 output_dir=output_dir,
             )
@@ -1199,21 +1438,59 @@ def main() -> None:
                 )
             curated_jsonl_path = output_dir / f"{split_name}_curated.jsonl"
             parquet_path = output_dir / f"{split_name}.parquet"
-            convert_jsonl_to_sft_parquet(
+            parquet_df_raw = convert_jsonl_to_sft_parquet(
                 input_path=curated_jsonl_path,
                 output_path=parquet_path,
             )
+            parquet_df = parquet_df_raw
+            if split_name == "train":
+                parquet_df = _rebalance_train_turn3_targets(
+                    parquet_df_raw,
+                    min_local_refine_ratio=float(args.train_min_local_refine_ratio),
+                )
+                if len(parquet_df) != len(parquet_df_raw) or not parquet_df.equals(parquet_df_raw):
+                    parquet_df.to_parquet(parquet_path, index=False)
+                    print(
+                        f"Rebalanced {split_name}.parquet turn3_target_type distribution: "
+                        f"{_distribution_from_series(parquet_df['turn3_target_type'])}"
+                    )
             teacher_distribution: dict[str, int] = {}
             for record in curated_records:
                 teacher = str(record.get("reference_teacher_model") or "unknown")
                 teacher_distribution[teacher] = teacher_distribution.get(teacher, 0) + 1
 
-            metadata[f"{split_name}_samples"] = len(curated_records)
+            metadata[f"{split_name}_samples"] = len(parquet_df)
             metadata[f"{split_name}_teacher_eval_records"] = len(full_evaluations)
             metadata[f"{split_name}_eval_samples"] = min(eval_count, len(records)) if eval_count > 0 else len(records)
             metadata[f"{split_name}_candidate_samples"] = min(candidate_count, len(records))
             metadata[f"{split_name}_teacher_distribution"] = teacher_distribution
             metadata[f"source_{split_name}_jsonl"] = str(path)
+            metadata[f"{split_name}_turn3_annotation_error_count"] = annotation_summary["turn3_annotation_error_count"]
+            metadata[f"{split_name}_turn3_annotation_error_ratio"] = annotation_summary["turn3_annotation_error_ratio"]
+            if "turn3_annotation_errors_path" in annotation_summary:
+                metadata[f"{split_name}_turn3_annotation_errors_path"] = annotation_summary["turn3_annotation_errors_path"]
+            if "turn3_target_type" in parquet_df_raw.columns:
+                if split_name == "train":
+                    metadata["train_samples_before_balance"] = len(parquet_df_raw)
+                    metadata["train_min_local_refine_ratio"] = float(args.train_min_local_refine_ratio)
+                    metadata["train_turn3_target_type_distribution_before_balance"] = _distribution_from_series(
+                        parquet_df_raw["turn3_target_type"]
+                    )
+                metadata[f"{split_name}_turn3_target_type_distribution"] = _distribution_from_series(
+                    parquet_df["turn3_target_type"]
+                )
+            if "turn3_trigger_reason" in parquet_df.columns:
+                metadata[f"{split_name}_turn3_trigger_reason_distribution"] = _distribution_from_series(
+                    parquet_df["turn3_trigger_reason"]
+                )
+            if "refine_ops_signature" in parquet_df.columns:
+                metadata[f"{split_name}_refine_ops_signature_distribution"] = _distribution_from_series(
+                    parquet_df["refine_ops_signature"]
+                )
+            if "selected_feature_tool_signature" in parquet_df.columns:
+                metadata[f"{split_name}_selected_feature_tool_signature_distribution"] = _distribution_from_series(
+                    parquet_df["selected_feature_tool_signature"]
+                )
 
         write_metadata(output_dir, **metadata)
     finally:

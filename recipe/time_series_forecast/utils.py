@@ -49,6 +49,7 @@ _httpx_client = None
 
 # Default lengths resolved from env/base.yaml
 DEFAULT_LOOKBACK_WINDOW, DEFAULT_FORECAST_HORIZON = get_default_lengths()
+SYNTHETIC_TIMESTAMP_ANCHOR = pd.Timestamp("2000-01-01 00:00:00")
 
 
 def _get_httpx_client():
@@ -622,8 +623,8 @@ def parse_time_series_to_dataframe(
         
     elif len(valid_timestamps) == 0:
         # Case 2: No timestamps at all - generate synthetic ones
-        # Use current time as base or a reasonable default
-        base_time = pd.Timestamp.now().floor('h')  # Round to current hour
+        # Use a fixed synthetic anchor to keep parsing/output deterministic.
+        base_time = SYNTHETIC_TIMESTAMP_ANCHOR
         freq = pd.Timedelta(default_freq)
         datetime_list = [base_time + freq * i for i in range(len(values))]
         
@@ -729,7 +730,7 @@ def format_predictions_to_string(
         if last_timestamp:
             base_time = pd.to_datetime(last_timestamp)
         else:
-            base_time = pd.Timestamp('2017-01-01')
+            base_time = SYNTHETIC_TIMESTAMP_ANCHOR
         
         for i, (_, row) in enumerate(pred_df.iterrows()):
             ts = base_time + pd.Timedelta(hours=(i + 1) * freq_hours)

@@ -40,8 +40,87 @@ if [ -z "${MODEL_PATH}" ]; then
     exit 1
 fi
 
-TRAIN_FILES="${TRAIN_FILES:-${SFT_TRAIN_FILES:-$PROJECT_DIR/dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2/train.parquet}}"
-VAL_FILES="${VAL_FILES:-${SFT_VAL_FILES:-$PROJECT_DIR/dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2/val.parquet}}"
+resolve_consistent_env_value() {
+    local label="$1"
+    shift
+    local resolved=""
+    local env_name
+    local candidate
+    for env_name in "$@"; do
+        candidate="${!env_name:-}"
+        if [ -z "$candidate" ]; then
+            continue
+        fi
+        if [ -n "$resolved" ] && [ "$candidate" != "$resolved" ]; then
+            echo "Conflicting ${label} values:" >&2
+            printf '  %s=%s\n' "$env_name" "$candidate" >&2
+            printf '  resolved=%s\n' "$resolved" >&2
+            exit 1
+        fi
+        resolved="$candidate"
+    done
+    printf '%s\n' "$resolved"
+}
+
+SFT_DATASET_DIR="${SFT_DATASET_DIR:-}"
+TRAIN_FILES_EXPLICIT="$(resolve_consistent_env_value 'SFT train parquet' TRAIN_FILES SFT_TRAIN_FILES)"
+VAL_FILES_EXPLICIT="$(resolve_consistent_env_value 'SFT val parquet' VAL_FILES SFT_VAL_FILES)"
+
+if [ -n "$SFT_DATASET_DIR" ]; then
+    DERIVED_TRAIN_FILES="$SFT_DATASET_DIR/train.parquet"
+    DERIVED_VAL_FILES="$SFT_DATASET_DIR/val.parquet"
+    if [ -n "$TRAIN_FILES_EXPLICIT" ] && [ "$TRAIN_FILES_EXPLICIT" != "$DERIVED_TRAIN_FILES" ]; then
+        echo "Conflicting SFT dataset specification for train split." >&2
+        echo "SFT_DATASET_DIR implies: $DERIVED_TRAIN_FILES" >&2
+        echo "Explicit train file: $TRAIN_FILES_EXPLICIT" >&2
+        exit 1
+    fi
+    if [ -n "$VAL_FILES_EXPLICIT" ] && [ "$VAL_FILES_EXPLICIT" != "$DERIVED_VAL_FILES" ]; then
+        echo "Conflicting SFT dataset specification for val split." >&2
+        echo "SFT_DATASET_DIR implies: $DERIVED_VAL_FILES" >&2
+        echo "Explicit val file: $VAL_FILES_EXPLICIT" >&2
+        exit 1
+    fi
+    TRAIN_FILES="${TRAIN_FILES_EXPLICIT:-$DERIVED_TRAIN_FILES}"
+    VAL_FILES="${VAL_FILES_EXPLICIT:-$DERIVED_VAL_FILES}"
+else
+    TRAIN_FILES="$TRAIN_FILES_EXPLICIT"
+    VAL_FILES="$VAL_FILES_EXPLICIT"
+fi
+
+if [ -z "${TRAIN_FILES}" ] || [ -z "${VAL_FILES}" ]; then
+    echo "SFT dataset path is required." >&2
+    echo "Set SFT_DATASET_DIR to a single dataset directory, or set both TRAIN_FILES and VAL_FILES explicitly." >&2
+    exit 1
+fi
+
+TRAIN_DIR="$(cd "$(dirname "$TRAIN_FILES")" && pwd)"
+VAL_DIR="$(cd "$(dirname "$VAL_FILES")" && pwd)"
+if [ "$TRAIN_DIR" != "$VAL_DIR" ]; then
+    echo "SFT train/val parquet must come from the same dataset directory." >&2
+    echo "train dir: $TRAIN_DIR" >&2
+    echo "val dir:   $VAL_DIR" >&2
+    exit 1
+fi
+
+SFT_METADATA_PATH="$TRAIN_DIR/metadata.json"
+if [ ! -f "$SFT_METADATA_PATH" ]; then
+    echo "SFT dataset metadata not found: $SFT_METADATA_PATH" >&2
+    echo "Use a dataset directory produced by the ETTh1 SFT builders, or pass the correct parquet paths." >&2
+    exit 1
+fi
+python3 - "$SFT_METADATA_PATH" <<'PY'
+import sys
+from recipe.time_series_forecast.dataset_identity import DATASET_KIND_RUNTIME_SFT_PARQUET, validate_metadata_file
+
+metadata_path = sys.argv[1]
+payload, _ = validate_metadata_file(metadata_path, expected_kind=DATASET_KIND_RUNTIME_SFT_PARQUET)
+print(
+    f"[SFT DATASET] kind={payload.get('dataset_kind')} stage={payload.get('pipeline_stage', '')} "
+    f"metadata={metadata_path}"
+)
+PY
+
 if [ ! -f "${TRAIN_FILES}" ]; then
     echo "SFT train parquet not found: ${TRAIN_FILES}"
     echo "Generate or restore the SFT dataset first."
@@ -79,8 +158,6 @@ CMD=(
     "data.train_files=${TRAIN_FILES}"
     "data.val_files=${VAL_FILES}"
     "data.messages_key=messages"
-    "data.tools_key=tools"
-    "data.enable_thinking_key=enable_thinking"
     "data.ignore_input_ids_mismatch=true"
     "data.pad_mode=no_padding"
     "data.max_length=${MAX_LENGTH}"
