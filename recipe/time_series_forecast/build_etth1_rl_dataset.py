@@ -54,8 +54,8 @@ def build_prompt(
         f"Forecast Horizon: {forecast_horizon}\n"
         "Requirements:\n"
         "1) Extract feature evidence before selecting a forecasting model.\n"
-        "2) Choose one model from the enabled experts and then predict.\n"
-        "3) In Turn 3, refine the selected model forecast if needed and follow the required output protocol with <answer>.\n"
+        "2) After diagnostics are complete, choose one model from the enabled experts and then predict.\n"
+        "3) After prediction, refine the selected model forecast only if needed and follow the required output protocol with <think>...</think><answer>...</answer>.\n"
         "Historical Data:\n"
         f"{value_lines}"
     )

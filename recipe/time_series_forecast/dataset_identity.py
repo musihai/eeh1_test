@@ -32,13 +32,18 @@ def validate_metadata_payload(
     payload: dict[str, Any],
     *,
     metadata_path: str | Path,
-    expected_kind: str,
+    expected_kind: str | Iterable[str],
     allowed_pipeline_stages: Iterable[str] | None = None,
 ) -> dict[str, Any]:
+    if isinstance(expected_kind, str):
+        expected_kinds = {expected_kind}
+    else:
+        expected_kinds = {str(item).strip() for item in expected_kind if str(item).strip()}
     actual_kind = str(payload.get("dataset_kind") or "").strip()
-    if actual_kind != expected_kind:
+    if actual_kind not in expected_kinds:
+        kind_text = next(iter(expected_kinds)) if len(expected_kinds) == 1 else sorted(expected_kinds)
         raise ValueError(
-            f"Dataset metadata kind mismatch: expected `{expected_kind}`, got `{actual_kind or '__missing__'}` "
+            f"Dataset metadata kind mismatch: expected `{kind_text}`, got `{actual_kind or '__missing__'}` "
             f"from {metadata_path}"
         )
 
@@ -56,7 +61,7 @@ def validate_metadata_payload(
 def validate_metadata_file(
     metadata_path: str | Path,
     *,
-    expected_kind: str,
+    expected_kind: str | Iterable[str],
     allowed_pipeline_stages: Iterable[str] | None = None,
 ) -> tuple[dict[str, Any], Path]:
     path = Path(metadata_path).resolve()
@@ -73,7 +78,7 @@ def validate_metadata_file(
 def validate_sibling_metadata(
     data_file: str | Path,
     *,
-    expected_kind: str,
+    expected_kind: str | Iterable[str],
     allowed_pipeline_stages: Iterable[str] | None = None,
 ) -> tuple[dict[str, Any], Path]:
     metadata_path = metadata_path_for_data_file(data_file)

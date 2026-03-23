@@ -369,6 +369,7 @@ class RayAgentTrainer(RayPPOTrainer):
             default=float("nan"),
         )
         generation_stop_reason = self._to_str_list(reward_extra_infos_dict.get("generation_stop_reason"), n)
+        generation_finish_reason = self._to_str_list(reward_extra_infos_dict.get("generation_finish_reason"), n)
         selected_model = self._to_str_list(
             reward_extra_infos_dict.get("selected_model")
             or reward_extra_infos_dict.get("prediction_model_used")
@@ -452,8 +453,28 @@ class RayAgentTrainer(RayPPOTrainer):
             n,
             default=float("nan"),
         )
+        prediction_step_index = self._to_float_list(
+            reward_extra_infos_dict.get("prediction_step_index"),
+            n,
+            default=float("nan"),
+        )
+        final_answer_step_index = self._to_float_list(
+            reward_extra_infos_dict.get("final_answer_step_index"),
+            n,
+            default=float("nan"),
+        )
+        required_step_budget = self._to_float_list(
+            reward_extra_infos_dict.get("required_step_budget"),
+            n,
+            default=float("nan"),
+        )
         tool_call_count = self._to_float_list(
             reward_extra_infos_dict.get("tool_call_count"),
+            n,
+            default=float("nan"),
+        )
+        response_token_len = self._to_float_list(
+            reward_extra_infos_dict.get("response_token_len"),
             n,
             default=float("nan"),
         )
@@ -565,6 +586,7 @@ class RayAgentTrainer(RayPPOTrainer):
         final_answer_reject_counter = Counter(reason for reason in final_answer_reject_reason if reason)
         format_failure_reason_counter = Counter(reason for reason in format_failure_reason if reason)
         generation_stop_reason_counter = Counter(reason for reason in generation_stop_reason if reason)
+        generation_finish_reason_counter = Counter(reason for reason in generation_finish_reason if reason)
         selected_model_counter = Counter(model for model in selected_model if model)
         feature_tool_signature_counter = Counter(signature for signature in feature_tool_signature if signature)
         required_feature_tool_signature_counter = Counter(
@@ -618,8 +640,14 @@ class RayAgentTrainer(RayPPOTrainer):
         prediction_call_count_values = [
             float(v) for v in prediction_call_count if isinstance(v, (int, float)) and np.isfinite(v)
         ]
+        required_step_budget_values = [
+            float(v) for v in required_step_budget if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
         tool_call_count_values = [
             float(v) for v in tool_call_count if isinstance(v, (int, float)) and np.isfinite(v)
+        ]
+        response_token_len_values = [
+            float(v) for v in response_token_len if isinstance(v, (int, float)) and np.isfinite(v)
         ]
         history_analysis_count_values = [
             float(v) for v in history_analysis_count if isinstance(v, (int, float)) and np.isfinite(v)
@@ -721,7 +749,13 @@ class RayAgentTrainer(RayPPOTrainer):
             "prediction_call_count_mean": float(np.mean(prediction_call_count_values))
             if prediction_call_count_values
             else float("nan"),
+            "required_step_budget_mean": float(np.mean(required_step_budget_values))
+            if required_step_budget_values
+            else float("nan"),
             "tool_call_count_mean": float(np.mean(tool_call_count_values)) if tool_call_count_values else float("nan"),
+            "response_token_len_mean": float(np.mean(response_token_len_values))
+            if response_token_len_values
+            else float("nan"),
             "history_analysis_count_mean": float(np.mean(history_analysis_count_values))
             if history_analysis_count_values
             else float("nan"),
@@ -751,6 +785,9 @@ class RayAgentTrainer(RayPPOTrainer):
             },
             "generation_stop_reason_distribution": {
                 str(k): int(v) for k, v in sorted(generation_stop_reason_counter.items())
+            },
+            "generation_finish_reason_distribution": {
+                str(k): int(v) for k, v in sorted(generation_finish_reason_counter.items())
             },
             "feature_tool_signature_distribution": {
                 str(k): int(v) for k, v in sorted(feature_tool_signature_counter.items())
@@ -810,6 +847,7 @@ class RayAgentTrainer(RayPPOTrainer):
                 "failure_reason": format_failure_reason[i] if format_failure_reason[i] else "",
                 "final_answer_reject_reason": final_answer_reject_reason[i] if final_answer_reject_reason[i] else "",
                 "generation_stop_reason": generation_stop_reason[i] if generation_stop_reason[i] else "",
+                "generation_finish_reason": generation_finish_reason[i] if generation_finish_reason[i] else "",
                 "strict_length_match": bool(strict_length_match_arr[i]),
                 "length_hard_fail": bool(length_hard_fail[i]),
                 "trainer_seq_score": float(trainer_seq_score[i]) if np.isfinite(trainer_seq_score[i]) else float("nan"),
@@ -853,7 +891,13 @@ class RayAgentTrainer(RayPPOTrainer):
                 if np.isfinite(missing_required_feature_tool_count[i])
                 else -1,
                 "prediction_call_count": int(prediction_call_count[i]) if np.isfinite(prediction_call_count[i]) else -1,
+                "prediction_step_index": int(prediction_step_index[i]) if np.isfinite(prediction_step_index[i]) else -1,
+                "final_answer_step_index": int(final_answer_step_index[i])
+                if np.isfinite(final_answer_step_index[i])
+                else -1,
+                "required_step_budget": int(required_step_budget[i]) if np.isfinite(required_step_budget[i]) else -1,
                 "tool_call_count": int(tool_call_count[i]) if np.isfinite(tool_call_count[i]) else -1,
+                "response_token_len": int(response_token_len[i]) if np.isfinite(response_token_len[i]) else -1,
                 "history_analysis_count": int(history_analysis_count[i])
                 if np.isfinite(history_analysis_count[i])
                 else -1,
@@ -1360,6 +1404,13 @@ class RayAgentTrainer(RayPPOTrainer):
 
         gc.collect()
 
+    def _should_run_initial_validation(self) -> bool:
+        trainer_cfg = self.config.trainer
+        wants_validation = bool(
+            trainer_cfg.get("val_before_train", True) or trainer_cfg.get("val_only", False)
+        )
+        return self.val_reward_fn is not None and wants_validation
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1387,7 +1438,7 @@ class RayAgentTrainer(RayPPOTrainer):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+        if self._should_run_initial_validation():
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")

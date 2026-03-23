@@ -20,6 +20,7 @@ from recipe.time_series_forecast.build_etth1_high_quality_sft import (
 )
 from recipe.time_series_forecast.dataset_identity import (
     DATASET_KIND_RL_JSONL,
+    DATASET_KIND_RUNTIME_SFT_PARQUET,
     DATASET_KIND_TEACHER_CURATED_SFT,
 )
 
@@ -544,8 +545,9 @@ class TestHighQualitySFTBuilder(unittest.TestCase):
             self.assertEqual(train_df["turn3_target_type"].value_counts(dropna=False).to_dict(), {"validated_keep": 2, "local_refine": 1})
 
             metadata = json.loads((output_dir / "metadata.json").read_text())
-            self.assertEqual(metadata["dataset_kind"], DATASET_KIND_TEACHER_CURATED_SFT)
-            self.assertEqual(metadata["pipeline_stage"], "teacher200_curated")
+            self.assertEqual(metadata["dataset_kind"], DATASET_KIND_RUNTIME_SFT_PARQUET)
+            self.assertEqual(metadata["pipeline_stage"], "teacher200_runtime_sft")
+            self.assertEqual(metadata["curated_jsonl_dataset_kind"], DATASET_KIND_TEACHER_CURATED_SFT)
             self.assertEqual(metadata["train_samples_before_balance"], 10)
             self.assertEqual(metadata["train_samples"], 3)
             self.assertEqual(

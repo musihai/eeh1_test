@@ -26,6 +26,7 @@ from recipe.time_series_forecast.build_etth1_sft_dataset import (
 )
 from recipe.time_series_forecast.dataset_identity import (
     DATASET_KIND_RL_JSONL,
+    DATASET_KIND_RUNTIME_SFT_PARQUET,
     DATASET_KIND_TEACHER_CURATED_SFT,
     validate_sibling_metadata,
 )
@@ -154,10 +155,12 @@ def score_prediction_text(
     *,
     prediction_text: str,
 ) -> tuple[float, dict[str, float]]:
+    # Teacher-eval compares raw forecast strings, not final Turn-3 protocol outputs.
     score = compute_score(
         data_source=str(prepared_sample["data_source"]),
         solution_str=prediction_solution(prediction_text),
         ground_truth=str(prepared_sample["ground_truth"]),
+        allow_recovery=True,
     )
     score_value = float(score["score"] if isinstance(score, dict) else score)
     details: dict[str, float] = {}
@@ -504,6 +507,7 @@ async def evaluate_teacher_for_sample(
                 data_source=data_source,
                 solution_str=prediction_solution(pred_text),
                 ground_truth=ground_truth,
+                allow_recovery=True,
             )
             score_value = float(score["score"] if isinstance(score, dict) else score)
             details = {}
@@ -1330,8 +1334,9 @@ def main() -> None:
     )
 
     metadata: dict[str, Any] = {
-        "dataset_kind": DATASET_KIND_TEACHER_CURATED_SFT,
-        "pipeline_stage": "teacher200_curated",
+        "dataset_kind": DATASET_KIND_RUNTIME_SFT_PARQUET,
+        "pipeline_stage": "teacher200_runtime_sft",
+        "curated_jsonl_dataset_kind": DATASET_KIND_TEACHER_CURATED_SFT,
         "selection_method": "teacher_reward_scoring_with_bucketed_time_coverage_and_teacher_error_logging",
         "teacher_models": models,
         "max_concurrency": args.max_concurrency,

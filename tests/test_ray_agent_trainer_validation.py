@@ -9,8 +9,10 @@ import torch
 from omegaconf import OmegaConf
 
 from arft.ray_agent_trainer import RayAgentTrainer, evaluate_validation_reward_manager
+from recipe.time_series_forecast.reward import append_turn3_generation_debug
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.naive import NaiveRewardManager
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
 
 class _AsyncRewardManager:
@@ -84,6 +86,124 @@ class TestValidationRewardManager(unittest.TestCase):
         finally:
             stale_loop.close()
 
+    def test_ray_ppo_trainer_runs_initial_validation_for_val_only_even_when_disabled_by_default(self) -> None:
+        trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+        trainer.config = OmegaConf.create({"trainer": {"val_before_train": False, "val_only": True}})
+
+        self.assertTrue(trainer._should_run_initial_validation())
+
+    def test_ray_agent_trainer_runs_initial_validation_for_val_only_even_when_disabled_by_default(self) -> None:
+        trainer = RayAgentTrainer.__new__(RayAgentTrainer)
+        trainer.config = OmegaConf.create({"trainer": {"val_before_train": False, "val_only": True}})
+        trainer.val_reward_fn = object()
+
+        self.assertTrue(trainer._should_run_initial_validation())
+
+        trainer.val_reward_fn = None
+        self.assertFalse(trainer._should_run_initial_validation())
+
+    def test_reward_manager_merges_reward_extra_keys_into_extra_info(self) -> None:
+        captured = {}
+
+        def _compute_score(**kwargs):
+            captured.update(kwargs.get("extra_info", {}))
+            return {"score": 0.1}
+
+        manager = NaiveRewardManager(
+            config=OmegaConf.create({}),
+            tokenizer=_Tokenizer(),
+            compute_score=_compute_score,
+        )
+
+        batch = DataProto.from_dict(
+            tensors={
+                "responses": torch.tensor([[31, 32, 33]], dtype=torch.long),
+                "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+            },
+            non_tensors={
+                "reward_model": np.array(
+                    [{"ground_truth": "2016-01-01 00:00:00 1.0", "style": "rule"}],
+                    dtype=object,
+                ),
+                "data_source": np.array(["ETTh1"], dtype=object),
+                "prediction_call_count": np.array([1], dtype=object),
+                "turn_stage": np.array(["refinement"], dtype=object),
+            },
+            meta_info={"reward_extra_keys": ["prediction_call_count", "turn_stage"]},
+        )
+
+        result = asyncio.run(manager.run_single(batch))
+
+        self.assertEqual(result["reward_score"], 0.1)
+        self.assertEqual(captured["prediction_call_count"], 1)
+        self.assertEqual(captured["turn_stage"], "refinement")
+
+    def test_turn3_generation_debug_uses_unified_chain_debug_file_only(self) -> None:
+        previous_chain_debug = os.environ.get("TS_CHAIN_DEBUG")
+        previous_chain_file = os.environ.get("TS_CHAIN_DEBUG_FILE")
+        previous_legacy_file = os.environ.get("TS_TURN3_DEBUG_FILE")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            chain_file = os.path.join(tmp_dir, "ts_chain_debug_smoke.jsonl")
+            legacy_file = os.path.join(tmp_dir, "turn3_generation_debug_legacy.jsonl")
+            os.environ["TS_CHAIN_DEBUG"] = "1"
+            os.environ["TS_CHAIN_DEBUG_FILE"] = chain_file
+            os.environ["TS_TURN3_DEBUG_FILE"] = legacy_file
+            try:
+                append_turn3_generation_debug(
+                    data_source="ETTh1",
+                    solution_str="<answer>\n1.0000\n</answer>",
+                    ground_truth="1.0000",
+                    sample_uid="sample-0",
+                    output_source="patchtst",
+                    format_score=-1.0,
+                    length_score=0.0,
+                    length_penalty=0.0,
+                    mse_score=0.0,
+                    change_point_score=0.0,
+                    season_trend_score=0.0,
+                    final_score=0.0,
+                    orig_mse=0.0,
+                    orig_mae=0.0,
+                    norm_mse=0.0,
+                    norm_mae=0.0,
+                    raw_mse=0.0,
+                    raw_mae=0.0,
+                    length_hard_fail=False,
+                    strict_length_match=True,
+                    format_parse_mode="strict_protocol",
+                    raw_protocol_reject_reason="",
+                    was_recovered=False,
+                    format_failure_reason="ok",
+                    has_answer_tag=True,
+                    has_answer_open=True,
+                    has_answer_close=True,
+                    pred_values=[1.0],
+                    gt_values=[1.0],
+                )
+            finally:
+                if previous_chain_debug is None:
+                    os.environ.pop("TS_CHAIN_DEBUG", None)
+                else:
+                    os.environ["TS_CHAIN_DEBUG"] = previous_chain_debug
+                if previous_chain_file is None:
+                    os.environ.pop("TS_CHAIN_DEBUG_FILE", None)
+                else:
+                    os.environ["TS_CHAIN_DEBUG_FILE"] = previous_chain_file
+                if previous_legacy_file is None:
+                    os.environ.pop("TS_TURN3_DEBUG_FILE", None)
+                else:
+                    os.environ["TS_TURN3_DEBUG_FILE"] = previous_legacy_file
+
+            self.assertTrue(os.path.exists(chain_file))
+            self.assertFalse(os.path.exists(legacy_file))
+
+            with open(chain_file, "r", encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+
+            self.assertEqual(rows[-1]["stage"], "turn3_generation_debug")
+            self.assertEqual(rows[-1]["sample_uid"], "sample-0")
+
     def test_min_eval_debug_writer_emits_extended_metrics(self) -> None:
         trainer = RayAgentTrainer.__new__(RayAgentTrainer)
         trainer.global_steps = 20
@@ -111,6 +231,7 @@ class TestValidationRewardManager(unittest.TestCase):
             "trainer_seq_score": [0.7, -1.0, -0.55],
             "selected_model": ["itransformer", "itransformer", "chronos2"],
             "generation_stop_reason": ["stop", "length", "stop"],
+            "generation_finish_reason": ["stop", "length", "stop"],
             "selected_forecast_orig_mse": [0.2, 0.8, 1.7],
             "selected_forecast_len_match": [True, False, True],
             "selected_forecast_exact_copy": [True, False, False],
@@ -129,7 +250,11 @@ class TestValidationRewardManager(unittest.TestCase):
             "required_feature_tool_count": [3, 3, 2],
             "missing_required_feature_tool_count": [0, 2, 0],
             "prediction_call_count": [1, 1, 1],
+            "prediction_step_index": [2, 0, 2],
+            "final_answer_step_index": [3, 0, 3],
+            "required_step_budget": [5, 6, 5],
             "tool_call_count": [4, 0, 3],
+            "response_token_len": [100, 1024, 99],
             "history_analysis_count": [3, 0, 2],
             "illegal_turn3_tool_call_count": [0, 0, 1],
             "prediction_requested_model": ["itransformer", "__missing__", "chronos2"],
@@ -201,7 +326,9 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertAlmostEqual(agg_row["feature_tool_count_mean"], 2.0, places=6)
             self.assertAlmostEqual(agg_row["required_feature_tool_count_mean"], 8.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["missing_required_feature_tool_count_mean"], 2.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["required_step_budget_mean"], 16.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["tool_call_count_mean"], 7.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["response_token_len_mean"], 407.6666666666667, places=6)
             self.assertAlmostEqual(agg_row["history_analysis_count_mean"], 5.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["no_tool_call_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["no_history_analysis_ratio"], 1.0 / 3.0, places=6)
@@ -227,6 +354,7 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertEqual(agg_row["workflow_status_distribution"], {"accepted": 1, "not_attempted": 1, "rejected": 1})
             self.assertEqual(agg_row["format_failure_reason_distribution"]["missing_answer_close_tag"], 1)
             self.assertEqual(agg_row["generation_stop_reason_distribution"], {"length": 1, "stop": 2})
+            self.assertEqual(agg_row["generation_finish_reason_distribution"], {"length": 1, "stop": 2})
             self.assertEqual(
                 agg_row["final_answer_reject_reason_distribution"]["invalid_answer_shape:lines=95,expected=96"],
                 1,
@@ -239,14 +367,19 @@ class TestValidationRewardManager(unittest.TestCase):
                 row for row in sample_rows if row["category"] == "near_miss_94_95" and row["sample_id"] == "sample-2"
             )
             self.assertEqual(near_miss_row["generation_stop_reason"], "stop")
+            self.assertEqual(near_miss_row["generation_finish_reason"], "stop")
             self.assertEqual(near_miss_row["prediction_requested_model"], "chronos2")
             self.assertTrue(near_miss_row["refinement_changed"])
             self.assertTrue(near_miss_row["selected_forecast_len_match"])
             self.assertFalse(near_miss_row["selected_forecast_exact_copy"])
             self.assertEqual(near_miss_row["refinement_changed_value_count"], 3)
             self.assertEqual(near_miss_row["refinement_first_changed_index"], 72)
+            self.assertEqual(near_miss_row["required_step_budget"], 5)
             self.assertEqual(near_miss_row["tool_call_count"], 3)
+            self.assertEqual(near_miss_row["response_token_len"], 99)
             self.assertEqual(near_miss_row["history_analysis_count"], 2)
+            self.assertEqual(near_miss_row["prediction_step_index"], 2)
+            self.assertEqual(near_miss_row["final_answer_step_index"], 3)
             self.assertEqual(near_miss_row["required_feature_tool_count"], 2)
             self.assertEqual(near_miss_row["missing_required_feature_tool_count"], 0)
             self.assertEqual(

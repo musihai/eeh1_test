@@ -1,29 +1,35 @@
-# Cast-R1-TS（ETTh1 单变量 `OT`）
+# Cast-R1-TS
 
-当前仓库的推荐主线是：
+当前仓库已经清理到一条新的正式复现实验主线，只保留原始 `ETTh1.csv` 和代码。
 
-`工具服务 -> 基础 RL jsonl -> 第一轮 teacher eval -> curriculum RL jsonl -> 第二轮 teacher200 -> SFT -> RL`
+截至 `2026-03-23`，这条主线已经实际跑通到：
 
-## 先说结论
+- 基础 RL 数据重建完成
+- teacher-curated 数据重建完成
+- curriculum RL 数据重建完成
+- step-wise SFT 数据重建完成
+- 正式 SFT 完成，checkpoint: `artifacts/checkpoints/sft/time_series_forecast_sft_paper_strict_formal_20260323/global_step_33/huggingface`
+- RL `val_only` 完成，debug 目录: `logs/debug/diag_paper_strict_formal_20260323_valonly/`
 
-这轮修复之后，不需要强制重跑整个流程。
+## 正式实验命名
 
-当前推荐最小重跑范围：
+本轮正式实验统一使用：
 
-1. 重新跑 Step 5：第二轮 teacher200，生成新的 `same3` parquet
-2. 重新跑 Step 6：SFT
-3. 重新跑 Step 7 / Step 8：RL
+- rerun tag: `paper_strict_formal_20260323`
+- SFT project: `TimeSeriesForecast-SFT-Formal`
+- SFT experiment: `qwen3-1.7b-etth1-ot-sft-paper-strict-formal-20260323`
+- SFT save dir: `artifacts/checkpoints/sft/time_series_forecast_sft_paper_strict_formal_20260323/`
+- RL project: `TimeSeriesForecast-Formal`
+- RL experiment: `etth1_ot_qwen3_1_7b_rl_paper_strict_formal_20260323`
 
-一般不需要重跑 Step 2 到 Step 4，原因是：
+当前 profile 默认已经切到这套命名：
 
-- 这次最关键的修复集中在 `teacher200 -> SFT -> RL` 这一段
-- `ETTh1.csv` 本身带真实时间戳，所以固定 synthetic timestamp anchor 不会改变这条主线的数据
-- `SFT_DATASET_DIR` 路径约束是 launcher 行为修复，不影响已经生成好的 RL jsonl
+- [examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh](/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh)
 
-只有在下面两种情况下，才建议从 Step 2 全部重跑：
+注意：
 
-- 你怀疑当前 `dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/` 本身就不是用正确 teacher metadata 构建出来的
-- 你想做一套完全干净、从头一致的新产物
+- `RL_MODEL_PATH` 不再默认指向旧 SFT checkpoint
+- 正式 RL 启动前必须显式 export 新的 SFT `huggingface` checkpoint 路径
 
 ## 环境
 
@@ -33,41 +39,29 @@ conda activate cast-r1-ts
 export PYTHONPATH=$PWD:$PYTHONPATH
 ```
 
-如果当前 shell 不能直接 `conda activate`，下面所有命令都可以改成 `conda run -n cast-r1-ts ...`。
+说明：
 
-统一 profile：
+- 下文所有 `python` / `ray` / launcher 命令都默认在 `cast-r1-ts` 环境内执行
+- `run_qwen3-1.7B_sft.sh` 和 `run_qwen3-1.7B.sh` 内部会直接调用 `python3` / `ray`，所以不要在系统环境里直接跑
 
-```bash
-examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
-```
+## 当前仓库状态
 
-## 现在的关键约束
+这轮 clean rerun 开始前，已经删除：
 
-- `run_qwen3-1.7B_sft.sh` 不再猜数据集路径
-- 跑 SFT 时必须显式设置 `SFT_DATASET_DIR`
-- `SFT_DATASET_DIR` 对应目录里必须有 `train.parquet`、`val.parquet`、`metadata.json`
-- `build_etth1_high_quality_sft.py` 现在默认 `Turn 3` 标注出错就直接失败，不再静默降级混入 parquet
-- RL 启动前建议先 `ray stop --force`
+- 旧生成数据集
+- 旧 SFT / RL checkpoints
+- 旧 debug 日志
+- 非主线旧脚本 `build_etth1_sft_subset.py`
+- 非主线旧脚本 `retrain_expert_models_train_split.py`
 
-## Step 1. 启动工具服务
+保留项只有：
 
-如果后面要跑 RL，单独开一个终端执行：
+- 原始数据：`dataset/ETT-small/ETTh1.csv`
+- 主线代码与测试
 
-```bash
-PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh \
-bash recipe/time_series_forecast/start_model_server.sh 3 8994
-```
+## 正式流程
 
-检查：
-
-```bash
-curl http://127.0.0.1:8994/health
-curl http://127.0.0.1:8994/models
-```
-
-## Step 2 到 Step 4. 只有需要全量重建时才跑
-
-### Step 2. 生成基础 RL jsonl
+### Step 1. 重建基础 RL 数据
 
 ```bash
 python recipe/time_series_forecast/build_etth1_rl_dataset.py \
@@ -81,7 +75,14 @@ python recipe/time_series_forecast/build_etth1_rl_dataset.py \
   --test-rows 3256
 ```
 
-### Step 3. 第一轮 teacher eval
+核对项：
+
+- `train / val / test` 行数应为 `12060 / 1722 / 3065`
+- `metadata.json` 的 `pipeline_stage` 应为 `base_rl`
+- `raw_prompt` 必须包含 3-stage workflow 指令
+- `ground_truth` 必须是带真实时间戳的 96 行序列
+
+### Step 2. 重建 teacher-curated 数据
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1,2,3 \
@@ -96,9 +97,11 @@ python recipe/time_series_forecast/build_etth1_high_quality_sft.py \
   --train-candidate-samples 600 \
   --val-candidate-samples 192 \
   --test-candidate-samples 256 \
+  --train-min-local-refine-ratio 0.0 \
   --models patchtst,chronos2,itransformer,arima \
   --predictor-mode local \
   --predictor-device cuda \
+  --predictor-devices cuda:0,cuda:1,cuda:2,cuda:3 \
   --num-workers 4 \
   --local-batch-size 256 \
   --resume-teacher-eval \
@@ -107,7 +110,15 @@ python recipe/time_series_forecast/build_etth1_high_quality_sft.py \
   --max-concurrency 4
 ```
 
-### Step 4. 用 teacher metadata 重建 curriculum RL jsonl
+核对项：
+
+- 产物目录：`dataset/ett_sft_etth1_runtime_teacher200_paper_same2/`
+- `train_curated.jsonl / val_curated.jsonl / test_curated.jsonl` 数量应为 `200 / 64 / 128`
+- `metadata.json` 的 `pipeline_stage` 应为 `teacher200_runtime_sft`
+- `turn3_annotation_error_count` 和 `turn3_annotation_error_ratio` 必须为 `0`
+- 当前主线是 `paper_strict`，所以 `local_refine` 不应再被当作默认目标分布
+
+### Step 3. 用 teacher metadata 重建 curriculum RL 数据
 
 ```bash
 python recipe/time_series_forecast/build_etth1_rl_dataset.py \
@@ -124,224 +135,146 @@ python recipe/time_series_forecast/build_etth1_rl_dataset.py \
   --test-teacher-metadata-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/test_teacher_eval.jsonl
 ```
 
-## 推荐现在直接从这里开始
+核对项：
 
-### Step 5. 第二轮 teacher200
+- `metadata.json` 的 `pipeline_stage` 应为 `curriculum_rl`
+- `teacher_metadata_coverage_ratio` 应接近 `1.0`
+- `train_stage1 / train_stage12 / train_stage123` 应正常生成
 
-这一步现在必须重跑。
+### Step 4. 重建 step-wise SFT 数据
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-python recipe/time_series_forecast/build_etth1_high_quality_sft.py \
-  --train-jsonl dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train.jsonl \
-  --val-jsonl dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/val.jsonl \
-  --test-jsonl dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/test.jsonl \
-  --output-dir dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same3 \
-  --train-target-samples 200 \
-  --val-target-samples 64 \
-  --test-target-samples 128 \
-  --train-candidate-samples 600 \
-  --val-candidate-samples 192 \
-  --test-candidate-samples 256 \
-  --models patchtst,chronos2,itransformer,arima \
-  --predictor-mode local \
-  --predictor-device cuda \
-  --train-eval-samples 600 \
-  --val-eval-samples 192 \
-  --test-eval-samples 256 \
-  --train-min-local-refine-ratio 0.30 \
-  --num-workers 4 \
-  --local-batch-size 256 \
-  --resume-teacher-eval \
-  --max-turn3-annotation-error-count 0 \
-  --max-turn3-annotation-error-ratio 0.0 \
-  --max-concurrency 4
+python recipe/time_series_forecast/build_etth1_sft_dataset.py \
+  --train-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/train_curated.jsonl \
+  --val-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/val_curated.jsonl \
+  --test-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/test_curated.jsonl \
+  --output-dir dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise \
+  --turn3-target-mode paper_strict \
+  --train-min-local-refine-ratio 0.0
 ```
 
-跑完至少检查这几项：
+核对项：
 
-- `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same3/train.parquet`
-- `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same3/val.parquet`
-- `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same3/metadata.json`
-- `metadata.json` 里的 `train_turn3_annotation_error_count=0`
-- `metadata.json` 里的 `train_turn3_annotation_error_ratio=0.0`
+- refinement 行必须记录 `turn3_target_mode = paper_strict`
+- refinement 行必须记录 `turn3_target_type = validated_keep`
+- `refine_ops_signature` 应为 `none`
+- `turn3_protocol_valid_ratio` 应为 `1.0`
 
-如果这里失败并且生成了 `*_turn3_annotation_errors.jsonl`，先修这个，不要继续往下跑。
-
-### Step 6. 跑 SFT
-
-这一步现在必须重跑。
+### Step 5. 跑正式 SFT
 
 ```bash
-cd /data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main
-conda activate cast-r1-ts
-export PYTHONPATH=$PWD:$PYTHONPATH
-
+export PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
+export RUN_MODE=train
+export CUDA_VISIBLE_DEVICES=0,1,2
 export MODEL_PATH=/data/linyujie/models/Qwen3-1.7B
-export SAVE_DIR=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same3
-export EXPERIMENT_NAME=time_series_forecast_sft_teacher200_paper_same3
-export PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
-export RUN_MODE=train
-export SFT_DATASET_DIR=$PWD/dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same3
+export SFT_DATASET_DIR=$PWD/dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise
 
-PRINT_CMD_ONLY=1 bash examples/time_series_forecast/run_qwen3-1.7B_sft.sh \
-  trainer.resume_mode=disable
-
-unset PRINT_CMD_ONLY
-
-bash examples/time_series_forecast/run_qwen3-1.7B_sft.sh \
-  trainer.resume_mode=disable
+bash examples/time_series_forecast/run_qwen3-1.7B_sft.sh
 ```
 
-先确认打印出来的是：
+默认命名：
 
-- `train.parquet` 和 `val.parquet` 都来自 `ett_sft_etth1_runtime_ot_teacher200_paper_same3`
-- `trainer.default_local_dir` 指向 `time_series_forecast_sft_teacher200_paper_same3`
+- save dir: `artifacts/checkpoints/sft/time_series_forecast_sft_paper_strict_formal_20260323/`
+- experiment: `qwen3-1.7b-etth1-ot-sft-paper-strict-formal-20260323`
 
-SFT 输出目录：
+核对项：
+
+- `trainer.default_local_dir` 必须写到新的 formal SFT 目录
+- `train.parquet / val.parquet` 必须来自 `same4_stepwise`
+- 保存出的 checkpoint 必须包含 `hf_model`
+
+本轮实际结果：
+
+- checkpoint tracker: `artifacts/checkpoints/sft/time_series_forecast_sft_paper_strict_formal_20260323/latest_checkpointed_iteration.txt = 33`
+- 最新 checkpoint: `artifacts/checkpoints/sft/time_series_forecast_sft_paper_strict_formal_20260323/global_step_33/`
+- 最终 `val/loss = 0.0018108173971995711`
+
+### Step 6. 先跑 RL val-only 检查
+
+先找到最新 SFT checkpoint 的 `huggingface` 路径，然后显式设置：
 
 ```bash
-artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same3/
+export RL_MODEL_PATH=/abs/path/to/latest/huggingface
 ```
 
-RL 用的模型路径必须指向：
+再跑：
 
 ```bash
-artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same3/<global_step_x>/huggingface
-```
-
-### Step 7. RL smoke
-
-这一步建议先跑。
-
-```bash
-cd /data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main
-conda activate cast-r1-ts
-export PYTHONPATH=$PWD:$PYTHONPATH
-
-unset PYTORCH_CUDA_ALLOC_CONF
 ray stop --force
 
-unset EXP_NAME TRAIN_FILES VAL_FILES MODEL_PATH RL_EXP_NAME
-
+export RUN_MODE=smoke
+export PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
+export CUDA_VISIBLE_DEVICES=0,1,2
 export DEBUG_CHAIN=1
-export TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_smoke.jsonl
-export RL_TRAIN_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train.jsonl
-export RL_VAL_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/val.jsonl
-export RL_TEMPERATURE=0.3
-export RL_ROLLOUT_GPU_MEMORY_UTILIZATION=0.22
-export RL_ROLLOUT_MAX_MODEL_LEN=8192
-export RL_ROLLOUT_MAX_BATCHED_TOKENS=4096
-export RL_ROLLOUT_N=1
-export RL_MAX_RESPONSE_LENGTH=3072
-export RL_ACTOR_MAX_TOKEN_LEN_PER_GPU=6144
-export MODEL_PATH=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same3/global_step_6/huggingface
-export PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
-export RUN_MODE=train
-export RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_smoke_paper_same3
-
-PRINT_CMD_ONLY=1 bash examples/time_series_forecast/run_qwen3-1.7B.sh \
-  trainer.total_training_steps=20 \
-  trainer.test_freq=5 \
-  trainer.resume_mode=disable \
-  trainer.log_val_generations=0
-
-unset PRINT_CMD_ONLY
+export TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/diag_paper_strict_formal_20260323_valonly/ts_chain_debug_smoke.jsonl
+export TS_MIN_EVAL_AGG_FILE=$PWD/logs/debug/diag_paper_strict_formal_20260323_valonly/eval_step_aggregate.jsonl
+export TS_MIN_EVAL_SAMPLE_FILE=$PWD/logs/debug/diag_paper_strict_formal_20260323_valonly/eval_step_samples.jsonl
 
 bash examples/time_series_forecast/run_qwen3-1.7B.sh \
-  trainer.total_training_steps=20 \
-  trainer.test_freq=5 \
-  trainer.resume_mode=disable \
-  trainer.log_val_generations=0
+  trainer.val_before_train=True \
+  trainer.val_only=True
 ```
 
-先确认：
+核对项：
 
-- `data.train_files=...train.jsonl`
-- `data.val_files=...val.jsonl`
-- `actor_rollout_ref.model.path=.../huggingface`
+- `final_answer_accept_ratio`
+- `strict_length_match_ratio`
+- `required_step_budget_mean`
+- `prediction_step_index`
+- `final_answer_step_index`
+- `generation_finish_reason_distribution`
 
-不要假设一定是 `global_step_6`。先看：
+本轮实际结果：
+
+- `final_answer_accept_ratio = 1.0`
+- `strict_length_match_ratio = 1.0`
+- `required_step_budget_mean = 4.0`
+- `prediction_step_index = 2.0`
+- `final_answer_step_index = 3.0`
+- `generation_finish_reason_distribution = {"stop": 1}`
+- `selected_forecast_exact_copy_ratio = 1.0`
+
+### Step 7. 跑正式 curriculum RL
 
 ```bash
-cat artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same3/latest_checkpointed_iteration.txt
-```
-
-然后把上面命令里的 step 改成真实值。
-
-### Step 8. RL 正式训练
-
-smoke 正常后再跑。
-
-```bash
-cd /data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main
-conda activate cast-r1-ts
-export PYTHONPATH=$PWD:$PYTHONPATH
-
-unset PYTORCH_CUDA_ALLOC_CONF
 ray stop --force
 
-unset EXP_NAME TRAIN_FILES VAL_FILES MODEL_PATH RL_EXP_NAME
-
-export DEBUG_CHAIN=0
-export TS_CHAIN_DEBUG_FILE=$PWD/logs/debug/ts_chain_debug_eval20_paper_same3.jsonl
-export RL_TRAIN_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/train_stage123.jsonl
-export RL_VAL_FILES=$PWD/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/val.jsonl
-export RL_TEMPERATURE=0.3
-export RL_ROLLOUT_GPU_MEMORY_UTILIZATION=0.22
-export RL_ROLLOUT_MAX_MODEL_LEN=8192
-export RL_ROLLOUT_MAX_BATCHED_TOKENS=4096
-export RL_ROLLOUT_N=1
-export RL_MAX_RESPONSE_LENGTH=3072
-export RL_ACTOR_MAX_TOKEN_LEN_PER_GPU=6144
-export MODEL_PATH=$PWD/artifacts/checkpoints/sft/time_series_forecast_sft_teacher200_paper_same3/global_step_6/huggingface
-export PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
 export RUN_MODE=train
-export RL_EXP_NAME=etth1_ot_qwen3_1_7b_rl_paper_same3
+export PROFILE_PATH=examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh
+export CUDA_VISIBLE_DEVICES=0,1,2
+export RL_MODEL_PATH=/abs/path/to/latest/huggingface
 
-PRINT_CMD_ONLY=1 bash examples/time_series_forecast/run_qwen3-1.7B.sh \
-  trainer.total_training_steps=120 \
-  trainer.test_freq=20 \
-  trainer.save_freq=40 \
-  trainer.resume_mode=disable \
-  trainer.log_val_generations=0
-
-unset PRINT_CMD_ONLY
-
-bash examples/time_series_forecast/run_qwen3-1.7B.sh \
-  trainer.total_training_steps=120 \
-  trainer.test_freq=20 \
-  trainer.save_freq=40 \
-  trainer.resume_mode=disable \
-  trainer.log_val_generations=0
+bash examples/time_series_forecast/run_qwen3-1.7B_curriculum.sh
 ```
 
-## 当前最值得看什么
+默认命名：
 
-关键日志：
+- RL project: `TimeSeriesForecast-Formal`
+- RL experiment: `etth1_ot_qwen3_1_7b_rl_paper_strict_formal_20260323`
 
-- `logs/debug/eval_step_aggregate.jsonl`
-- `logs/debug/eval_step_samples.jsonl`
-- `$TS_CHAIN_DEBUG_FILE`
-- `debug_logs/final_launch_cmd.txt`
+执行逻辑：
 
-RL smoke / 正式训练时优先看：
+- `stage1`: `train_stage1.jsonl`
+- `stage12`: `train_stage12.jsonl`
+- `stage123`: `train_stage123.jsonl`
+- 每个 phase 会把上一 phase 最新 `actor/huggingface` checkpoint 作为下一 phase 初始化
 
-- `workflow_status`
-- `final_answer_parse_mode`
-- `final_answer_reject_reason`
-- `tool_call_count`
-- `tool_call_sequence`
+注意：
 
-如果 `workflow_status` 长期是 `not_attempted`，或者 `refinement` 轮还在继续调工具，先不要分析预测精度，先修协议和轨迹。
+- 对 `curriculum_rl` 数据集，正式 `train` 模式不再允许直接用根目录 `train.jsonl`
+- 如果你直接跑 `run_qwen3-1.7B.sh` 且没有显式设置 `RL_CURRICULUM_PHASE`，脚本会拒绝启动，避免再次绕开 curriculum
 
-## 当前最重要的目录
+## 当前必须保留的主线代码
 
-- 原始数据：`dataset/ETT-small/ETTh1.csv`
-- 基础 RL 数据：`dataset/ett_rl_etth1_paper_same2/`
-- curriculum RL 数据：`dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2/`
-- 第一轮 teacher200：`dataset/ett_sft_etth1_runtime_teacher200_paper_same2/`
-- 推荐正式 teacher200：`dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same3/`
-- SFT checkpoint：`artifacts/checkpoints/sft/`
-- RL checkpoint：`artifacts/checkpoints/rl/`
-- 调试日志：`logs/debug/`
+- `recipe/time_series_forecast/build_etth1_rl_dataset.py`
+- `recipe/time_series_forecast/build_etth1_high_quality_sft.py`
+- `recipe/time_series_forecast/build_etth1_sft_dataset.py`
+- `recipe/time_series_forecast/time_series_forecast_agent_flow.py`
+- `recipe/time_series_forecast/prompts.py`
+- `recipe/time_series_forecast/reward.py`
+- `recipe/time_series_forecast/model_server.py`
+- `recipe/time_series_forecast/task_protocol.py`
+- `recipe/time_series_forecast/dataset_identity.py`
+- `examples/time_series_forecast/run_qwen3-1.7B_sft.sh`
+- `examples/time_series_forecast/run_qwen3-1.7B.sh`
+- `examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh`

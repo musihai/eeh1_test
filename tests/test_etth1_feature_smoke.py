@@ -34,7 +34,7 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
             "Requirements:\n"
             "1) Extract feature evidence before selecting a forecasting model.\n"
             "2) Choose one model from the enabled experts and then predict.\n"
-            "3) Follow the required output protocol with <answer> only.\n"
+            "3) Follow the required output protocol with <think>...</think><answer>...</answer>.\n"
             "Historical Data:\n"
             + "\n".join(lines)
         )

@@ -68,3 +68,23 @@ def select_feature_tool_names(values: list[float]) -> list[str]:
         selected_tool_names.add(fallback_tool)
 
     return [name for name in FEATURE_TOOL_ORDER if name in selected_tool_names]
+
+
+def plan_diagnostic_tool_batches(
+    required_tool_names: list[str] | tuple[str, ...],
+    *,
+    max_parallel_calls: int = 5,
+) -> list[list[str]]:
+    required = [name for name in FEATURE_TOOL_ORDER if name in set(required_tool_names or [])]
+    if not required:
+        required = ["extract_basic_statistics"]
+
+    batch_cap = max(1, int(max_parallel_calls or 1))
+    batches: list[list[str]] = []
+    remaining = list(required)
+
+    while remaining:
+        batches.append(remaining[:batch_cap])
+        remaining = remaining[batch_cap:]
+
+    return [batch for batch in batches if batch]

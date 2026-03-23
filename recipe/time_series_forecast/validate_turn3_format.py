@@ -21,12 +21,40 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def get_last_assistant_content(record: dict[str, Any]) -> str:
     messages = record.get("messages", [])
+    if isinstance(messages, tuple):
+        messages = list(messages)
+    elif hasattr(messages, "tolist") and not isinstance(messages, list):
+        try:
+            messages = messages.tolist()
+        except Exception:
+            messages = []
+    if not isinstance(messages, list):
+        messages = []
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
             content = msg["content"].strip()
             if content:
                 return content
     return ""
+
+
+def record_requires_paper_turn3_protocol(record: dict[str, Any]) -> bool:
+    explicit = record.get("paper_turn3_required")
+    if explicit is not None:
+        if isinstance(explicit, bool):
+            return explicit
+        if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+            return bool(int(explicit))
+        text = str(explicit).strip().lower()
+        if text in {"1", "true", "yes", "y"}:
+            return True
+        if text in {"0", "false", "no", "n"}:
+            return False
+
+    turn_stage = str(record.get("turn_stage", "") or "").strip().lower()
+    if turn_stage:
+        return turn_stage == "refinement"
+    return True
 
 
 def extract_candidate_answer_text(record: dict[str, Any]) -> tuple[str, str]:
@@ -50,10 +78,15 @@ def extract_candidate_answer_text(record: dict[str, Any]) -> tuple[str, str]:
     return "", "none"
 
 
-def check_answer_format(text: str, expected_len: int = 96) -> tuple[bool, str, int]:
+def check_answer_format(
+    text: str,
+    expected_len: int = 96,
+    *,
+    allow_recovery: bool = False,
+) -> tuple[bool, str, int]:
     if not text:
         return False, "empty_assistant_content", 0
-    answer_text, _, reject_reason = parse_final_answer_protocol(text, expected_len, allow_recovery=True)
+    answer_text, _, reject_reason = parse_final_answer_protocol(text, expected_len, allow_recovery=allow_recovery)
     if answer_text is None:
         values = extract_values_from_time_series_string(text)
         return False, reject_reason or "unknown_format_failure", len(values)
@@ -64,6 +97,38 @@ def check_answer_format(text: str, expected_len: int = 96) -> tuple[bool, str, i
         return False, f"length_mismatch:{pred_len}!={expected_len}", pred_len
 
     return True, "ok", pred_len
+
+
+def check_paper_turn3_protocol(text: str, expected_len: int = 96) -> tuple[bool, str, int]:
+    """Validate the strict paper-aligned Turn-3 protocol.
+
+    The paper protocol requires exactly one `<think>...</think>` block followed by
+    exactly one `<answer>...</answer>` block, with the answer containing the
+    expected number of numeric forecast lines.
+    """
+    if not text:
+        return False, "empty_assistant_content", 0
+
+    answer_text, _, reject_reason = parse_final_answer_protocol(text, expected_len, allow_recovery=False)
+    if answer_text is None:
+        values = extract_values_from_time_series_string(text)
+        return False, reject_reason or "unknown_format_failure", len(values)
+
+    values = extract_values_from_time_series_string(answer_text)
+    pred_len = len(values)
+    if pred_len != expected_len:
+        return False, f"length_mismatch:{pred_len}!={expected_len}", pred_len
+
+    return True, "ok", pred_len
+
+
+def check_record_format(record: dict[str, Any], expected_len: int = 96) -> tuple[bool, str, str, int, str]:
+    content, source = extract_candidate_answer_text(record)
+    if record_requires_paper_turn3_protocol(record):
+        ok, reason, pred_len = check_paper_turn3_protocol(content, expected_len=expected_len)
+    else:
+        ok, reason, pred_len = check_answer_format(content, expected_len=expected_len, allow_recovery=True)
+    return ok, source, reason, pred_len, content
 
 
 def main() -> None:
@@ -82,23 +147,32 @@ def main() -> None:
     invalid: list[tuple[int, str, int, str, str]] = []
     valid_records: list[dict[str, Any]] = []
     source_count: dict[str, int] = {}
+    checked_count = 0
+    skipped_count = 0
 
     for idx, rec in enumerate(records):
-        content, source = extract_candidate_answer_text(rec)
+        if not record_requires_paper_turn3_protocol(rec):
+            skipped_count += 1
+            valid_records.append(rec)
+            continue
+        checked_count += 1
+        ok, source, reason, pred_len, content = check_record_format(rec, expected_len=args.expected_len)
         source_count[source] = source_count.get(source, 0) + 1
-        ok, reason, pred_len = check_answer_format(content, expected_len=args.expected_len)
         if ok:
             valid_records.append(rec)
         else:
             invalid.append((idx, source, reason, pred_len, content[:500]))
 
     total = len(records)
-    valid = len(valid_records)
+    valid = checked_count - len(invalid)
     invalid_n = len(invalid)
-    valid_ratio = (valid / total * 100.0) if total > 0 else 0.0
+    valid_ratio = (valid / checked_count * 100.0) if checked_count > 0 else 0.0
 
     print(f"input={input_path}")
-    print(f"total={total} valid={valid} invalid={invalid_n} valid_ratio={valid_ratio:.2f}%")
+    print(
+        f"total={total} checked={checked_count} skipped={skipped_count} "
+        f"valid={valid} invalid={invalid_n} valid_ratio={valid_ratio:.2f}%"
+    )
     print(f"source_count={source_count}")
 
     if invalid:

@@ -18,20 +18,6 @@ ENABLE_SEASON_TREND_SCORE = True
 TURN3_SUCCESS_SAMPLE_RATE = max(int(os.getenv("TS_TURN3_SUCCESS_SAMPLE_RATE", "100") or 100), 1)
 
 
-def turn3_generation_debug_file() -> str:
-    override = os.getenv("TS_TURN3_DEBUG_FILE", "").strip()
-    if override:
-        return override
-
-    chain_file = os.getenv("TS_CHAIN_DEBUG_FILE", "/tmp/ts_chain_debug.jsonl")
-    chain_dir = os.path.dirname(chain_file) or "."
-    chain_name = os.path.basename(chain_file)
-    if chain_name.startswith("ts_chain_debug"):
-        suffix = chain_name[len("ts_chain_debug"):]
-        return os.path.join(chain_dir, f"turn3_generation_debug{suffix}")
-    return os.path.join(chain_dir, "turn3_generation_debug.jsonl")
-
-
 def append_turn3_generation_debug(
     *,
     data_source: str,
@@ -136,7 +122,6 @@ def append_turn3_generation_debug(
         "trailing_text_after_close_len": int(len(trailing_after_close)),
         "trailing_text_after_close_head": short_text(trailing_after_close, 200),
         "raw_text_tail": extract_tail_lines(raw_text, 10),
-        "_debug_file": turn3_generation_debug_file(),
     }
 
     if is_failure:
@@ -335,22 +320,28 @@ def extract_strict_protocol_answer(solution_str: Optional[str], expected_len: in
     if solution_str is None:
         return None, "empty_solution"
 
+    if "<think>" in solution_str and "</think>" not in solution_str:
+        return None, "missing_think_close_tag"
+    if "</think>" in solution_str and "<think>" not in solution_str:
+        return None, "missing_think_open_tag"
     if "<answer>" in solution_str and "</answer>" not in solution_str:
         return None, "missing_answer_close_tag"
     if "</answer>" in solution_str and "<answer>" not in solution_str:
         return None, "missing_answer_open_tag"
     if "<answer>" not in solution_str and "</answer>" not in solution_str:
         return None, "missing_answer_block"
+    if "<think>" not in solution_str and "</think>" not in solution_str:
+        return None, "missing_think_block"
 
     protocol_match = re.fullmatch(
-        r"\s*(?:<think>.*?</think>\s*)?<answer>(.*?)</answer>\s*",
+        r"\s*<think>(.*?)</think>\s*<answer>(.*?)</answer>\s*",
         solution_str,
         re.DOTALL,
     )
     if not protocol_match:
         return None, "extra_text_outside_tags"
 
-    candidate = protocol_match.group(1).strip()
+    candidate = protocol_match.group(2).strip()
     if looks_like_forecast_answer(candidate, expected_len):
         return candidate, None
     return None, infer_answer_shape_failure(candidate, expected_len)
@@ -402,7 +393,7 @@ def parse_final_answer_protocol(
     solution_str: Optional[str],
     expected_len: int,
     *,
-    allow_recovery: bool = True,
+    allow_recovery: bool = False,
 ) -> Tuple[Optional[str], str, Optional[str]]:
     strict_answer, reject_reason = extract_strict_protocol_answer(solution_str, expected_len)
     if strict_answer is not None:
@@ -595,7 +586,12 @@ def normalize_for_reward(x_list: List[float], y_list: List[float]) -> Tuple[List
     return x_result.tolist(), y_result.tolist()
 
 
-def compute_format_score(solution_str: str, expected_len: Optional[int] = None) -> float:
+def compute_format_score(
+    solution_str: str,
+    expected_len: Optional[int] = None,
+    *,
+    allow_recovery: bool = False,
+) -> float:
     """
     Check if the solution follows the required format with <answer> tags.
     
@@ -609,7 +605,11 @@ def compute_format_score(solution_str: str, expected_len: Optional[int] = None) 
         inferred_len = int(expected_len or 0)
         if inferred_len <= 0:
             inferred_len = len(extract_values_from_time_series_string(solution_str or ""))
-        answer_text, _, _ = parse_final_answer_protocol(solution_str, max(inferred_len, 1), allow_recovery=True)
+        answer_text, _, _ = parse_final_answer_protocol(
+            solution_str,
+            max(inferred_len, 1),
+            allow_recovery=allow_recovery,
+        )
         if answer_text is not None:
             return 0.0
         return -1.0
@@ -618,13 +618,22 @@ def compute_format_score(solution_str: str, expected_len: Optional[int] = None) 
         return -1.0
 
 
-def infer_format_failure_reason(solution_str: Optional[str], expected_len: Optional[int] = None) -> str:
+def infer_format_failure_reason(
+    solution_str: Optional[str],
+    expected_len: Optional[int] = None,
+    *,
+    allow_recovery: bool = False,
+) -> str:
     if solution_str is None:
         return "empty_solution"
     inferred_len = int(expected_len or 0)
     if inferred_len <= 0:
         inferred_len = len(extract_values_from_time_series_string(solution_str or ""))
-    answer_text, _, reject_reason = parse_final_answer_protocol(solution_str, max(inferred_len, 1), allow_recovery=True)
+    answer_text, _, reject_reason = parse_final_answer_protocol(
+        solution_str,
+        max(inferred_len, 1),
+        allow_recovery=allow_recovery,
+    )
     if answer_text is not None:
         return "ok"
     return reject_reason or "unknown_format_failure"
@@ -857,7 +866,8 @@ def compute_score(
     data_source: str,
     solution_str: str,
     ground_truth: str,
-    extra_info: Optional[dict] = None
+    extra_info: Optional[dict] = None,
+    allow_recovery: bool = False,
 ) -> dict:
     """
     Compute the paper-aligned composite reward for time series prediction.
@@ -874,6 +884,7 @@ def compute_score(
         solution_str: Model's solution string with <answer> tags
         ground_truth: Ground truth time series string
         extra_info: Optional additional information (unused)
+        allow_recovery: Whether malformed final protocol may be recovered before scoring
         
     Returns:
         Total reward score
@@ -897,7 +908,9 @@ def compute_score(
     passthrough_extra_keys = (
         "final_answer_reject_reason",
         "generation_stop_reason",
+        "generation_finish_reason",
         "prediction_model_used",
+        "prediction_attempt_count",
         "prediction_call_count",
         "illegal_turn3_tool_call_count",
         "prediction_requested_model",
@@ -918,6 +931,7 @@ def compute_score(
         "turn_stage",
         "workflow_status",
         "workflow_violation_reason",
+        "required_step_budget",
         "prompt_char_len",
         "response_char_len",
         "response_token_len",
@@ -1066,7 +1080,7 @@ def compute_score(
     canonical_answer, format_parse_mode, raw_protocol_reject_reason = parse_final_answer_protocol(
         solution_str,
         protocol_expected_len,
-        allow_recovery=True,
+        allow_recovery=allow_recovery,
     )
     scoring_solution = (
         f"<answer>\n{canonical_answer}\n</answer>"
@@ -1098,7 +1112,9 @@ def compute_score(
 
     if format_score < 0:
         format_failure_reason = raw_protocol_reject_reason or infer_format_failure_reason(
-            solution_str, expected_len=protocol_expected_len
+            solution_str,
+            expected_len=protocol_expected_len,
+            allow_recovery=allow_recovery,
         )
     elif gt_len > 0 and pred_len > 0:
         min_len = min(pred_len, gt_len)

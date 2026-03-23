@@ -15,6 +15,7 @@ class FinalAnswerParsingTest(unittest.TestCase):
         agent.prediction_requested_model = None
         agent.prediction_model_defaulted = False
         agent.prediction_step_index = None
+        agent.prediction_turn_stage = None
         agent.prediction_call_count = 1
         agent.illegal_turn3_tool_call_count = 0
         agent.final_answer_reject_reason = None
@@ -80,45 +81,41 @@ class FinalAnswerParsingTest(unittest.TestCase):
         self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "missing_answer_block")
 
-    def test_recovers_missing_close_tag(self) -> None:
+    def test_rejects_missing_close_tag_without_runtime_recovery(self) -> None:
         agent = self._make_agent()
         text = f"<think>x</think><answer>\n{self._numeric_answer_lines(96)}"
         answer, penalty = agent._extract_final_answer(text)
-        self.assertIsNotNone(answer)
+        self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
-        self.assertIsNone(agent.final_answer_reject_reason)
-        self.assertEqual(agent.final_answer_parse_mode, "recovered_missing_answer_close_tag_answer_block")
+        self.assertEqual(agent.final_answer_reject_reason, "missing_answer_close_tag")
+        self.assertEqual(agent.final_answer_parse_mode, "rejected_missing_answer_close_tag")
 
-    def test_recovers_overlong_answer_block_by_canonicalizing_first_horizon(self) -> None:
+    def test_rejects_overlong_answer_block_instead_of_canonicalizing(self) -> None:
         agent = self._make_agent()
         text = f"<think>x</think><answer>\n{self._numeric_answer_lines(97)}\n</answer>"
         answer, penalty = agent._extract_final_answer(text)
-        self.assertIsNotNone(answer)
+        self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
-        self.assertIsNone(agent.final_answer_reject_reason)
-        self.assertEqual(
-            agent.final_answer_parse_mode,
-            "recovered_invalid_answer_shape:lines=97,expected=96_answer_block",
-        )
-        self.assertEqual(len([line for line in answer.splitlines() if line.strip()]), 96)
+        self.assertEqual(agent.final_answer_reject_reason, "invalid_answer_shape:lines=97,expected=96")
+        self.assertEqual(agent.final_answer_parse_mode, "rejected_invalid_answer_shape:lines=97,expected=96")
 
-    def test_accepts_answer_only_protocol_during_refinement(self) -> None:
+    def test_rejects_answer_only_protocol_during_refinement(self) -> None:
         agent = self._make_agent()
         text = f"<answer>\n{self._numeric_answer_lines(96)}\n</answer>"
         answer, penalty = agent._extract_final_answer(text)
-        self.assertIsNotNone(answer)
+        self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
-        self.assertIsNone(agent.final_answer_reject_reason)
-        self.assertEqual(agent.final_answer_parse_mode, "strict_protocol")
+        self.assertEqual(agent.final_answer_reject_reason, "missing_think_block")
+        self.assertEqual(agent.final_answer_parse_mode, "rejected_missing_think_block")
 
-    def test_recovers_plain_numeric_forecast_block_during_refinement(self) -> None:
+    def test_rejects_plain_numeric_forecast_block_during_refinement(self) -> None:
         agent = self._make_agent()
         text = f"{self._numeric_answer_lines(96)}\n<|im_end|>"
         answer, penalty = agent._extract_final_answer(text)
-        self.assertIsNotNone(answer)
+        self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
-        self.assertIsNone(agent.final_answer_reject_reason)
-        self.assertEqual(agent.final_answer_parse_mode, "recovered_missing_answer_block_plain_forecast_block")
+        self.assertEqual(agent.final_answer_reject_reason, "missing_answer_block")
+        self.assertEqual(agent.final_answer_parse_mode, "rejected_missing_answer_block")
 
     def test_tool_call_response_is_not_treated_as_final_answer_failure(self) -> None:
         agent = self._make_agent()
@@ -126,8 +123,8 @@ class FinalAnswerParsingTest(unittest.TestCase):
         answer, penalty = agent._extract_final_answer(text)
         self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
-        self.assertIsNone(agent.final_answer_reject_reason)
-        self.assertEqual(agent.final_answer_parse_mode, "tool_call_response")
+        self.assertEqual(agent.final_answer_reject_reason, "missing_answer_block")
+        self.assertEqual(agent.final_answer_parse_mode, "rejected_missing_answer_block")
 
     def test_rejects_non_forecast_text(self) -> None:
         agent = self._make_agent()
@@ -139,28 +136,28 @@ class FinalAnswerParsingTest(unittest.TestCase):
     def test_accepts_answer_block_before_prediction_but_workflow_rejects_later(self) -> None:
         agent = self._make_agent()
         agent.prediction_results = None
-        text = f"<answer>\n{self._numeric_answer_lines(96)}\n</answer>"
+        text = f"<think>x</think><answer>\n{self._numeric_answer_lines(96)}\n</answer>"
         answer, penalty = agent._extract_final_answer(text)
         self.assertIsNotNone(answer)
         self.assertEqual(penalty, 0.0)
         self.assertIsNone(agent.final_answer_reject_reason)
         self.assertEqual(agent.final_answer_parse_mode, "strict_protocol")
 
-    def test_recovers_extra_text_outside_tags(self) -> None:
+    def test_rejects_extra_text_outside_tags(self) -> None:
         agent = self._make_agent()
         text = f"<think>x</think><answer>\n{self._numeric_answer_lines(96)}\n</answer>\nextra"
         answer, penalty = agent._extract_final_answer(text)
-        self.assertIsNotNone(answer)
+        self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
-        self.assertIsNone(agent.final_answer_reject_reason)
-        self.assertEqual(agent.final_answer_parse_mode, "recovered_extra_text_outside_tags_answer_block")
+        self.assertEqual(agent.final_answer_reject_reason, "extra_text_outside_tags")
+        self.assertEqual(agent.final_answer_parse_mode, "rejected_extra_text_outside_tags")
 
     def test_final_turn_sampling_params_add_stop_and_cap_tokens(self) -> None:
         agent = self._make_agent()
         params = agent._prepare_sampling_params({"temperature": 0.3, "top_p": 0.95})
-        self.assertEqual(params["stop"], ["</answer>", "<tool_call>"])
+        self.assertEqual(params["stop"], ["</answer>"])
         self.assertTrue(params["include_stop_str_in_output"])
-        self.assertEqual(params["max_tokens"], 1024)
+        self.assertEqual(params["max_tokens"], 1408)
         self.assertAlmostEqual(params["temperature"], 0.2, places=6)
         self.assertAlmostEqual(params["top_p"], 0.9, places=6)
 
@@ -177,6 +174,7 @@ class FinalAnswerParsingTest(unittest.TestCase):
     def test_validate_workflow_rejects_copying_historical_tail(self) -> None:
         agent = self._make_agent()
         agent.prediction_step_index = 2
+        agent.prediction_turn_stage = "routing"
         agent.values = [float(idx) for idx in range(200)]
         copied_tail = "\n".join(f"{float(value):.4f}" for value in agent.values[-96:])
         valid, penalty, message = agent._validate_workflow_completion(copied_tail)
@@ -187,31 +185,31 @@ class FinalAnswerParsingTest(unittest.TestCase):
     def test_validate_workflow_rejects_tool_calls_after_prediction(self) -> None:
         agent = self._make_agent()
         agent.prediction_step_index = 2
+        agent.prediction_turn_stage = "routing"
         agent.illegal_turn3_tool_call_count = 1
         valid, penalty, message = agent._validate_workflow_completion(self._numeric_answer_lines(96))
         self.assertFalse(valid)
         self.assertLess(penalty, 0.0)
         self.assertIn("may not call tools", message)
 
-    def test_validate_workflow_rejects_prediction_called_on_wrong_turn(self) -> None:
+    def test_validate_workflow_rejects_prediction_called_outside_routing_stage(self) -> None:
         agent = self._make_agent()
         agent.prediction_step_index = 3
+        agent.prediction_turn_stage = "diagnostic"
         valid, penalty, message = agent._validate_workflow_completion(self._numeric_answer_lines(96))
         self.assertFalse(valid)
         self.assertLess(penalty, 0.0)
-        self.assertIn("turn 2", message)
+        self.assertIn("routing stage", message)
 
-    def test_validate_workflow_rejects_incomplete_required_feature_coverage(self) -> None:
+    def test_validate_workflow_rejects_missing_diagnostic_analysis(self) -> None:
         agent = self._make_agent()
-        agent.required_feature_tools = [
-            "extract_basic_statistics",
-            "extract_event_summary",
-        ]
+        agent.basic_statistics = None
         agent.prediction_step_index = 2
+        agent.prediction_turn_stage = "routing"
         valid, penalty, message = agent._validate_workflow_completion(self._numeric_answer_lines(96))
         self.assertFalse(valid)
         self.assertLess(penalty, 0.0)
-        self.assertIn("extract_event_summary", message)
+        self.assertIn("diagnostic feature tool", message)
 
     def test_execute_tool_call_blocks_prediction_during_diagnostic_turn(self) -> None:
         agent = self._make_agent()
@@ -229,17 +227,14 @@ class FinalAnswerParsingTest(unittest.TestCase):
         self.assertEqual(agent.prediction_requested_model, "patchtst")
         self.assertEqual(agent.prediction_call_count, 0)
 
-    def test_execute_tool_call_blocks_prediction_until_required_coverage_complete(self) -> None:
+    def test_execute_tool_call_blocks_prediction_until_some_diagnostic_tool_completed(self) -> None:
         agent = self._make_agent()
         agent.prediction_results = None
         agent.prediction_call_count = 0
-        agent.required_feature_tools = [
-            "extract_basic_statistics",
-            "extract_event_summary",
-        ]
+        agent.basic_statistics = None
 
         async def _fake_run_prediction_tool(model_name: str = "chronos2") -> str:
-            self.fail("prediction tool should not run before all required feature tools are complete")
+            self.fail("prediction tool should not run before any diagnostic feature tool is complete")
 
         agent._run_prediction_tool = _fake_run_prediction_tool
         tool_call = SimpleNamespace(name="predict_time_series", arguments={"model_name": "patchtst"})
@@ -266,13 +261,11 @@ class FinalAnswerParsingTest(unittest.TestCase):
         result = asyncio.run(agent._execute_tool_call(tool_call, turn_stage="diagnostic"))
         self.assertIsNone(result)
 
-    def test_current_turn_stage_stays_diagnostic_until_required_tools_complete(self) -> None:
+    def test_current_turn_stage_switches_to_routing_after_any_diagnostic_tool(self) -> None:
         agent = self._make_agent()
         agent.prediction_results = None
-        agent.required_feature_tools = [
-            "extract_basic_statistics",
-            "extract_event_summary",
-        ]
+        agent.basic_statistics = None
+        agent.event_summary = None
         self.assertEqual(agent._current_turn_stage(), "diagnostic")
         agent.event_summary = {"event_segment_count": 4.0}
         self.assertEqual(agent._current_turn_stage(), "routing")

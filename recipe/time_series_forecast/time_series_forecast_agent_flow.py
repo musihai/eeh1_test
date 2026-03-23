@@ -55,7 +55,9 @@ from recipe.time_series_forecast.reward import (
     parse_final_answer_protocol,
 )
 import numpy as np
-from recipe.time_series_forecast.diagnostic_policy import FEATURE_TOOL_ORDER, select_feature_tool_names
+from recipe.time_series_forecast.diagnostic_policy import (
+    FEATURE_TOOL_ORDER,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -80,6 +82,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.prediction_model_defaulted = False
         self.prediction_tool_error = None
         self.prediction_step_index = None
+        self.prediction_turn_stage = None
+        self.prediction_attempt_count = 0
         self.prediction_call_count = 0
         self.illegal_turn3_tool_call_count = 0
         self.feature_tool_sequence = []
@@ -91,6 +95,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.target_column = "OT"
         self.parse_error_message = None
         self.required_feature_tools = []
+        self.diagnostic_tool_batches = []
+        self.absolute_step_budget = None
 
         # Feature extraction caches
         self.basic_statistics = None
@@ -115,6 +121,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         cls.tokenizer = tokenizer
         cls.processor = processor
         cls.max_steps = kwargs.get("max_steps", 5)
+        cls.max_prediction_attempts = max(1, int(kwargs.get("max_prediction_attempts", 2) or 2))
         cls.max_parallel_calls = kwargs.get("max_parallel_calls", 5)
         cls.lookback_window = kwargs.get("lookback_window", 96)
         cls.forecast_horizon = kwargs.get("forecast_horizon", 96)
@@ -136,6 +143,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.prediction_model_defaulted = False
         self.prediction_tool_error = None
         self.prediction_step_index = None
+        self.prediction_turn_stage = None
+        self.prediction_attempt_count = 0
         self.prediction_call_count = 0
         self.illegal_turn3_tool_call_count = 0
         self.feature_tool_sequence = []
@@ -144,6 +153,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.final_answer_parse_mode = None
         self.final_answer_step_index = None
         self.required_feature_tools = []
+        self.diagnostic_tool_batches = []
+        self.absolute_step_budget = None
         self.basic_statistics = None
         self.within_channel_dynamics = None
         self.forecast_residuals = None
@@ -182,14 +193,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             )
             self.timestamps, self.values = [], []
 
-        if self.values:
-            try:
-                self.required_feature_tools = list(select_feature_tool_names(list(self.values)))
-            except Exception as exc:
-                logger.warning("Failed to derive required diagnostic tools: %s", exc)
-                self.required_feature_tools = []
-        if not self.required_feature_tools:
-            self.required_feature_tools = ["extract_basic_statistics"]
+        self.required_feature_tools = []
+        self.diagnostic_tool_batches = []
+        self.absolute_step_budget = self._required_step_budget()
 
         metrics = {}
         request_id = uuid4().hex[:8]
@@ -208,10 +214,15 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         pred_len = 0
         expected_len = len(extract_ground_truth_values(ground_truth)) if ground_truth else int(self.forecast_horizon or 96)
         generation_stop_reason = ""
+        generation_finish_reason = ""
         io_records: list[dict[str, Any]] = []
 
         num_steps = 0
-        while num_steps < self.max_steps:
+        configured_max_steps = int(self.max_steps or 0)
+        while True:
+            effective_max_steps = max(configured_max_steps, self._required_step_budget())
+            if num_steps >= effective_max_steps:
+                break
             num_steps += 1
             turn_stage = self._current_turn_stage()
             messages = [
@@ -222,12 +233,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             apply_chat_template_kwargs = {
                 "add_generation_prompt": True,
                 "tokenize": True,
-                # Use a single stable serialization path across all turns. The
-                # final protocol is answer-only, so thinking tags are not needed.
-                "enable_thinking": False,
             }
-            if turn_stage != "refinement":
-                apply_chat_template_kwargs["tools"] = self.tool_schemas
+            tool_schemas = self._tool_schemas_for_turn(turn_stage)
+            if tool_schemas:
+                apply_chat_template_kwargs["tools"] = tool_schemas
 
             prompt_ids = await self.loop.run_in_executor(
                 None,
@@ -241,6 +250,13 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 )
             response_ids = output.token_ids[: self.response_length]
             generation_stop_reason = getattr(output, "stop_reason", "")
+            output_extra_info = getattr(output, "extra_info", {}) or {}
+            if isinstance(output_extra_info, dict):
+                generation_finish_reason = str(output_extra_info.get("finish_reason") or "")
+            else:
+                generation_finish_reason = ""
+            if not generation_finish_reason:
+                generation_finish_reason = generation_stop_reason
             
             # Decode response to check for final answer
             response_text = await self.loop.run_in_executor(None, self.tokenizer.decode, response_ids)
@@ -301,7 +317,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     # Workflow completed - compute reward based on prediction accuracy
                     self.final_answer = final_answer
                     self.final_answer_step_index = num_steps
-                    reward_score = self._compute_final_reward(final_answer, ground_truth) + format_penalty
+                    reward_score = self._compute_final_reward(response_text, ground_truth) + format_penalty
                     logger.info(f"Final answer detected. Reward score: {reward_score}")
                     # if reward_score > 0.5:
                     #     for record in io_records:
@@ -365,18 +381,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     "output_source": self.prediction_model_used,
                     "selected_model": selected_model,
                     "generation_stop_reason": generation_stop_reason,
-                    "prediction_call_count": int(self.prediction_call_count),
-                    "illegal_turn3_tool_call_count": int(self.illegal_turn3_tool_call_count),
-                    "prediction_requested_model": self.prediction_requested_model or "",
-                    "prediction_model_defaulted": bool(self.prediction_model_defaulted),
-                    "prediction_tool_error": self.prediction_tool_error or "",
-                    "prediction_step_index": int(self.prediction_step_index or 0),
-                    "final_answer_step_index": int(self.final_answer_step_index or 0),
-                    "feature_tool_count": int(len(self.feature_tool_sequence)),
-                    "feature_tool_signature": self._feature_tool_signature(),
-                    "analysis_state_signature": self._analysis_state_signature(),
-                    "analysis_coverage_ratio": self._analysis_coverage_ratio(),
-                    "history_analysis_count": int(len(self.history_analysis)),
+                    "generation_finish_reason": generation_finish_reason,
+                    **self._shared_reward_tracking_fields(sample_uid=kwargs.get("uid")),
                     "tool_call_count": int(len(tool_call_names)),
                     "tool_call_sequence": "->".join(tool_call_names) if tool_call_names else "",
                     "executed_tool_count": int(len(executed_tool_names)),
@@ -385,6 +391,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     "turn_stage": turn_stage,
                     "workflow_status": workflow_status,
                     "workflow_violation_reason": workflow_message,
+                    "required_step_budget": int(self._required_step_budget()),
                     "prompt_char_len": int(len(messages[1]["content"])),
                     "response_char_len": int(len(response_text)),
                     "response_token_len": int(len(response_ids)),
@@ -397,10 +404,12 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 step_index=num_steps,
                 request_id=request_id,
                 sample_index=kwargs.get("index"),
+                sample_uid=kwargs.get("uid"),
                 turn_stage=turn_stage,
                 prompt_text=messages[1]["content"],
                 response_text=response_text,
                 generation_stop_reason=generation_stop_reason,
+                generation_finish_reason=generation_finish_reason,
                 tool_call_names=tool_call_names,
                 workflow_status=workflow_status,
                 workflow_message=workflow_message,
@@ -459,8 +468,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 "output_source": self.prediction_model_used,
                 "selected_model": final_selected_model,
                 "generation_stop_reason": generation_stop_reason,
-                "prediction_call_count": int(self.prediction_call_count),
-                "illegal_turn3_tool_call_count": int(self.illegal_turn3_tool_call_count),
+                "generation_finish_reason": generation_finish_reason,
+                **self._shared_reward_tracking_fields(sample_uid=kwargs.get("uid")),
                 **final_refinement_metrics,
             }
         )
@@ -476,16 +485,15 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         Returns:
             Tuple of (is_valid, penalty_score, message)
         """
-        # Check 1: Must complete the required diagnostic tool set before routing.
-        if not self._has_required_feature_coverage():
-            missing = ", ".join(self._missing_required_feature_tools())
-            return False, -0.5, f"Required feature extraction is incomplete. Missing: {missing}."
+        # Check 1: The agent must perform diagnostic analysis before routing.
+        if not self._has_diagnostic_analysis():
+            return False, -0.5, "At least one diagnostic feature tool must be executed before routing."
         
         # Check 2: Must have called predict_time_series
         if self.prediction_results is None:
             return False, -0.5, "predict_time_series was not called. You must get model predictions first."
 
-        # Check 3: Turn 2 must contain exactly one forecasting-tool invocation.
+        # Check 3: Routing must contain exactly one forecasting-tool invocation.
         if self.prediction_call_count != 1:
             return (
                 False,
@@ -493,19 +501,19 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 f"predict_time_series must be called exactly once before final output. Got {self.prediction_call_count}.",
             )
 
-        if int(self.prediction_step_index or 0) != 2:
+        if str(self.prediction_turn_stage or "").strip().lower() != "routing":
             return (
                 False,
                 -0.5,
-                f"predict_time_series must be called on turn 2. Got turn {int(self.prediction_step_index or 0)}.",
+                "predict_time_series must be called during the routing stage after diagnostics are complete.",
             )
 
-        # Check 4: Turn 3 must not invoke any tools.
+        # Check 4: Refinement must not invoke any tools after prediction.
         if self.illegal_turn3_tool_call_count > 0:
             return (
                 False,
                 -0.5,
-                f"Turn 3 may not call tools after prediction results are available. Illegal calls: {self.illegal_turn3_tool_call_count}.",
+                f"Refinement may not call tools after prediction results are available. Illegal calls: {self.illegal_turn3_tool_call_count}.",
             )
         
         # Check 5: Check if answer is just copying the input data (reward hacking detection)
@@ -542,31 +550,58 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
     def _current_turn_stage(self) -> str:
         if self.prediction_results is not None:
             return "refinement"
-        if self._has_required_feature_coverage():
+        if self._has_diagnostic_analysis():
             return "routing"
         return "diagnostic"
+
+    def _max_prediction_attempts(self) -> int:
+        try:
+            configured = int(getattr(self, "max_prediction_attempts", getattr(type(self), "max_prediction_attempts", 2)) or 2)
+        except (TypeError, ValueError):
+            configured = 2
+        return max(configured, 1)
+
+    def _required_step_budget(self) -> int:
+        cached_budget = getattr(self, "absolute_step_budget", None)
+        if cached_budget is not None:
+            return max(int(cached_budget), 1)
+
+        try:
+            configured_max_steps = int(getattr(self, "max_steps", getattr(type(self), "max_steps", 0)) or 0)
+        except (TypeError, ValueError):
+            configured_max_steps = 0
+
+        # Paper-aligned episode budget: one diagnostic turn, up to the configured
+        # prediction retry budget during routing, and one refinement turn.
+        return max(configured_max_steps, 1 + self._max_prediction_attempts() + 1, 1)
+
+    def _current_prompt_required_feature_tools(self) -> list[str]:
+        if self._current_turn_stage() == "diagnostic":
+            return list(FEATURE_TOOL_ORDER)
+        return self._executed_feature_tool_names()
 
     def _analysis_state_signature(self) -> str:
         active = self._executed_feature_tool_names()
         return "|".join(active) if active else "none"
 
     def _analysis_coverage_ratio(self) -> float:
-        required = self._required_feature_tool_names()
-        if not required:
-            return 1.0
-        missing = set(self._missing_required_feature_tools())
-        completed_required = len([name for name in required if name not in missing])
-        return float(completed_required / len(required))
+        return 1.0 if self._has_diagnostic_analysis() else 0.0
 
     def _required_feature_tool_names(self) -> list[str]:
         required = [str(name) for name in getattr(self, "required_feature_tools", []) if str(name).strip()]
         if not required:
-            return ["extract_basic_statistics"]
+            return self._executed_feature_tool_names()
         return [name for name in FEATURE_TOOL_ORDER if name in required] or required
 
     def _required_feature_tool_signature(self) -> str:
         required = self._required_feature_tool_names()
         return "->".join(required) if required else "none"
+
+    @staticmethod
+    def _sample_uid_text(sample_uid: Any) -> str:
+        if sample_uid is None:
+            return ""
+        return str(sample_uid)
 
     def _executed_feature_tool_names(self) -> list[str]:
         feature_state = {
@@ -583,12 +618,39 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         return [name for name in self._required_feature_tool_names() if name not in executed]
 
     def _has_required_feature_coverage(self) -> bool:
-        return len(self._missing_required_feature_tools()) == 0
+        return self._has_diagnostic_analysis()
+
+    def _has_diagnostic_analysis(self) -> bool:
+        return bool(self._executed_feature_tool_names())
 
     def _feature_tool_signature(self) -> str:
         if not self.feature_tool_sequence:
             return "none"
         return "->".join(self.feature_tool_sequence)
+
+    def _shared_reward_tracking_fields(self, *, sample_uid: Any) -> dict[str, Any]:
+        uid_text = self._sample_uid_text(sample_uid)
+        return {
+            "sample_uid": uid_text,
+            "prediction_attempt_count": int(self.prediction_attempt_count),
+            "prediction_call_count": int(self.prediction_call_count),
+            "illegal_turn3_tool_call_count": int(self.illegal_turn3_tool_call_count),
+            "prediction_requested_model": self.prediction_requested_model or "",
+            "prediction_model_defaulted": bool(self.prediction_model_defaulted),
+            "prediction_tool_error": self.prediction_tool_error or "",
+            "prediction_step_index": int(self.prediction_step_index or 0),
+            "prediction_turn_stage": self.prediction_turn_stage or "",
+            "final_answer_step_index": int(self.final_answer_step_index or 0),
+            "feature_tool_count": int(len(self.feature_tool_sequence)),
+            "feature_tool_signature": self._feature_tool_signature(),
+            "required_feature_tool_signature": self._required_feature_tool_signature(),
+            "required_feature_tool_count": int(len(self._required_feature_tool_names())),
+            "missing_required_feature_tool_count": int(len(self._missing_required_feature_tools())),
+            "analysis_state_signature": self._analysis_state_signature(),
+            "analysis_coverage_ratio": self._analysis_coverage_ratio(),
+            "history_analysis_count": int(len(self.history_analysis)),
+            "required_step_budget": int(self._required_step_budget()),
+        }
 
     @staticmethod
     def _series_preview(values: list[float], preview_size: int = 3) -> str:
@@ -616,10 +678,12 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         step_index: int,
         request_id: str,
         sample_index: Any,
+        sample_uid: Any,
         turn_stage: str,
         prompt_text: str,
         response_text: str,
         generation_stop_reason: str,
+        generation_finish_reason: str,
         tool_call_names: list[str],
         workflow_status: str,
         workflow_message: str,
@@ -630,6 +694,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             {
                 "request_id": request_id,
                 "sample_index": sample_index,
+                "sample_uid": self._sample_uid_text(sample_uid or reward_extra_info.get("sample_uid")),
                 "step_index": int(step_index),
                 "turn_stage": turn_stage,
                 "tool_call_sequence": tool_call_names,
@@ -637,24 +702,52 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 "executed_tool_count": int(reward_extra_info.get("executed_tool_count", 0) or 0),
                 "executed_tool_sequence": reward_extra_info.get("executed_tool_sequence", ""),
                 "rejected_tool_call_count": int(reward_extra_info.get("rejected_tool_call_count", 0) or 0),
-                "feature_tool_signature": self._feature_tool_signature(),
-                "feature_tool_count": int(len(self.feature_tool_sequence)),
-                "required_feature_tool_signature": self._required_feature_tool_signature(),
-                "required_feature_tool_count": int(len(self._required_feature_tool_names())),
-                "missing_required_feature_tool_count": int(len(self._missing_required_feature_tools())),
-                "analysis_state_signature": self._analysis_state_signature(),
-                "analysis_coverage_ratio": self._analysis_coverage_ratio(),
-                "history_analysis_count": int(len(self.history_analysis)),
+                "feature_tool_signature": reward_extra_info.get("feature_tool_signature", self._feature_tool_signature()),
+                "feature_tool_count": int(
+                    reward_extra_info.get("feature_tool_count", len(self.feature_tool_sequence)) or 0
+                ),
+                "required_feature_tool_signature": reward_extra_info.get(
+                    "required_feature_tool_signature",
+                    self._required_feature_tool_signature(),
+                ),
+                "required_feature_tool_count": int(
+                    reward_extra_info.get("required_feature_tool_count", len(self._required_feature_tool_names())) or 0
+                ),
+                "missing_required_feature_tool_count": int(
+                    reward_extra_info.get(
+                        "missing_required_feature_tool_count",
+                        len(self._missing_required_feature_tools()),
+                    )
+                    or 0
+                ),
+                "analysis_state_signature": reward_extra_info.get(
+                    "analysis_state_signature",
+                    self._analysis_state_signature(),
+                ),
+                "analysis_coverage_ratio": reward_extra_info.get(
+                    "analysis_coverage_ratio",
+                    self._analysis_coverage_ratio(),
+                ),
+                "history_analysis_count": int(
+                    reward_extra_info.get("history_analysis_count", len(self.history_analysis)) or 0
+                ),
                 "prediction_requested_model": self.prediction_requested_model or "",
                 "prediction_model_used": self.prediction_model_used or "",
                 "prediction_model_defaulted": bool(self.prediction_model_defaulted),
                 "prediction_tool_error": self.prediction_tool_error or "",
+                "prediction_attempt_count": int(self.prediction_attempt_count),
                 "prediction_call_count": int(self.prediction_call_count),
                 "prediction_step_index": int(self.prediction_step_index or 0),
+                "prediction_turn_stage": self.prediction_turn_stage or "",
+                "final_answer_step_index": int(
+                    reward_extra_info.get("final_answer_step_index", self.final_answer_step_index or 0) or 0
+                ),
                 "illegal_turn3_tool_call_count": int(self.illegal_turn3_tool_call_count),
+                "required_step_budget": int(reward_extra_info.get("required_step_budget", self._required_step_budget())),
                 "workflow_status": workflow_status,
                 "workflow_violation_reason": workflow_message,
                 "generation_stop_reason": generation_stop_reason,
+                "generation_finish_reason": generation_finish_reason,
                 "final_answer_reject_reason": self.final_answer_reject_reason or "",
                 "final_answer_parse_mode": self.final_answer_parse_mode or "",
                 "prompt_char_len": int(len(prompt_text)),
@@ -692,9 +785,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
     def _final_answer_max_tokens(self) -> int:
         expected = self._expected_prediction_count()
         response_cap = int(self.response_length or 0) or 2048
-        # Keep enough headroom for 96 numeric lines plus tags, but avoid letting
-        # malformed final outputs run all the way to the global response cap.
-        return min(response_cap, max(256, expected * 10 + 64))
+        # Qwen-style tokenization for one-value-per-line forecasts is denser than
+        # the old 10-token heuristic. In validation, exact-copy 96-line answers
+        # repeatedly hit a 1024-token cap before `</answer>` was emitted.
+        return min(response_cap, max(384, expected * 12 + 256))
 
     def _tool_turn_max_tokens(self) -> int:
         response_cap = int(self.response_length or 0) or 2048
@@ -724,7 +818,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         existing_max_tokens = params.get("max_tokens", params.get("max_new_tokens"))
 
         if stage == "refinement":
-            params["stop"] = self._merge_stop_strings(params.get("stop"), ["</answer>", "<tool_call>"])
+            params["stop"] = self._merge_stop_strings(params.get("stop"), ["</answer>"])
             params["include_stop_str_in_output"] = True
             if "temperature" in params:
                 params["temperature"] = min(float(params["temperature"]), 0.2)
@@ -752,6 +846,13 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             params.pop("max_new_tokens", None)
         return params
 
+    def _tool_schemas_for_turn(self, turn_stage: str) -> list[dict[str, Any]]:
+        if turn_stage == "diagnostic":
+            return list(FEATURE_TOOL_SCHEMAS)
+        if turn_stage == "routing":
+            return [PREDICT_TIMESERIES_TOOL_SCHEMA]
+        return []
+
     def _extract_final_answer(self, response_text: str) -> tuple[Optional[str], float]:
         """
         Extract final answer from response text.
@@ -765,14 +866,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.final_answer_reject_reason = None
         self.final_answer_parse_mode = None
 
-        if "<tool_call>" in response_text and "<answer>" not in response_text and "</answer>" not in response_text:
-            self.final_answer_parse_mode = "tool_call_response"
-            return None, 0.0
-
         final_answer, parse_mode, reject_reason = parse_final_answer_protocol(
             response_text,
             self._expected_prediction_count(),
-            allow_recovery=self.prediction_results is not None,
+            allow_recovery=False,
         )
         if final_answer is not None:
             if parse_mode.startswith("recovered_"):
@@ -797,7 +894,6 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 tools=self.tool_schemas,
                 add_generation_prompt=True,
                 tokenize=True,
-                enable_thinking=False,
             ),
         )
         response_ids = self.tokenizer.encode("PARSE_FAILURE", add_special_tokens=False)
@@ -825,7 +921,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         step = await self._postprocess(step, **kwargs)
         return AgentFlowOutput(steps=[step], metrics={})
 
-    def _compute_final_reward(self, final_answer: str, ground_truth: str) -> float:
+    def _compute_final_reward(self, final_response: str, ground_truth: str) -> float:
         """
         Compute reward score based on final prediction and ground truth.
         
@@ -840,11 +936,11 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             return 0.0
         
         try:
-            # Use the compute_score function from reward.py
             result = compute_score(
                 data_source="time_series",
-                solution_str=f"<answer>\n{final_answer}\n</answer>",
-                ground_truth=ground_truth
+                solution_str=final_response,
+                ground_truth=ground_truth,
+                allow_recovery=False,
             )
             return float(result["score"] if isinstance(result, dict) else result)
         except Exception as e:
@@ -865,7 +961,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             selected_answer = self._canonical_answer_from_prediction_text(self.prediction_results)
             result = compute_score(
                 data_source="time_series",
-                solution_str=f"<answer>\n{selected_answer}\n</answer>",
+                solution_str=self._wrap_final_protocol(
+                    selected_answer,
+                    "I keep the selected forecast as the final answer because it is already consistent.",
+                ),
                 ground_truth=ground_truth,
             )
             score = float(result["score"] if isinstance(result, dict) else result)
@@ -874,6 +973,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             logger.warning("Error computing selected forecast reward: %s", exc)
             return 0.0
 
+    @staticmethod
+    def _wrap_final_protocol(answer_text: str, reflection_text: str) -> str:
+        return f"<think>\n{reflection_text.strip()}\n</think>\n<answer>\n{answer_text}\n</answer>"
+
     def _compute_intermediate_reward(
         self,
         *,
@@ -881,10 +984,6 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         executed_tool_names: list[str],
         ground_truth: str,
     ) -> float:
-        if not executed_tool_names:
-            return 0.0
-        if turn_stage == "routing" and "predict_time_series" in executed_tool_names:
-            return self._compute_selected_forecast_reward(ground_truth)
         return 0.0
 
     def _compute_series_metrics(
@@ -1023,8 +1122,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             history_analysis=self.history_analysis,
             prediction_results=self.prediction_tool_output or self.prediction_results,
             prediction_model_used=self.prediction_model_used,
-            required_feature_tools=self._required_feature_tool_names(),
+            required_feature_tools=self._current_prompt_required_feature_tools(),
             completed_feature_tools=self._executed_feature_tool_names(),
+            turn_stage=self._current_turn_stage(),
         )
 
     async def _execute_tool_call(self, tool_call: FunctionCall, **kwargs) -> Optional[str]:
@@ -1051,10 +1151,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 logger.warning("predict_time_series called during diagnostic turn, rejected until next turn")
                 return None
 
-            if not self._has_required_feature_coverage():
+            if not self._has_diagnostic_analysis():
                 logger.warning(
-                    "predict_time_series called before required feature coverage completed; missing=%s",
-                    ",".join(self._missing_required_feature_tools()),
+                    "predict_time_series called before any diagnostic feature tool completed",
                 )
                 return None
 
@@ -1062,9 +1161,23 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             if model_name not in {"chronos2", "arima", "patchtst", "itransformer"}:
                 model_name = "chronos2"
             self.prediction_model_defaulted = bool(requested_model_name != model_name)
+            if int(self.prediction_attempt_count) >= self._max_prediction_attempts():
+                logger.warning(
+                    "predict_time_series attempted after retry budget exhausted; max_prediction_attempts=%s",
+                    self._max_prediction_attempts(),
+                )
+                return None
+            self.prediction_attempt_count += 1
             self.prediction_call_count += 1
-            self.prediction_step_index = self.prediction_step_index or len(self.steps) + 1
-            return await self._run_prediction_tool(model_name=model_name)
+            self.prediction_step_index = len(self.steps) + 1
+            self.prediction_turn_stage = turn_stage
+            tool_output = await self._run_prediction_tool(model_name=model_name)
+            if tool_output is None:
+                self.prediction_call_count = max(0, int(self.prediction_call_count) - 1)
+                self.prediction_step_index = None
+                self.prediction_turn_stage = None
+                return None
+            return tool_output
 
         if turn_stage == "routing":
             logger.warning("Feature tool %s attempted during routing turn; predict_time_series required instead.", tool_call.name)
@@ -1150,6 +1263,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     "model_name": model_name,
                     "prediction_requested_model": self.prediction_requested_model or "",
                     "prediction_model_defaulted": bool(self.prediction_model_defaulted),
+                    "prediction_attempt_count": int(self.prediction_attempt_count),
                     "prediction_step_index": int(self.prediction_step_index or 0),
                     "prediction_call_count": int(self.prediction_call_count),
                     "analysis_state_signature": self._analysis_state_signature(),
@@ -1177,6 +1291,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     "model_name": model_name,
                     "prediction_requested_model": self.prediction_requested_model or "",
                     "prediction_model_defaulted": bool(self.prediction_model_defaulted),
+                    "prediction_attempt_count": int(self.prediction_attempt_count),
                     "prediction_step_index": int(self.prediction_step_index or 0),
                     "prediction_call_count": int(self.prediction_call_count),
                     "analysis_state_signature": self._analysis_state_signature(),

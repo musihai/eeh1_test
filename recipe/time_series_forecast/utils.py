@@ -46,20 +46,30 @@ _CHRONOS_SERVICE_URL = os.environ.get("CHRONOS_SERVICE_URL", _MODEL_SERVICE_URL)
 
 # Global HTTP client cache for async requests
 _httpx_client = None
+_httpx_client_loop = None
 
 # Default lengths resolved from env/base.yaml
 DEFAULT_LOOKBACK_WINDOW, DEFAULT_FORECAST_HORIZON = get_default_lengths()
 SYNTHETIC_TIMESTAMP_ANCHOR = pd.Timestamp("2000-01-01 00:00:00")
 
 
-def _get_httpx_client():
-    """Get or create httpx async client"""
-    global _httpx_client
-    if _httpx_client is None:
-        import httpx
+async def _get_httpx_client():
+    """Get or create an httpx async client bound to the current event loop."""
+    global _httpx_client, _httpx_client_loop
+    import httpx
+
+    current_loop = asyncio.get_running_loop()
+    client_closed = bool(getattr(_httpx_client, "is_closed", False))
+    if _httpx_client is None or _httpx_client_loop is not current_loop or client_closed:
+        if _httpx_client is not None and not client_closed:
+            try:
+                await _httpx_client.aclose()
+            except Exception:
+                pass
         # These requests only target the local model service. Ignore ambient
         # HTTP(S)_PROXY settings so localhost traffic is not hijacked by a proxy.
         _httpx_client = httpx.AsyncClient(timeout=60.0, trust_env=False)
+        _httpx_client_loop = current_loop
     return _httpx_client
 
 
@@ -170,7 +180,7 @@ async def predict_with_chronos_async(
     # Call the service
     import httpx
 
-    client = _get_httpx_client()
+    client = await _get_httpx_client()
     service_url = _resolve_model_service_url(model_service_url)
     try:
         response = await client.post(f"{service_url}/predict", json=request_data)
@@ -378,7 +388,7 @@ async def predict_with_patchtst_async(
     # Call the unified model service
     import httpx
 
-    client = _get_httpx_client()
+    client = await _get_httpx_client()
     service_url = _resolve_model_service_url(model_service_url)
     try:
         response = await client.post(f"{service_url}/predict", json=request_data)
@@ -440,7 +450,7 @@ async def predict_with_itransformer_async(
     # Call the unified model service
     import httpx
 
-    client = _get_httpx_client()
+    client = await _get_httpx_client()
     service_url = _resolve_model_service_url(model_service_url)
     try:
         response = await client.post(f"{service_url}/predict", json=request_data)

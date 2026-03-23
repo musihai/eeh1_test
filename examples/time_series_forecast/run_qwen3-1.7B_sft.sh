@@ -111,10 +111,17 @@ if [ ! -f "$SFT_METADATA_PATH" ]; then
 fi
 python3 - "$SFT_METADATA_PATH" <<'PY'
 import sys
-from recipe.time_series_forecast.dataset_identity import DATASET_KIND_RUNTIME_SFT_PARQUET, validate_metadata_file
+from recipe.time_series_forecast.dataset_identity import (
+    DATASET_KIND_RUNTIME_SFT_PARQUET,
+    DATASET_KIND_TEACHER_CURATED_SFT,
+    validate_metadata_file,
+)
 
 metadata_path = sys.argv[1]
-payload, _ = validate_metadata_file(metadata_path, expected_kind=DATASET_KIND_RUNTIME_SFT_PARQUET)
+payload, _ = validate_metadata_file(
+    metadata_path,
+    expected_kind=(DATASET_KIND_RUNTIME_SFT_PARQUET, DATASET_KIND_TEACHER_CURATED_SFT),
+)
 print(
     f"[SFT DATASET] kind={payload.get('dataset_kind')} stage={payload.get('pipeline_stage', '')} "
     f"metadata={metadata_path}"
@@ -131,6 +138,50 @@ if [ ! -f "${VAL_FILES}" ]; then
     echo "Generate or restore the SFT dataset first."
     exit 1
 fi
+python3 - "$TRAIN_FILES" "$VAL_FILES" <<'PY'
+import sys
+import pandas as pd
+
+from recipe.time_series_forecast.validate_turn3_format import (
+    check_paper_turn3_protocol,
+    get_last_assistant_content,
+    record_requires_paper_turn3_protocol,
+)
+
+
+def inspect(path: str) -> None:
+    frame = pd.read_parquet(path)
+    failures = []
+    checked = 0
+    for row_idx, row in frame.iterrows():
+        record = {
+            "messages": row["messages"],
+            "turn_stage": row.get("turn_stage", ""),
+            "paper_turn3_required": row.get("paper_turn3_required", None),
+        }
+        if not record_requires_paper_turn3_protocol(record):
+            continue
+        checked += 1
+        content = get_last_assistant_content(record)
+        expected_len = int(row.get("forecast_horizon", 96) or 96)
+        ok, reason, pred_len = check_paper_turn3_protocol(content, expected_len=expected_len)
+        if not ok:
+            failures.append((int(row_idx), reason, int(pred_len)))
+            if len(failures) >= 5:
+                break
+    if checked <= 0:
+        raise SystemExit(f"SFT parquet {path} does not contain any refinement rows to validate.")
+    if failures:
+        raise SystemExit(
+            f"SFT parquet {path} is not paper-aligned turn-3 protocol. "
+            f"First failures: {failures}"
+        )
+    print(f"[SFT TURN3 PROTOCOL] path={path} checked={checked} total={len(frame)} status=ok")
+
+
+inspect(sys.argv[1])
+inspect(sys.argv[2])
+PY
 SAVE_DIR="${SAVE_DIR:-${SFT_SAVE_DIR:-$PROJECT_DIR/artifacts/checkpoints/sft/time_series_forecast_sft}}"
 PROJECT_NAME="${PROJECT_NAME:-${SFT_PROJECT_NAME:-TimeSeriesForecast-SFT}}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-${SFT_EXPERIMENT_NAME:-qwen3-1.7b-etth1-ot-sft}}"

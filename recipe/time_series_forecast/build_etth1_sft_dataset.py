@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 import numpy as np
 import pandas as pd
 
 from recipe.time_series_forecast.prompts import (
+    FEATURE_TOOL_SCHEMAS,
+    PREDICT_TIMESERIES_TOOL_SCHEMA,
     build_runtime_user_prompt,
     build_timeseries_system_prompt,
 )
@@ -21,7 +24,7 @@ from recipe.time_series_forecast.dataset_identity import (
     DATASET_KIND_TEACHER_CURATED_SFT,
     validate_sibling_metadata,
 )
-from recipe.time_series_forecast.diagnostic_policy import select_feature_tool_names
+from recipe.time_series_forecast.diagnostic_policy import plan_diagnostic_tool_batches
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
 from recipe.time_series_forecast.utils import (
     compact_prediction_tool_output_from_string,
@@ -44,7 +47,19 @@ from recipe.time_series_forecast.utils import (
 
 
 SUPPORTED_PREDICTION_MODELS = {"patchtst", "itransformer", "arima", "chronos2"}
-DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same2")
+TURN3_TARGET_MODE_PAPER_STRICT = "paper_strict"
+TURN3_TARGET_MODE_ENGINEERING_REFINE = "engineering_refine"
+SUPPORTED_TURN3_TARGET_MODES = {
+    TURN3_TARGET_MODE_PAPER_STRICT,
+    TURN3_TARGET_MODE_ENGINEERING_REFINE,
+}
+DEFAULT_TURN3_TARGET_MODE = TURN3_TARGET_MODE_PAPER_STRICT
+DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise_heuristicroute")
+DEFAULT_CURATED_INPUT_DIR = Path("dataset/ett_sft_etth1_runtime_teacher200_paper_same2")
+DEFAULT_TRAIN_JSONL = DEFAULT_CURATED_INPUT_DIR / "train_curated.jsonl"
+DEFAULT_VAL_JSONL = DEFAULT_CURATED_INPUT_DIR / "val_curated.jsonl"
+DEFAULT_TEST_JSONL = DEFAULT_CURATED_INPUT_DIR / "test_curated.jsonl"
+DEFAULT_TRAIN_STAGE_REPEAT_FACTORS = {"diagnostic": 1, "routing": 1, "refinement": 1}
 
 
 @dataclass(frozen=True)
@@ -63,11 +78,294 @@ FEATURE_TOOL_BUILDERS = (
     ("extract_data_quality", lambda values: format_data_quality(extract_data_quality(values))),
     ("extract_event_summary", lambda values: format_event_summary(extract_event_summary(values))),
 )
+FEATURE_TOOL_SCHEMA_BY_NAME = {
+    str(schema["function"]["name"]): schema for schema in FEATURE_TOOL_SCHEMAS
+}
+FEATURE_TOOL_LABELS = {
+    "extract_basic_statistics": "basic statistics",
+    "extract_within_channel_dynamics": "within-channel dynamics",
+    "extract_forecast_residuals": "forecast residual patterns",
+    "extract_data_quality": "data quality",
+    "extract_event_summary": "event-level changes",
+}
+EVENT_PATTERN_NAMES = ["rise", "fall", "flat", "oscillation"]
+ROUTING_MODEL_RATIONALES = {
+    "patchtst": "patch-level local patterns and seasonality",
+    "itransformer": "global temporal dependencies and trend interactions",
+    "arima": "stable linear autocorrelation structure",
+    "chronos2": "irregular dynamics that benefit from a strong general forecasting prior",
+}
+
+
+def _last_assistant_content(messages: Any) -> str:
+    if not isinstance(messages, list):
+        return ""
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "assistant" and isinstance(msg.get("content"), str):
+            content = msg["content"].strip()
+            if content:
+                return content
+    return ""
+
+
+def _coerce_bool_flag(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return bool(int(value))
+    if isinstance(value, float) and pd.isna(value):
+        return default
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in {"1", "true", "yes", "y"}:
+        return True
+    if text in {"0", "false", "no", "n"}:
+        return False
+    return default
+
+
+def _row_requires_paper_turn3_protocol(row: Any) -> bool:
+    explicit_flag = row.get("paper_turn3_required") if hasattr(row, "get") else None
+    if explicit_flag is not None and not (isinstance(explicit_flag, float) and pd.isna(explicit_flag)):
+        return _coerce_bool_flag(explicit_flag, default=False)
+
+    turn_stage = str((row.get("turn_stage") if hasattr(row, "get") else "") or "").strip().lower()
+    if turn_stage:
+        return turn_stage == "refinement"
+    return True
+
+
+def _source_level_frame(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe is None or dataframe.empty:
+        return dataframe
+
+    if "turn_stage" in dataframe.columns:
+        refinement_df = dataframe.loc[dataframe["turn_stage"] == "refinement"].copy()
+        if not refinement_df.empty:
+            sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in refinement_df.columns]
+            if sort_columns:
+                refinement_df = refinement_df.sort_values(sort_columns, kind="stable")
+            return refinement_df.reset_index(drop=True)
+
+    if "source_sample_index" in dataframe.columns:
+        sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in dataframe.columns]
+        ordered = dataframe.sort_values(sort_columns or ["source_sample_index"], kind="stable")
+        return ordered.drop_duplicates(subset=["source_sample_index"], keep="last").reset_index(drop=True)
+    return dataframe.reset_index(drop=True)
+
+
+def _paper_turn3_protocol_reason(content: str, expected_len: int) -> str:
+    if not content:
+        return "empty_last_assistant"
+    match = re.fullmatch(r"\s*<think>(.*?)</think>\s*<answer>(.*?)</answer>\s*", content, re.DOTALL)
+    if match is None:
+        if "<think>" not in content and "</think>" not in content:
+            return "missing_think_block"
+        if "<think>" in content and "</think>" not in content:
+            return "missing_think_close_tag"
+        if "</think>" in content and "<think>" not in content:
+            return "missing_think_open_tag"
+        if "<answer>" not in content and "</answer>" not in content:
+            return "missing_answer_block"
+        if "<answer>" in content and "</answer>" not in content:
+            return "missing_answer_close_tag"
+        if "</answer>" in content and "<answer>" not in content:
+            return "missing_answer_open_tag"
+        return "extra_text_outside_tags"
+
+    answer_text = match.group(2).strip()
+    lines = [line.strip() for line in answer_text.splitlines() if line.strip()]
+    values = _extract_prediction_values(answer_text)
+    if len(lines) != expected_len:
+        return f"invalid_answer_shape:lines={len(lines)},expected={expected_len}"
+    if len(values) != expected_len:
+        return f"invalid_answer_shape:values={len(values)},expected={expected_len}"
+    return "ok"
+
+
+def _summarize_paper_turn3_protocol(dataframe: pd.DataFrame) -> dict[str, Any]:
+    total = int(len(dataframe))
+    reason_counter: Counter[str] = Counter()
+    invalid_examples: list[dict[str, Any]] = []
+    checked_count = 0
+
+    for row_idx, row in dataframe.iterrows():
+        if not _row_requires_paper_turn3_protocol(row):
+            continue
+        checked_count += 1
+        expected_len = int(row.get("forecast_horizon", 96) or 96)
+        content = _last_assistant_content(row.get("messages"))
+        reason = _paper_turn3_protocol_reason(content, expected_len)
+        reason_counter[reason] += 1
+        if reason != "ok" and len(invalid_examples) < 5:
+            invalid_examples.append(
+                {
+                    "row_index": int(row_idx),
+                    "sample_index": int(row.get("sample_index", -1) or -1),
+                    "reason": reason,
+                    "assistant_head": content[:200],
+                }
+            )
+
+    valid_count = int(reason_counter.get("ok", 0))
+    invalid_count = checked_count - valid_count
+    return {
+        "turn3_protocol": "paper_think_answer_xml",
+        "turn3_protocol_checked_count": int(checked_count),
+        "turn3_protocol_skipped_count": int(max(total - checked_count, 0)),
+        "turn3_protocol_valid_count": valid_count,
+        "turn3_protocol_invalid_count": int(invalid_count),
+        "turn3_protocol_valid_ratio": float(valid_count / checked_count) if checked_count > 0 else 0.0,
+        "turn3_protocol_reason_distribution": {str(k): int(v) for k, v in sorted(reason_counter.items())},
+        "turn3_protocol_invalid_examples": invalid_examples,
+    }
+
+
+def _validate_paper_turn3_protocol(dataframe: pd.DataFrame, *, split_name: str, output_path: Path) -> dict[str, Any]:
+    summary = _summarize_paper_turn3_protocol(dataframe)
+    if int(summary["turn3_protocol_checked_count"]) <= 0:
+        raise ValueError(
+            f"{split_name} SFT parquet at {output_path} does not contain any refinement records to validate."
+        )
+    if int(summary["turn3_protocol_invalid_count"]) > 0:
+        raise ValueError(
+            f"{split_name} SFT parquet is not paper-aligned at {output_path}. "
+            f"reason_distribution={summary['turn3_protocol_reason_distribution']} "
+            f"examples={summary['turn3_protocol_invalid_examples']}"
+        )
+    return summary
 
 
 def _normalize_teacher_model(model_name: Any) -> str:
     model = str(model_name or "patchtst").strip().lower()
     return model if model in SUPPORTED_PREDICTION_MODELS else "patchtst"
+
+
+def _compute_routing_feature_snapshot(history_values: Sequence[float]) -> dict[str, Any]:
+    values = [float(value) for value in history_values]
+    basic = extract_basic_statistics(values)
+    dynamics = extract_within_channel_dynamics(values)
+    residuals = extract_forecast_residuals(values)
+    quality = extract_data_quality(values)
+    events = extract_event_summary(values)
+    dominant_pattern_idx = int(float(events.get("event_dominant_pattern", 0.0) or 0.0))
+    dominant_pattern_idx = min(max(dominant_pattern_idx, 0), len(EVENT_PATTERN_NAMES) - 1)
+    return {
+        "acf1": float(basic.get("acf1", 0.0)),
+        "acf_seasonal": float(basic.get("acf_seasonal", 0.0)),
+        "cusum_max": float(basic.get("cusum_max", 0.0)),
+        "changepoint_count": float(dynamics.get("changepoint_count", 0.0)),
+        "peak_count": float(dynamics.get("peak_count", 0.0)),
+        "peak_spacing_cv": float(dynamics.get("peak_spacing_cv", 0.0)),
+        "monotone_duration": float(dynamics.get("monotone_duration", 0.0)),
+        "residual_exceed_ratio": float(residuals.get("residual_exceed_ratio", 0.0)),
+        "quality_quantization_score": float(quality.get("quality_quantization_score", 0.0)),
+        "quality_saturation_ratio": float(quality.get("quality_saturation_ratio", 0.0)),
+        "dominant_pattern": EVENT_PATTERN_NAMES[dominant_pattern_idx],
+    }
+
+
+def _heuristic_routing_scores(feature_snapshot: dict[str, Any]) -> dict[str, float]:
+    acf1 = float(feature_snapshot.get("acf1", 0.0))
+    acf_seasonal = float(feature_snapshot.get("acf_seasonal", 0.0))
+    cusum_max = float(feature_snapshot.get("cusum_max", 0.0))
+    changepoint_count = float(feature_snapshot.get("changepoint_count", 0.0))
+    peak_count = float(feature_snapshot.get("peak_count", 0.0))
+    peak_spacing_cv = float(feature_snapshot.get("peak_spacing_cv", 0.0))
+    monotone_duration = float(feature_snapshot.get("monotone_duration", 0.0))
+    residual_exceed_ratio = float(feature_snapshot.get("residual_exceed_ratio", 0.0))
+    quality_quantization_score = float(feature_snapshot.get("quality_quantization_score", 0.0))
+    quality_saturation_ratio = float(feature_snapshot.get("quality_saturation_ratio", 0.0))
+
+    scores = {model_name: 0.0 for model_name in sorted(SUPPORTED_PREDICTION_MODELS)}
+
+    scores["arima"] += 2.0 if acf1 >= 0.93 else (1.0 if acf1 >= 0.88 else 0.0)
+    scores["arima"] += 1.5 if abs(acf_seasonal) <= 0.15 else 0.0
+    scores["arima"] += 1.5 if changepoint_count <= 1.0 else (0.5 if changepoint_count <= 2.0 else -1.0)
+    scores["arima"] += 1.0 if residual_exceed_ratio <= 0.04 else (-0.5 if residual_exceed_ratio >= 0.06 else 0.0)
+    scores["arima"] += 0.5 if peak_count <= 3.0 else -0.5
+
+    scores["patchtst"] += 1.5 if acf_seasonal >= 0.12 else 0.0
+    scores["patchtst"] += 1.5 if 2.0 <= peak_count <= 4.0 else (0.5 if peak_count == 5.0 else -0.5)
+    scores["patchtst"] += 1.0 if peak_spacing_cv <= 0.22 else 0.0
+    scores["patchtst"] += 0.8 if changepoint_count <= 2.0 else 0.0
+    scores["patchtst"] += 0.5 if residual_exceed_ratio <= 0.05 else 0.0
+
+    scores["itransformer"] += 2.0 if changepoint_count >= 3.0 else (1.0 if changepoint_count >= 2.0 else 0.0)
+    scores["itransformer"] += 1.2 if cusum_max >= 90.0 else (0.5 if cusum_max >= 70.0 else 0.0)
+    scores["itransformer"] += 0.8 if monotone_duration >= 0.12 else 0.0
+    scores["itransformer"] += 0.5 if acf_seasonal >= 0.18 else 0.0
+    scores["itransformer"] += 0.5 if peak_count >= 4.0 else 0.0
+
+    scores["chronos2"] += 2.0 if residual_exceed_ratio >= 0.06 else (1.0 if residual_exceed_ratio >= 0.05 else 0.0)
+    scores["chronos2"] += 1.2 if peak_count >= 5.0 else 0.0
+    scores["chronos2"] += 1.0 if peak_spacing_cv >= 0.30 else 0.0
+    scores["chronos2"] += 0.8 if quality_saturation_ratio >= 0.05 or quality_quantization_score >= 0.16 else 0.0
+    scores["chronos2"] += 0.5 if acf1 <= 0.88 else 0.0
+    return scores
+
+
+def _select_prediction_model_by_heuristic(history_values: Sequence[float]) -> tuple[str, dict[str, Any], str]:
+    feature_snapshot = _compute_routing_feature_snapshot(history_values)
+    acf1 = float(feature_snapshot["acf1"])
+    acf_seasonal = float(feature_snapshot["acf_seasonal"])
+    changepoint_count = float(feature_snapshot["changepoint_count"])
+    residual_exceed_ratio = float(feature_snapshot["residual_exceed_ratio"])
+    peak_count = float(feature_snapshot["peak_count"])
+    peak_spacing_cv = float(feature_snapshot["peak_spacing_cv"])
+    monotone_duration = float(feature_snapshot["monotone_duration"])
+    cusum_max = float(feature_snapshot["cusum_max"])
+    dominant_pattern = str(feature_snapshot["dominant_pattern"])
+    quality_issue = (
+        float(feature_snapshot["quality_saturation_ratio"]) >= 0.05
+        or float(feature_snapshot["quality_quantization_score"]) >= 0.16
+    )
+
+    if residual_exceed_ratio >= 0.06 or quality_issue or (peak_count >= 5.0 and peak_spacing_cv >= 0.30):
+        return (
+            "chronos2",
+            feature_snapshot,
+            "The window is irregular or noisy, so I avoid brittle classical assumptions and prefer a robust foundation forecaster.",
+        )
+    if acf1 >= 0.93 and abs(acf_seasonal) <= 0.15 and changepoint_count <= 1.0 and residual_exceed_ratio <= 0.04 and peak_count <= 3.0:
+        return (
+            "arima",
+            feature_snapshot,
+            "The series remains stable with strong short-lag autocorrelation and limited structural change, so a linear seasonal forecaster is sufficient.",
+        )
+    if changepoint_count >= 3.0 or (cusum_max >= 90.0 and monotone_duration >= 0.10):
+        return (
+            "itransformer",
+            feature_snapshot,
+            "The series shows regime shifts and longer-range structural drift, so I prefer a model that can absorb global dependency changes.",
+        )
+    if acf_seasonal >= 0.12 and 2.0 <= peak_count <= 5.0 and peak_spacing_cv <= 0.25:
+        return (
+            "patchtst",
+            feature_snapshot,
+            "The window shows repeatable local seasonal motifs with reasonably regular peaks, so a patch-based temporal model is a good fit.",
+        )
+
+    scores = _heuristic_routing_scores(feature_snapshot)
+    selected_model = max(
+        scores.items(),
+        key=lambda item: (
+            float(item[1]),
+            {"arima": 0, "patchtst": 1, "itransformer": 2, "chronos2": 3}[str(item[0])],
+        ),
+    )[0]
+    fallback_reason_by_model = {
+        "arima": "The diagnostics still look comparatively stable, so I choose the simplest structured forecaster.",
+        "patchtst": "The diagnostics suggest local repeating motifs, so I choose the patch-based temporal model.",
+        "itransformer": "The diagnostics indicate structural drift, so I choose the global-dependency forecaster.",
+        "chronos2": "The diagnostics remain hard to explain with simple assumptions, so I choose the robust foundation forecaster.",
+    }
+    if dominant_pattern == "oscillation" and selected_model == "arima":
+        selected_model = "chronos2"
+    return selected_model, feature_snapshot, fallback_reason_by_model[selected_model]
 
 
 def _make_tool_call(tool_name: str, arguments: dict[str, Any], call_id: str) -> dict[str, Any]:
@@ -100,32 +398,13 @@ async def _predict_with_runtime_tools(
         model_name=model_name,
     )
     last_timestamp = get_last_timestamp(historical_data)
-    if not last_timestamp:
-        raise ValueError("Unable to infer the last historical timestamp for teacher prediction formatting.")
     return format_predictions_to_string(pred_df, last_timestamp)
 
 
 def build_feature_tool_results(values: list[float]) -> list[ToolResult]:
-    basic_features = extract_basic_statistics(values)
-    dynamics_features = extract_within_channel_dynamics(values)
-    residual_features = extract_forecast_residuals(values)
-    quality_features = extract_data_quality(values)
-    event_features = extract_event_summary(values)
-
-    tool_outputs = {
-        "extract_basic_statistics": format_basic_statistics(basic_features),
-        "extract_within_channel_dynamics": format_within_channel_dynamics(dynamics_features),
-        "extract_forecast_residuals": format_forecast_residuals(residual_features),
-        "extract_data_quality": format_data_quality(quality_features),
-        "extract_event_summary": format_event_summary(event_features),
-    }
-
-    selected_tool_names = set(select_feature_tool_names(values))
-
     return [
-        ToolResult(tool_name=name, tool_output=tool_outputs[name])
-        for name, _builder in FEATURE_TOOL_BUILDERS
-        if name in selected_tool_names
+        ToolResult(tool_name=name, tool_output=builder(values))
+        for name, builder in FEATURE_TOOL_BUILDERS
     ]
 
 
@@ -170,6 +449,16 @@ def _prediction_text_from_values(values: list[float]) -> str:
 
 def _feature_tool_signature(selected_feature_tools: list[str]) -> str:
     return "->".join(selected_feature_tools) if selected_feature_tools else "none"
+
+
+def _normalize_turn3_target_mode(turn3_target_mode: str | None) -> str:
+    mode = str(turn3_target_mode or DEFAULT_TURN3_TARGET_MODE).strip().lower()
+    if mode not in SUPPORTED_TURN3_TARGET_MODES:
+        raise ValueError(
+            f"Unsupported turn3_target_mode={turn3_target_mode!r}. "
+            f"Expected one of {sorted(SUPPORTED_TURN3_TARGET_MODES)}."
+        )
+    return mode
 
 
 def _median_abs_deviation(values: list[float]) -> float:
@@ -426,7 +715,9 @@ def _build_turn3_target(
     forecast_horizon: int,
     model_name: str,
     selected_feature_tools: list[str],
+    turn3_target_mode: str = DEFAULT_TURN3_TARGET_MODE,
 ) -> dict[str, Any]:
+    turn3_target_mode = _normalize_turn3_target_mode(turn3_target_mode)
     base_values = _require_prediction_values(base_prediction_text, forecast_horizon, source_name=f"{model_name}_base")
     reward_model = sample.get("reward_model", {}) if isinstance(sample.get("reward_model"), dict) else {}
     ground_truth_values = _extract_prediction_values(str(reward_model.get("ground_truth", "") or ""))
@@ -435,6 +726,20 @@ def _build_turn3_target(
             f"ground_truth length must be at least forecast_horizon={forecast_horizon}, got {len(ground_truth_values)}"
         )
     ground_truth_values = ground_truth_values[:forecast_horizon]
+    best_delta_summary = _summarize_refine_delta(base_values, base_values)
+    if turn3_target_mode == TURN3_TARGET_MODE_PAPER_STRICT:
+        return {
+            "turn3_target_type": "validated_keep",
+            "refine_ops": [],
+            "refine_ops_signature": "none",
+            "refine_gain_mse": 0.0,
+            "refine_gain_mae": 0.0,
+            "turn3_trigger_reason": "evidence_consistent",
+            "base_teacher_prediction_text": _prediction_text_from_values(base_values),
+            "refined_prediction_text": _prediction_text_from_values(base_values),
+            **best_delta_summary,
+        }
+
     score_margin = float(sample.get("teacher_eval_score_margin", 0.0) or 0.0)
     candidate_refinements = _generate_local_refinement_candidates(base_values, history_values)
     attempt_refine, trigger_reasons = _should_attempt_refinement(
@@ -449,7 +754,6 @@ def _build_turn3_target(
     best_ops: list[str] = []
     best_mse = base_mse
     best_mae = base_mae
-    best_delta_summary = _summarize_refine_delta(base_values, base_values)
     best_trigger_reasons = ["evidence_consistent"]
 
     if attempt_refine:
@@ -494,8 +798,185 @@ def _build_turn3_target(
     }
 
 
-def build_final_answer(prediction_values: list[float]) -> str:
-    return f"<answer>\n{_prediction_text_from_values(prediction_values)}\n</answer>"
+def _format_refine_ops_for_reflection(refine_ops: list[str]) -> str:
+    if not refine_ops:
+        return "keep the selected-model forecast unchanged"
+
+    name_map = {
+        "isolated_spike_smoothing": "smooth an isolated spike",
+        "flat_tail_repair": "repair a flat tail",
+        "local_level_adjust": "adjust a local level shift",
+        "local_slope_adjust": "adjust a local slope change",
+        "amplitude_clip": "clip an implausible amplitude excursion",
+    }
+    phrases = [name_map.get(op, op.replace("_", " ")) for op in refine_ops]
+    if len(phrases) == 1:
+        return phrases[0]
+    if len(phrases) == 2:
+        return f"{phrases[0]} and {phrases[1]}"
+    return ", ".join(phrases[:-1]) + f", and {phrases[-1]}"
+
+
+def _format_phrase_list(phrases: Sequence[str]) -> str:
+    unique_phrases = [phrase for phrase in dict.fromkeys(phrases) if phrase]
+    if not unique_phrases:
+        return ""
+    if len(unique_phrases) == 1:
+        return unique_phrases[0]
+    if len(unique_phrases) == 2:
+        return f"{unique_phrases[0]} and {unique_phrases[1]}"
+    return ", ".join(unique_phrases[:-1]) + f", and {unique_phrases[-1]}"
+
+
+def _format_routing_metric_value(metric_name: str, metric_value: Any) -> str:
+    if isinstance(metric_value, str):
+        return metric_value
+    try:
+        value = float(metric_value)
+    except Exception:
+        return str(metric_value)
+    if metric_name in {"Changepoint Count", "Peak Count"}:
+        return f"{value:.1f}"
+    return f"{value:.4f}"
+
+
+def _build_routing_metric_items(
+    *,
+    history_values: Sequence[float],
+    selected_feature_tools: Sequence[str],
+) -> list[str]:
+    metric_items: list[tuple[str, Any]] = []
+    selected = set(selected_feature_tools or [])
+    values = [float(value) for value in history_values]
+
+    if "extract_basic_statistics" in selected:
+        basic = extract_basic_statistics(values)
+        metric_items.extend(
+            [
+                ("ACF(1)", basic.get("acf1", 0.0)),
+                ("ACF(seasonal)", basic.get("acf_seasonal", 0.0)),
+            ]
+        )
+
+    if "extract_within_channel_dynamics" in selected:
+        dynamics = extract_within_channel_dynamics(values)
+        metric_items.extend(
+            [
+                ("Changepoint Count", dynamics.get("changepoint_count", 0.0)),
+                ("Peak Count", dynamics.get("peak_count", 0.0)),
+            ]
+        )
+
+    if "extract_forecast_residuals" in selected:
+        residuals = extract_forecast_residuals(values)
+        metric_items.append(("Exceed Ratio", residuals.get("residual_exceed_ratio", 0.0)))
+
+    if "extract_event_summary" in selected:
+        events = extract_event_summary(values)
+        dominant_idx = int(float(events.get("event_dominant_pattern", 0.0) or 0.0))
+        dominant_idx = min(max(dominant_idx, 0), len(EVENT_PATTERN_NAMES) - 1)
+        metric_items.append(("Dominant Pattern", EVENT_PATTERN_NAMES[dominant_idx]))
+
+    return [
+        f"{metric_name}={_format_routing_metric_value(metric_name, metric_value)}"
+        for metric_name, metric_value in metric_items
+    ]
+
+
+def build_routing_reflection(
+    *,
+    model_name: str,
+    history_values: Sequence[float],
+    selected_feature_tools: Sequence[str],
+    decision_reason: str = "",
+) -> str:
+    metric_items = _build_routing_metric_items(
+        history_values=history_values,
+        selected_feature_tools=selected_feature_tools,
+    )
+    if metric_items:
+        reason_text = str(decision_reason or "").strip()
+        if reason_text:
+            reason_text = f"\n{reason_text}"
+        return (
+            f"Observed diagnostics: {'; '.join(metric_items)}.\n"
+            f"Decision: {model_name}.\n"
+            f"{reason_text.lstrip()}\n"
+            f"I will call predict_time_series with {model_name}."
+        )
+
+    evidence_phrases = [
+        FEATURE_TOOL_LABELS.get(tool_name, tool_name.replace("_", " "))
+        for tool_name in selected_feature_tools
+    ]
+    evidence_text = _format_phrase_list(evidence_phrases)
+    model_rationale = ROUTING_MODEL_RATIONALES.get(model_name, "the observed temporal structure")
+    if evidence_text:
+        return (
+            f"Decision: {model_name}.\n"
+            f"I reviewed the diagnostic evidence from {evidence_text}. "
+            f"The observed series is most compatible with {model_rationale}, "
+            f"so I will call predict_time_series with {model_name}."
+        )
+    return (
+        f"Decision: {model_name}.\n"
+        f"The observed series is most compatible with {model_rationale}, "
+        f"so I will call predict_time_series with {model_name}."
+    )
+
+
+def build_final_answer(
+    prediction_values: list[float],
+    *,
+    turn3_target_type: str,
+    model_name: str,
+    refine_ops: list[str],
+) -> str:
+    if turn3_target_type == "local_refine":
+        reflection = (
+            f"The selected {model_name} forecast is mostly consistent with the diagnostics, "
+            f"but I apply a small local correction to {_format_refine_ops_for_reflection(refine_ops)} "
+            "while preserving the overall trajectory."
+        )
+    else:
+        reflection = (
+            f"The selected {model_name} forecast is consistent with the diagnostic evidence, "
+            "so I keep the forecast unchanged."
+        )
+
+    return (
+        f"<think>\n{reflection}\n</think>\n"
+        f"<answer>\n{_prediction_text_from_values(prediction_values)}\n</answer>"
+    )
+
+
+def _make_stage_record(
+    *,
+    shared_fields: dict[str, Any],
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    turn_stage: str,
+    turn_stage_order: int,
+    trajectory_turn_count: int,
+    current_required_feature_tools: list[str],
+    completed_feature_tools_before_turn: list[str],
+    history_analysis_count_before_turn: int,
+    paper_turn3_required: bool,
+    diagnostic_batch_index: int = -1,
+) -> dict[str, Any]:
+    return {
+        **shared_fields,
+        "messages": messages,
+        "tools": copy.deepcopy(tools) if tools is not None else None,
+        "turn_stage": turn_stage,
+        "turn_stage_order": int(turn_stage_order),
+        "trajectory_turn_count": int(trajectory_turn_count),
+        "current_required_feature_tools": list(current_required_feature_tools),
+        "completed_feature_tools_before_turn": list(completed_feature_tools_before_turn),
+        "history_analysis_count_before_turn": int(history_analysis_count_before_turn),
+        "paper_turn3_required": bool(paper_turn3_required),
+        "diagnostic_batch_index": int(diagnostic_batch_index),
+    }
 
 
 def _resolve_prediction_text(
@@ -511,7 +992,15 @@ def _resolve_prediction_text(
     if allow_cached_reference:
         cached_teacher_prediction = str(sample.get("teacher_prediction_text", "") or "").strip()
         if cached_teacher_prediction:
-            return cached_teacher_prediction, "reference_teacher_cached"
+            try:
+                _require_prediction_values(
+                    cached_teacher_prediction,
+                    forecast_horizon,
+                    source_name=f"{model_name}_cached_teacher",
+                )
+                return cached_teacher_prediction, "reference_teacher_cached"
+            except Exception:
+                pass
     prediction_text = asyncio.run(
         _predict_with_runtime_tools(
             historical_data=historical_data,
@@ -524,7 +1013,12 @@ def _resolve_prediction_text(
     return prediction_text, "reference_teacher_runtime"
 
 
-def build_sft_record(sample: dict[str, Any]) -> dict[str, Any]:
+def build_sft_records(
+    sample: dict[str, Any],
+    *,
+    turn3_target_mode: str = DEFAULT_TURN3_TARGET_MODE,
+) -> list[dict[str, Any]]:
+    turn3_target_mode = _normalize_turn3_target_mode(turn3_target_mode)
     raw_prompt = sample["raw_prompt"][0]["content"]
     reward_model = sample.get("reward_model", {}) if isinstance(sample.get("reward_model"), dict) else {}
     task_spec = parse_task_prompt(raw_prompt, data_source=sample.get("data_source"))
@@ -539,36 +1033,51 @@ def build_sft_record(sample: dict[str, Any]) -> dict[str, Any]:
 
     feature_results = build_feature_tool_results(history_values)
     selected_feature_tools = [result.tool_name for result in feature_results]
-    history_analysis = [result.tool_output for result in feature_results]
+    feature_result_by_name = {result.tool_name: result for result in feature_results}
+    diagnostic_tool_batches = plan_diagnostic_tool_batches(selected_feature_tools, max_parallel_calls=5)
 
     reference_teacher_model = _normalize_teacher_model(sample.get("reference_teacher_model"))
     second_teacher_model = _normalize_teacher_model(sample.get("teacher_eval_second_best_model"))
+    selected_prediction_model, routing_feature_snapshot, routing_policy_reason = _select_prediction_model_by_heuristic(
+        history_values
+    )
+    routing_policy_source = "heuristic_rule_based"
+
+    def _resolve_selected_prediction(model_name: str) -> tuple[str, str]:
+        return _resolve_prediction_text(
+            sample=sample,
+            historical_data=historical_data,
+            data_source=data_source,
+            target_column=target_column,
+            forecast_horizon=forecast_horizon,
+            model_name=model_name,
+            allow_cached_reference=(model_name == reference_teacher_model),
+        )
 
     try:
-        base_prediction_text, base_prediction_source = _resolve_prediction_text(
-            sample=sample,
-            historical_data=historical_data,
-            data_source=data_source,
-            target_column=target_column,
-            forecast_horizon=forecast_horizon,
-            model_name=reference_teacher_model,
-            allow_cached_reference=True,
-        )
-        selected_prediction_model = reference_teacher_model
-    except Exception:
-        if second_teacher_model == reference_teacher_model:
-            raise
-        base_prediction_text, base_prediction_source = _resolve_prediction_text(
-            sample=sample,
-            historical_data=historical_data,
-            data_source=data_source,
-            target_column=target_column,
-            forecast_horizon=forecast_horizon,
-            model_name=second_teacher_model,
-            allow_cached_reference=False,
-        )
-        selected_prediction_model = second_teacher_model
-        base_prediction_source = "second_teacher_runtime"
+        base_prediction_text, base_prediction_source = _resolve_selected_prediction(selected_prediction_model)
+    except Exception as primary_exc:
+        fallback_models: list[str] = []
+        for fallback_model in [reference_teacher_model, second_teacher_model]:
+            fallback_model = _normalize_teacher_model(fallback_model)
+            if fallback_model == selected_prediction_model or fallback_model in fallback_models:
+                continue
+            fallback_models.append(fallback_model)
+
+        for fallback_model in fallback_models:
+            try:
+                base_prediction_text, base_prediction_source = _resolve_selected_prediction(fallback_model)
+                selected_prediction_model = fallback_model
+                routing_policy_source = "heuristic_runtime_fallback"
+                routing_policy_reason = (
+                    f"{routing_policy_reason} The planned model was unavailable during dataset construction, "
+                    f"so I fallback to {fallback_model}."
+                ).strip()
+                break
+            except Exception:
+                continue
+        else:
+            raise primary_exc
 
     turn3_target = _build_turn3_target(
         sample=sample,
@@ -577,6 +1086,7 @@ def build_sft_record(sample: dict[str, Any]) -> dict[str, Any]:
         forecast_horizon=forecast_horizon,
         model_name=selected_prediction_model,
         selected_feature_tools=selected_feature_tools,
+        turn3_target_mode=turn3_target_mode,
     )
     final_prediction_values = _require_prediction_values(
         turn3_target["refined_prediction_text"],
@@ -590,99 +1100,24 @@ def build_sft_record(sample: dict[str, Any]) -> dict[str, Any]:
     )
 
     system_prompt = build_timeseries_system_prompt(data_source=data_source, target_column=target_column)
-    turn_1_prompt = build_runtime_user_prompt(
-        data_source=data_source,
-        target_column=target_column,
-        lookback_window=lookback_window,
-        forecast_horizon=forecast_horizon,
-        time_series_data=historical_data,
-        history_analysis=[],
-        prediction_results=None,
-        required_feature_tools=selected_feature_tools,
-        completed_feature_tools=[],
-    )
-    turn_2_prompt = build_runtime_user_prompt(
-        data_source=data_source,
-        target_column=target_column,
-        lookback_window=lookback_window,
-        forecast_horizon=forecast_horizon,
-        time_series_data=historical_data,
-        history_analysis=history_analysis,
-        prediction_results=None,
-        required_feature_tools=selected_feature_tools,
-        completed_feature_tools=selected_feature_tools,
-    )
-    turn_3_prompt = build_runtime_user_prompt(
-        data_source=data_source,
-        target_column=target_column,
-        lookback_window=lookback_window,
-        forecast_horizon=forecast_horizon,
-        time_series_data=historical_data,
-        history_analysis=history_analysis,
-        prediction_results=tool_prediction_text,
-        prediction_model_used=selected_prediction_model,
-        required_feature_tools=selected_feature_tools,
-        completed_feature_tools=selected_feature_tools,
-    )
-
-    feature_tool_calls = [
-        _make_tool_call(tool_name=result.tool_name, arguments={}, call_id=f"call_{idx}_{result.tool_name}")
-        for idx, result in enumerate(feature_results, start=1)
-    ]
-    feature_tool_messages = [
-        {
-            "role": "tool",
-            "content": result.tool_output,
-            "tool_call_id": feature_tool_calls[idx]["id"],
-        }
-        for idx, result in enumerate(feature_results)
-    ]
-    prediction_tool_call = _make_tool_call(
-        tool_name="predict_time_series",
-        arguments={"model_name": selected_prediction_model},
-        call_id="call_predict_time_series",
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": turn_1_prompt},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": feature_tool_calls,
-        },
-        *feature_tool_messages,
-        {"role": "user", "content": turn_2_prompt},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [prediction_tool_call],
-        },
-        {
-            "role": "tool",
-            "content": tool_prediction_text,
-            "tool_call_id": prediction_tool_call["id"],
-        },
-        {"role": "user", "content": turn_3_prompt},
-        {
-            "role": "assistant",
-            "content": build_final_answer(final_prediction_values),
-        },
-    ]
-
-    return {
-        "messages": messages,
-        "sample_index": int(sample.get("index", -1)),
+    trajectory_turn_count = len(diagnostic_tool_batches) + 2
+    source_sample_index = int(sample.get("index", -1))
+    shared_fields = {
+        "source_sample_index": source_sample_index,
+        "source_uid": str(sample.get("uid") or ""),
         "data_source": data_source,
         "target_column": target_column,
         "forecast_horizon": forecast_horizon,
         "lookback_window": lookback_window,
         "reference_teacher_model": reference_teacher_model,
         "selected_prediction_model": selected_prediction_model,
+        "routing_policy_source": routing_policy_source,
+        "routing_policy_reason": routing_policy_reason,
         "base_prediction_source": base_prediction_source,
-        "selected_feature_tools": selected_feature_tools,
+        "selected_feature_tools": list(selected_feature_tools),
         "selected_feature_tool_count": len(selected_feature_tools),
         "selected_feature_tool_signature": _feature_tool_signature(selected_feature_tools),
+        "turn3_target_mode": turn3_target_mode,
         "turn3_target_type": turn3_target["turn3_target_type"],
         "turn3_trigger_reason": turn3_target["turn3_trigger_reason"],
         "refine_ops": turn3_target["refine_ops"],
@@ -704,32 +1139,205 @@ def build_sft_record(sample: dict[str, Any]) -> dict[str, Any]:
         "teacher_eval_scores": sample.get("teacher_eval_scores"),
     }
 
+    records: list[dict[str, Any]] = []
+    history_analysis: list[str] = []
+    completed_feature_tools: list[str] = []
+    feature_call_serial = 1
+    turn_stage_order = 0
+
+    for batch_idx, batch_tool_names in enumerate(diagnostic_tool_batches):
+        turn_prompt = build_runtime_user_prompt(
+            data_source=data_source,
+            target_column=target_column,
+            lookback_window=lookback_window,
+            forecast_horizon=forecast_horizon,
+            time_series_data=historical_data,
+            history_analysis=history_analysis,
+            prediction_results=None,
+            required_feature_tools=batch_tool_names,
+            completed_feature_tools=completed_feature_tools,
+            turn_stage="diagnostic",
+        )
+        feature_tool_calls = [
+            _make_tool_call(tool_name=tool_name, arguments={}, call_id=f"call_{feature_call_serial + idx}_{tool_name}")
+            for idx, tool_name in enumerate(batch_tool_names)
+        ]
+        diagnostic_tools = [copy.deepcopy(FEATURE_TOOL_SCHEMA_BY_NAME[name]) for name in batch_tool_names]
+        records.append(
+            _make_stage_record(
+                shared_fields=shared_fields,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": turn_prompt},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": feature_tool_calls,
+                    },
+                ],
+                tools=diagnostic_tools,
+                turn_stage="diagnostic",
+                turn_stage_order=turn_stage_order,
+                trajectory_turn_count=trajectory_turn_count,
+                current_required_feature_tools=list(batch_tool_names),
+                completed_feature_tools_before_turn=list(completed_feature_tools),
+                history_analysis_count_before_turn=len(history_analysis),
+                paper_turn3_required=False,
+                diagnostic_batch_index=batch_idx,
+            )
+        )
+        for tool_name in batch_tool_names:
+            result = feature_result_by_name[tool_name]
+            history_analysis.append(result.tool_output)
+            completed_feature_tools.append(tool_name)
+        feature_call_serial += len(batch_tool_names)
+        turn_stage_order += 1
+
+    routing_prompt = build_runtime_user_prompt(
+        data_source=data_source,
+        target_column=target_column,
+        lookback_window=lookback_window,
+        forecast_horizon=forecast_horizon,
+        time_series_data=historical_data,
+        history_analysis=history_analysis,
+        prediction_results=None,
+        required_feature_tools=selected_feature_tools,
+        completed_feature_tools=selected_feature_tools,
+        turn_stage="routing",
+    )
+    turn_3_prompt = build_runtime_user_prompt(
+        data_source=data_source,
+        target_column=target_column,
+        lookback_window=lookback_window,
+        forecast_horizon=forecast_horizon,
+        time_series_data=historical_data,
+        history_analysis=history_analysis,
+        prediction_results=tool_prediction_text,
+        prediction_model_used=selected_prediction_model,
+        required_feature_tools=selected_feature_tools,
+        completed_feature_tools=selected_feature_tools,
+        turn_stage="refinement",
+    )
+
+    prediction_tool_call = _make_tool_call(
+        tool_name="predict_time_series",
+        arguments={"model_name": selected_prediction_model},
+        call_id="call_predict_time_series",
+    )
+    records.append(
+        _make_stage_record(
+            shared_fields=shared_fields,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": routing_prompt},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": build_routing_reflection(
+                        model_name=selected_prediction_model,
+                        history_values=history_values,
+                        selected_feature_tools=selected_feature_tools,
+                        decision_reason=routing_policy_reason,
+                    ),
+                    "tool_calls": [prediction_tool_call],
+                },
+            ],
+            tools=[copy.deepcopy(PREDICT_TIMESERIES_TOOL_SCHEMA)],
+            turn_stage="routing",
+            turn_stage_order=turn_stage_order,
+            trajectory_turn_count=trajectory_turn_count,
+            current_required_feature_tools=list(selected_feature_tools),
+            completed_feature_tools_before_turn=list(selected_feature_tools),
+            history_analysis_count_before_turn=len(history_analysis),
+            paper_turn3_required=False,
+        )
+    )
+    turn_stage_order += 1
+    records.append(
+        _make_stage_record(
+            shared_fields=shared_fields,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": turn_3_prompt},
+                {
+                    "role": "assistant",
+                    "content": build_final_answer(
+                        final_prediction_values,
+                        turn3_target_type=turn3_target["turn3_target_type"],
+                        model_name=selected_prediction_model,
+                        refine_ops=turn3_target["refine_ops"],
+                    ),
+                },
+            ],
+            tools=None,
+            turn_stage="refinement",
+            turn_stage_order=turn_stage_order,
+            trajectory_turn_count=trajectory_turn_count,
+            current_required_feature_tools=list(selected_feature_tools),
+            completed_feature_tools_before_turn=list(selected_feature_tools),
+            history_analysis_count_before_turn=len(history_analysis),
+            paper_turn3_required=True,
+        )
+    )
+    return records
+
+
+def build_sft_record(
+    sample: dict[str, Any],
+    *,
+    turn3_target_mode: str = DEFAULT_TURN3_TARGET_MODE,
+) -> dict[str, Any]:
+    records = build_sft_records(sample, turn3_target_mode=turn3_target_mode)
+    if not records:
+        raise ValueError("build_sft_records returned no records")
+    for record in records:
+        if str(record.get("turn_stage") or "").strip().lower() == "refinement":
+            compatible = dict(record)
+            compatible["sample_index"] = int(sample.get("index", -1))
+            return compatible
+    compatible = dict(records[-1])
+    compatible["sample_index"] = int(sample.get("index", -1))
+    return compatible
+
 
 def convert_jsonl_to_sft_parquet(
     *,
     input_path: str | Path,
     output_path: str | Path,
     max_samples: int = -1,
+    turn3_target_mode: str = DEFAULT_TURN3_TARGET_MODE,
 ) -> pd.DataFrame:
+    turn3_target_mode = _normalize_turn3_target_mode(turn3_target_mode)
     input_path = Path(input_path)
     output_path = Path(output_path)
     records: list[dict[str, Any]] = []
+    source_sample_count = 0
 
     with input_path.open("r", encoding="utf-8") as handle:
         for line_idx, line in enumerate(handle):
-            if max_samples > 0 and len(records) >= max_samples:
+            if max_samples > 0 and source_sample_count >= max_samples:
                 break
             if not line.strip():
                 continue
             sample = json.loads(line)
-            records.append(build_sft_record(sample))
+            stage_records = build_sft_records(sample, turn3_target_mode=turn3_target_mode)
+            for record in stage_records:
+                row = dict(record)
+                row["sample_index"] = len(records)
+                records.append(row)
+            source_sample_count += 1
             if (line_idx + 1) % 500 == 0:
                 print(f"Processed {line_idx + 1} samples from {input_path}")
 
     dataframe = pd.DataFrame(records)
+    _validate_paper_turn3_protocol(dataframe, split_name=input_path.stem, output_path=output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dataframe.to_parquet(output_path, index=False)
-    print(f"Wrote {len(dataframe)} SFT samples to {output_path}")
+    checked_count = int(_summarize_paper_turn3_protocol(dataframe).get("turn3_protocol_checked_count", 0))
+    print(
+        f"Wrote {len(dataframe)} SFT records from {source_sample_count} source samples "
+        f"({checked_count} refinement targets) to {output_path}"
+    )
     return dataframe
 
 
@@ -761,11 +1369,16 @@ def _rebalance_train_turn3_targets(
     if "turn3_target_type" not in dataframe.columns:
         return dataframe
 
-    local_refine_mask = dataframe["turn3_target_type"] == "local_refine"
-    validated_keep_mask = dataframe["turn3_target_type"] == "validated_keep"
-    local_refine_df = dataframe.loc[local_refine_mask].copy()
-    validated_keep_df = dataframe.loc[validated_keep_mask].copy()
-    other_df = dataframe.loc[~(local_refine_mask | validated_keep_mask)].copy()
+    group_column = "source_sample_index" if "source_sample_index" in dataframe.columns else "sample_index"
+    if group_column not in dataframe.columns:
+        return dataframe
+
+    source_frame = _source_level_frame(dataframe)
+    local_refine_mask = source_frame["turn3_target_type"] == "local_refine"
+    validated_keep_mask = source_frame["turn3_target_type"] == "validated_keep"
+    local_refine_df = source_frame.loc[local_refine_mask].copy()
+    validated_keep_df = source_frame.loc[validated_keep_mask].copy()
+    other_df = source_frame.loc[~(local_refine_mask | validated_keep_mask)].copy()
 
     local_count = len(local_refine_df)
     keep_count = len(validated_keep_df)
@@ -777,35 +1390,76 @@ def _rebalance_train_turn3_targets(
     if keep_count <= max_keep_count:
         return dataframe
 
-    validated_keep_df = validated_keep_df.sort_values("sample_index").reset_index(drop=True)
+    validated_keep_df = validated_keep_df.sort_values(group_column).reset_index(drop=True)
     if max_keep_count <= 0:
         rebalanced_keep_df = validated_keep_df.iloc[0:0].copy()
     else:
         take_positions = np.linspace(0, keep_count - 1, num=max_keep_count, dtype=int)
         rebalanced_keep_df = validated_keep_df.iloc[take_positions].copy()
 
-    balanced = pd.concat([local_refine_df, rebalanced_keep_df, other_df], ignore_index=True)
+    kept_source_ids = set(local_refine_df[group_column].tolist())
+    kept_source_ids.update(rebalanced_keep_df[group_column].tolist())
+    kept_source_ids.update(other_df[group_column].tolist())
+
+    balanced = dataframe.loc[dataframe[group_column].isin(kept_source_ids)].copy()
+    sort_columns = [col for col in (group_column, "turn_stage_order", "sample_index") if col in balanced.columns]
+    if sort_columns:
+        balanced = balanced.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+    return balanced
+
+
+def _rebalance_train_stage_records(
+    dataframe: pd.DataFrame,
+    *,
+    stage_repeat_factors: dict[str, int] | None,
+) -> pd.DataFrame:
+    if dataframe.empty or not stage_repeat_factors:
+        return dataframe
+    if "turn_stage" not in dataframe.columns:
+        return dataframe
+
+    normalized_factors = {
+        str(stage).strip().lower(): max(1, int(factor))
+        for stage, factor in stage_repeat_factors.items()
+        if str(stage).strip()
+    }
+    if not normalized_factors:
+        return dataframe
+
+    repeated_frames: list[pd.DataFrame] = []
+    for _, row in dataframe.iterrows():
+        stage = str(row.get("turn_stage") or "").strip().lower()
+        repeat_factor = normalized_factors.get(stage, 1)
+        row_frame = pd.DataFrame([row.to_dict()])
+        repeated_frames.extend(row_frame.copy() for _ in range(max(1, repeat_factor)))
+
+    balanced = pd.concat(repeated_frames, ignore_index=True)
+    sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in balanced.columns]
+    if sort_columns:
+        balanced = balanced.sort_values(sort_columns, kind="stable").reset_index(drop=True)
     if "sample_index" in balanced.columns:
-        balanced = balanced.sort_values("sample_index").reset_index(drop=True)
+        balanced["sample_index"] = list(range(len(balanced)))
     return balanced
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build ETTh1 OT multi-turn SFT parquet from RL jsonl samples.")
+    parser = argparse.ArgumentParser(
+        description="Build ETTh1 OT step-wise runtime-aligned SFT parquet from teacher-curated jsonl samples."
+    )
     parser.add_argument(
         "--train-jsonl",
-        default="dataset/ett_rl_etth1_paper_same2/train.jsonl",
-        help="RL train jsonl path.",
+        default=str(DEFAULT_TRAIN_JSONL),
+        help="Teacher-curated train jsonl path.",
     )
     parser.add_argument(
         "--val-jsonl",
-        default="dataset/ett_rl_etth1_paper_same2/val.jsonl",
-        help="RL val jsonl path.",
+        default=str(DEFAULT_VAL_JSONL),
+        help="Teacher-curated val jsonl path.",
     )
     parser.add_argument(
         "--test-jsonl",
-        default="dataset/ett_rl_etth1_paper_same2/test.jsonl",
-        help="Optional RL test jsonl path.",
+        default=str(DEFAULT_TEST_JSONL),
+        help="Optional teacher-curated test jsonl path.",
     )
     parser.add_argument(
         "--output-dir",
@@ -816,18 +1470,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-samples", type=int, default=-1, help="Limit val sample count for debugging.")
     parser.add_argument("--max-test-samples", type=int, default=-1, help="Limit test sample count for debugging.")
     parser.add_argument(
+        "--turn3-target-mode",
+        choices=sorted(SUPPORTED_TURN3_TARGET_MODES),
+        default=DEFAULT_TURN3_TARGET_MODE,
+        help="Turn-3 target generation mode. Default keeps the selected forecast unchanged for paper-aligned SFT.",
+    )
+    parser.add_argument(
         "--train-min-local-refine-ratio",
         type=float,
         default=0.30,
         help="Minimum desired local_refine ratio in train parquet. Set <=0 to disable train rebalancing.",
+    )
+    parser.add_argument(
+        "--train-stage-repeat-factors",
+        default=json.dumps(DEFAULT_TRAIN_STAGE_REPEAT_FACTORS, ensure_ascii=False),
+        help=(
+            "JSON object of train-only stage repeat factors, e.g. "
+            '\'{"diagnostic":1,"routing":1,"refinement":1}\'. '
+            "Use {} to disable stage reweighting."
+        ),
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    turn3_target_mode = _normalize_turn3_target_mode(args.turn3_target_mode)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    effective_train_min_local_refine_ratio = (
+        0.0
+        if turn3_target_mode == TURN3_TARGET_MODE_PAPER_STRICT
+        else float(args.train_min_local_refine_ratio)
+    )
+    raw_train_stage_repeat_factors = json.loads(str(args.train_stage_repeat_factors))
+    train_stage_repeat_factors = {
+        str(stage).strip().lower(): max(1, int(factor))
+        for stage, factor in dict(raw_train_stage_repeat_factors).items()
+        if str(stage).strip()
+    }
 
     source_metadata_paths: list[Path] = []
     for split_path in (Path(args.train_jsonl), Path(args.val_jsonl), Path(args.test_jsonl)):
@@ -835,7 +1516,7 @@ def main() -> None:
             continue
         _, source_metadata_path = validate_sibling_metadata(
             split_path,
-            expected_kind=DATASET_KIND_TEACHER_CURATED_SFT,
+            expected_kind=(DATASET_KIND_TEACHER_CURATED_SFT, DATASET_KIND_RUNTIME_SFT_PARQUET),
         )
         source_metadata_paths.append(source_metadata_path)
     if source_metadata_paths:
@@ -850,21 +1531,32 @@ def main() -> None:
         input_path=args.train_jsonl,
         output_path=output_dir / "train.parquet",
         max_samples=args.max_train_samples,
+        turn3_target_mode=turn3_target_mode,
     )
     train_df = _rebalance_train_turn3_targets(
         train_df_raw,
-        min_local_refine_ratio=float(args.train_min_local_refine_ratio),
+        min_local_refine_ratio=effective_train_min_local_refine_ratio,
+    )
+    train_df = _rebalance_train_stage_records(
+        train_df,
+        stage_repeat_factors=train_stage_repeat_factors,
     )
     if len(train_df) != len(train_df_raw) or not train_df.equals(train_df_raw):
+        _validate_paper_turn3_protocol(train_df, split_name="train", output_path=output_dir / "train.parquet")
         train_df.to_parquet(output_dir / "train.parquet", index=False)
         print(
             f"Rebalanced train.parquet turn3_target_type distribution: "
             f"{_distribution_from_series(train_df['turn3_target_type'])}"
         )
+        print(
+            f"Rebalanced train.parquet turn_stage distribution: "
+            f"{_distribution_from_series(train_df['turn_stage'])}"
+        )
     val_df = convert_jsonl_to_sft_parquet(
         input_path=args.val_jsonl,
         output_path=output_dir / "val.parquet",
         max_samples=args.max_val_samples,
+        turn3_target_mode=turn3_target_mode,
     )
 
     test_count = 0
@@ -875,52 +1567,112 @@ def main() -> None:
             input_path=test_path,
             output_path=output_dir / "test.parquet",
             max_samples=args.max_test_samples,
+            turn3_target_mode=turn3_target_mode,
         )
         test_count = len(test_df)
 
+    train_protocol_summary = _summarize_paper_turn3_protocol(train_df)
+    val_protocol_summary = _summarize_paper_turn3_protocol(val_df)
+    test_protocol_summary = _summarize_paper_turn3_protocol(test_df) if test_df is not None and len(test_df) > 0 else {}
+
     metadata_kwargs = dict(
         dataset_kind=DATASET_KIND_RUNTIME_SFT_PARQUET,
-        pipeline_stage="runtime_multiturn_sft",
+        pipeline_stage="runtime_stepwise_sft",
+        turn3_protocol="paper_think_answer_xml",
+        turn3_target_mode=turn3_target_mode,
         train_samples_before_balance=len(train_df_raw),
         train_samples=len(train_df),
+        train_source_samples_before_balance=len(_source_level_frame(train_df_raw)),
+        train_source_samples=len(_source_level_frame(train_df)),
         val_samples=len(val_df),
+        val_source_samples=len(_source_level_frame(val_df)),
         test_samples=test_count,
-        train_min_local_refine_ratio=float(args.train_min_local_refine_ratio),
+        test_source_samples=len(_source_level_frame(test_df)) if test_df is not None else 0,
+        requested_train_min_local_refine_ratio=float(args.train_min_local_refine_ratio),
+        train_min_local_refine_ratio=effective_train_min_local_refine_ratio,
+        train_stage_repeat_factors=train_stage_repeat_factors,
         source_train_jsonl=str(Path(args.train_jsonl)),
         source_val_jsonl=str(Path(args.val_jsonl)),
         source_test_jsonl=str(test_path),
         source_curated_metadata_path=str(source_metadata_paths[0]) if source_metadata_paths else "",
-        train_turn3_target_type_distribution_before_balance=_distribution_from_series(train_df_raw["turn3_target_type"]),
-        train_reference_teacher_model_distribution=_distribution_from_series(train_df["reference_teacher_model"]),
-        train_selected_prediction_model_distribution=_distribution_from_series(train_df["selected_prediction_model"]),
-        train_turn3_target_type_distribution=_distribution_from_series(train_df["turn3_target_type"]),
-        train_turn3_trigger_reason_distribution=_distribution_from_series(train_df["turn3_trigger_reason"]),
-        train_refine_ops_signature_distribution=_distribution_from_series(train_df["refine_ops_signature"]),
+        train_turn_stage_distribution=_distribution_from_series(train_df["turn_stage"]),
+        val_turn_stage_distribution=_distribution_from_series(val_df["turn_stage"]),
+        train_turn3_target_type_distribution_before_balance=_distribution_from_series(
+            _source_level_frame(train_df_raw)["turn3_target_type"]
+        ),
+        train_reference_teacher_model_distribution=_distribution_from_series(
+            _source_level_frame(train_df)["reference_teacher_model"]
+        ),
+        train_selected_prediction_model_distribution=_distribution_from_series(
+            _source_level_frame(train_df)["selected_prediction_model"]
+        ),
+        train_turn3_target_type_distribution=_distribution_from_series(_source_level_frame(train_df)["turn3_target_type"]),
+        train_turn3_trigger_reason_distribution=_distribution_from_series(_source_level_frame(train_df)["turn3_trigger_reason"]),
+        train_refine_ops_signature_distribution=_distribution_from_series(_source_level_frame(train_df)["refine_ops_signature"]),
         train_selected_feature_tool_signature_distribution=_distribution_from_series(
-            train_df["selected_feature_tool_signature"]
+            _source_level_frame(train_df)["selected_feature_tool_signature"]
         ),
-        train_base_prediction_source_distribution=_distribution_from_series(train_df["base_prediction_source"]),
-        val_reference_teacher_model_distribution=_distribution_from_series(val_df["reference_teacher_model"]),
-        val_selected_prediction_model_distribution=_distribution_from_series(val_df["selected_prediction_model"]),
-        val_turn3_target_type_distribution=_distribution_from_series(val_df["turn3_target_type"]),
-        val_turn3_trigger_reason_distribution=_distribution_from_series(val_df["turn3_trigger_reason"]),
-        val_refine_ops_signature_distribution=_distribution_from_series(val_df["refine_ops_signature"]),
+        train_base_prediction_source_distribution=_distribution_from_series(
+            _source_level_frame(train_df)["base_prediction_source"]
+        ),
+        train_turn3_protocol_checked_count=int(train_protocol_summary.get("turn3_protocol_checked_count", 0)),
+        train_turn3_protocol_skipped_count=int(train_protocol_summary.get("turn3_protocol_skipped_count", 0)),
+        train_turn3_protocol_valid_count=int(train_protocol_summary.get("turn3_protocol_valid_count", 0)),
+        train_turn3_protocol_invalid_count=int(train_protocol_summary.get("turn3_protocol_invalid_count", 0)),
+        train_turn3_protocol_valid_ratio=float(train_protocol_summary.get("turn3_protocol_valid_ratio", 0.0)),
+        train_turn3_protocol_reason_distribution=dict(train_protocol_summary.get("turn3_protocol_reason_distribution", {})),
+        val_reference_teacher_model_distribution=_distribution_from_series(
+            _source_level_frame(val_df)["reference_teacher_model"]
+        ),
+        val_selected_prediction_model_distribution=_distribution_from_series(
+            _source_level_frame(val_df)["selected_prediction_model"]
+        ),
+        val_turn3_target_type_distribution=_distribution_from_series(_source_level_frame(val_df)["turn3_target_type"]),
+        val_turn3_trigger_reason_distribution=_distribution_from_series(_source_level_frame(val_df)["turn3_trigger_reason"]),
+        val_refine_ops_signature_distribution=_distribution_from_series(_source_level_frame(val_df)["refine_ops_signature"]),
         val_selected_feature_tool_signature_distribution=_distribution_from_series(
-            val_df["selected_feature_tool_signature"]
+            _source_level_frame(val_df)["selected_feature_tool_signature"]
         ),
-        val_base_prediction_source_distribution=_distribution_from_series(val_df["base_prediction_source"]),
+        val_base_prediction_source_distribution=_distribution_from_series(
+            _source_level_frame(val_df)["base_prediction_source"]
+        ),
+        val_turn3_protocol_checked_count=int(val_protocol_summary.get("turn3_protocol_checked_count", 0)),
+        val_turn3_protocol_skipped_count=int(val_protocol_summary.get("turn3_protocol_skipped_count", 0)),
+        val_turn3_protocol_valid_count=int(val_protocol_summary.get("turn3_protocol_valid_count", 0)),
+        val_turn3_protocol_invalid_count=int(val_protocol_summary.get("turn3_protocol_invalid_count", 0)),
+        val_turn3_protocol_valid_ratio=float(val_protocol_summary.get("turn3_protocol_valid_ratio", 0.0)),
+        val_turn3_protocol_reason_distribution=dict(val_protocol_summary.get("turn3_protocol_reason_distribution", {})),
     )
     if test_df is not None and len(test_df) > 0:
         metadata_kwargs.update(
-            test_reference_teacher_model_distribution=_distribution_from_series(test_df["reference_teacher_model"]),
-            test_selected_prediction_model_distribution=_distribution_from_series(test_df["selected_prediction_model"]),
-            test_turn3_target_type_distribution=_distribution_from_series(test_df["turn3_target_type"]),
-            test_turn3_trigger_reason_distribution=_distribution_from_series(test_df["turn3_trigger_reason"]),
-            test_refine_ops_signature_distribution=_distribution_from_series(test_df["refine_ops_signature"]),
-            test_selected_feature_tool_signature_distribution=_distribution_from_series(
-                test_df["selected_feature_tool_signature"]
+            test_turn_stage_distribution=_distribution_from_series(test_df["turn_stage"]),
+            test_reference_teacher_model_distribution=_distribution_from_series(
+                _source_level_frame(test_df)["reference_teacher_model"]
             ),
-            test_base_prediction_source_distribution=_distribution_from_series(test_df["base_prediction_source"]),
+            test_selected_prediction_model_distribution=_distribution_from_series(
+                _source_level_frame(test_df)["selected_prediction_model"]
+            ),
+            test_turn3_target_type_distribution=_distribution_from_series(
+                _source_level_frame(test_df)["turn3_target_type"]
+            ),
+            test_turn3_trigger_reason_distribution=_distribution_from_series(
+                _source_level_frame(test_df)["turn3_trigger_reason"]
+            ),
+            test_refine_ops_signature_distribution=_distribution_from_series(
+                _source_level_frame(test_df)["refine_ops_signature"]
+            ),
+            test_selected_feature_tool_signature_distribution=_distribution_from_series(
+                _source_level_frame(test_df)["selected_feature_tool_signature"]
+            ),
+            test_base_prediction_source_distribution=_distribution_from_series(
+                _source_level_frame(test_df)["base_prediction_source"]
+            ),
+            test_turn3_protocol_checked_count=int(test_protocol_summary.get("turn3_protocol_checked_count", 0)),
+            test_turn3_protocol_skipped_count=int(test_protocol_summary.get("turn3_protocol_skipped_count", 0)),
+            test_turn3_protocol_valid_count=int(test_protocol_summary.get("turn3_protocol_valid_count", 0)),
+            test_turn3_protocol_invalid_count=int(test_protocol_summary.get("turn3_protocol_invalid_count", 0)),
+            test_turn3_protocol_valid_ratio=float(test_protocol_summary.get("turn3_protocol_valid_ratio", 0.0)),
+            test_turn3_protocol_reason_distribution=dict(test_protocol_summary.get("turn3_protocol_reason_distribution", {})),
         )
 
     _write_metadata(

@@ -61,7 +61,7 @@ def build_timeseries_system_prompt(
 - Follow the CURRENT user turn instructions only.
 - Use tool calls only when tool schemas are available in the current turn.
 - If no tool schema is available, NEVER emit `<tool_call>`.
-- When the user asks for the final forecast, output ONLY the required `<answer>...</answer>` block.
+- When the user asks for the final forecast, output ONLY the required `<think>...</think><answer>...</answer>` blocks.
 - Never add markdown, bullets, or explanatory prose outside the requested output format.
 """
 
@@ -69,43 +69,54 @@ def build_timeseries_system_prompt(
 TIMESERIES_SYSTEM_PROMPT = build_timeseries_system_prompt()
 
 
-def truncate_time_series_data(data: str, head: int = 5, tail: int = 5) -> str:
-    lines = data.strip().split("\n")
-    if len(lines) <= head + tail:
+def truncate_time_series_data(data: str, recent_rows: int = 48) -> str:
+    lines = [line for line in data.strip().split("\n") if line.strip()]
+    if recent_rows <= 0 or len(lines) <= recent_rows:
         return data
 
-    head_lines = lines[:head]
-    tail_lines = lines[-tail:]
-    omitted = len(lines) - head - tail
-    return "\n".join(head_lines) + f"\n... ({omitted} rows omitted) ...\n" + "\n".join(tail_lines)
+    tail_lines = lines[-recent_rows:]
+    omitted = len(lines) - recent_rows
+    return f"... ({omitted} earlier rows omitted) ...\n" + "\n".join(tail_lines)
+
+
+def _normalize_turn_stage(turn_stage: Optional[str]) -> str:
+    stage = str(turn_stage or "").strip().lower()
+    if stage in {"diagnostic", "routing", "refinement"}:
+        return stage
+    return ""
 
 
 def get_runtime_turn_info(
     history_analysis: Sequence[str] | None,
     prediction_results: Optional[str],
     forecast_horizon: int = 96,
-    required_feature_tools: Sequence[str] | None = None,
-    completed_feature_tools: Sequence[str] | None = None,
-) -> tuple[int, str]:
-    has_predictions = bool(prediction_results)
-    required = [str(name) for name in (required_feature_tools or []) if str(name).strip()]
-    completed = {str(name) for name in (completed_feature_tools or []) if str(name).strip()}
-    missing = [name for name in required if name not in completed]
+    turn_stage: Optional[str] = None,
+) -> tuple[str, str]:
+    stage = _normalize_turn_stage(turn_stage)
+    if not stage:
+        has_predictions = bool(prediction_results)
+        has_history = bool(list(history_analysis or []))
+        if has_predictions:
+            stage = "refinement"
+        elif has_history:
+            stage = "routing"
+        else:
+            stage = "diagnostic"
 
-    if not has_predictions and missing:
-        if len(missing) == 1:
-            return 1, f"Call the remaining feature extraction tool `{missing[0]}`. Do NOT call predict_time_series yet."
-        missing_text = ", ".join(f"`{name}`" for name in missing)
-        return 1, f"Call the remaining feature extraction tools in parallel when possible: {missing_text}. Do NOT call predict_time_series yet."
-    if not has_predictions:
-        return 2, "Call predict_time_series with your chosen model (e.g., 'chronos2')."
-    return 3, (
-        "Output your final answer in <answer>...</answer> format using the selected model prediction as the base forecast. "
-        "Keep it unchanged if it is already consistent; if you refine it, keep the change small, local, and evidence-based. "
-        f"Do NOT output any text outside <answer>. <answer> must contain exactly {forecast_horizon} lines, one numeric value per line, no timestamps. "
-        f"Stop immediately after the {forecast_horizon}th value. Do not generate any extra value. "
-        f"After the {forecast_horizon}th value, immediately close with </answer>, and do not output any text after it. "
-        "Do not emit <think>."
+    if stage == "diagnostic":
+        return "Diagnostic", (
+            "Inspect the historical series with feature-extraction tools only. "
+            "You may emit multiple feature-tool calls in parallel in this turn. "
+            "Do NOT call predict_time_series yet."
+        )
+    if stage == "routing":
+        return "Routing", "Call predict_time_series with your chosen model (e.g., 'chronos2')."
+    return "Refinement", (
+        "Output your final answer in <think>...</think><answer>...</answer> format using the selected model prediction as the base forecast. "
+        "Use <think> to briefly explain whether you keep the base forecast unchanged or apply a small local refinement. "
+        "Keep the forecast unchanged if it is already consistent; if you refine it, keep the change small, local, and evidence-based. "
+        f"Do NOT output any text outside <think> and <answer>. <answer> must contain exactly {forecast_horizon} lines, one numeric value per line, no timestamps. "
+        f"Stop immediately after the {forecast_horizon}th value and close with </answer>. Do not generate any extra value or any text after </answer>."
     )
 
 
@@ -121,28 +132,34 @@ def build_runtime_user_prompt(
     prediction_model_used: Optional[str] = None,
     required_feature_tools: Sequence[str] | None = None,
     completed_feature_tools: Sequence[str] | None = None,
+    turn_stage: Optional[str] = None,
 ) -> str:
     history_records = list(history_analysis or [])
-    required_tools = [str(name) for name in (required_feature_tools or []) if str(name).strip()]
+    available_diagnostic_tools = [str(name) for name in (required_feature_tools or []) if str(name).strip()]
     completed_tools = [str(name) for name in (completed_feature_tools or []) if str(name).strip()]
-    completed_tool_set = set(completed_tools)
-    missing_tools = [name for name in required_tools if name not in completed_tool_set]
     history_text = "\n".join(history_records) if history_records else "No previous analysis performed."
-    turn_num, action = get_runtime_turn_info(
+    stage_name, action = get_runtime_turn_info(
         history_records,
         prediction_results,
         forecast_horizon=forecast_horizon,
-        required_feature_tools=required_tools,
-        completed_feature_tools=completed_tools,
+        turn_stage=turn_stage,
     )
+    normalized_stage = _normalize_turn_stage(turn_stage) or stage_name.lower()
 
-    if prediction_results:
+    if normalized_stage == "refinement":
         model_line = f"### Selected Forecast Model: {prediction_model_used}\n" if prediction_model_used else ""
-        return f"""**[Turn {turn_num}] Action: {action}**
+        truncated_history = truncate_time_series_data(
+            time_series_data,
+            recent_rows=min(max(int(lookback_window or 96) // 2, 24), int(lookback_window or 96)),
+        )
+        return f"""**[Stage: {stage_name}] Action: {action}**
 ### Lookback Window: {lookback_window} rows
 ### Forecast Horizon: {forecast_horizon} rows
 {model_line}### Analysis Summary
 {history_text}
+
+### Recent Historical Window
+{truncated_history}
 
 ### Prediction Tool Output
 {prediction_results}
@@ -153,21 +170,16 @@ def build_runtime_user_prompt(
 3. Treat "Prediction Tool Output" as the base forecast produced by the selected model.
 4. If the base forecast is already consistent, keep it unchanged. If refinement is needed, keep it small, local, and evidence-based.
 5. Do NOT rewrite the forecast arbitrarily or ignore the selected-model forecast.
-6. Output ONLY <answer>...</answer>. Do not include anything else.
-7. <answer> must contain EXACTLY {forecast_horizon} lines.
-8. Each line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
-9. Stop immediately after the {forecast_horizon}th value, and do NOT generate any extra value.
-10. After the {forecast_horizon}th value, immediately output </answer>, with no extra text after it.
+6. Output ONLY one <think>...</think> block followed immediately by one <answer>...</answer> block.
+7. <think> must briefly state whether you keep the base forecast or apply a small local refinement, and why.
+8. <answer> must contain EXACTLY {forecast_horizon} lines.
+9. Each answer line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
+10. Stop immediately after the {forecast_horizon}th value, then output </answer>, with no extra text after it.
+11. Your reply must start with <think>. Do NOT copy placeholder text or template scaffolding into the final answer."""
 
-<answer>
-[Final prediction after optional small refinement]
-</answer>"""
-
-    if missing_tools:
-        required_text = ", ".join(required_tools) if required_tools else "extract_basic_statistics"
-        completed_text = ", ".join(completed_tools) if completed_tools else "none"
-        missing_text = ", ".join(missing_tools)
-        return f"""**[Turn {turn_num}] Action: {action}**
+    if normalized_stage == "diagnostic":
+        available_tools_text = ", ".join(available_diagnostic_tools) if available_diagnostic_tools else "extract_basic_statistics"
+        return f"""**[Stage: {stage_name}] Action: {action}**
 ### Lookback Window: {lookback_window} rows
 ### Forecast Horizon: {forecast_horizon} rows
 ### Historical Data
@@ -176,26 +188,21 @@ def build_runtime_user_prompt(
 ### Analysis History
 {history_text}
 
-### Required Diagnostic Tools
-{required_text}
-
-### Completed Diagnostic Tools
-{completed_text}
-
-### Remaining Diagnostic Tools
-{missing_text}
+### Diagnostic Tool Schemas Available This Turn
+{available_tools_text}
 
 **Instructions**:
-- Stay in Turn 1 until ALL required diagnostic tools have been called.
-- Call the remaining diagnostic tools in this turn.
-- If multiple required tools remain, emit multiple tool calls in the same assistant turn.
-- Do NOT call predict_time_series until every required diagnostic tool above has been executed.
+- Stay in the diagnostic stage and inspect the series through feature-extraction tools only.
+- You may call one or more feature tools in the same assistant turn.
+- Do NOT call predict_time_series in this turn.
 """
 
-    if history_records:
-        return f"""**[Turn {turn_num}] Action: {action}**
+    if normalized_stage == "routing":
+        return f"""**[Stage: {stage_name}] Action: {action}**
 ### Lookback Window: {lookback_window} rows
 ### Forecast Horizon: {forecast_horizon} rows
+### Historical Data
+{time_series_data}
 
 ### Analysis Summary
 {history_text}
@@ -213,23 +220,7 @@ def build_runtime_user_prompt(
 - Call predict_time_series exactly once with your chosen model_name.
 """
 
-    prediction_text = "No predictions available yet. Call predict_time_series to generate forecasts."
-    return f"""**[Turn {turn_num}] Action: {action}**
-### Lookback Window: {lookback_window} rows
-### Forecast Horizon: {forecast_horizon} rows
-### Historical Data
-{time_series_data}
-
-### Analysis History
-{history_text}
-
-### Model Predictions
-{prediction_text}
-
-**Check your current state and act accordingly:**
-- If any required diagnostic tools are still missing -> Call the remaining feature extraction tools. Do NOT call predict_time_series yet.
-- Only after all required diagnostic tools are completed and "Model Predictions" is empty -> Call predict_time_series with model_name.
-"""
+    raise ValueError(f"Unsupported runtime turn stage: {normalized_stage}")
 
 # OpenAI-compatible tool schemas for TimeSeriesForecast actions.
 PREDICT_TIMESERIES_TOOL_SCHEMA = {
@@ -237,8 +228,7 @@ PREDICT_TIMESERIES_TOOL_SCHEMA = {
     "function": {
         "name": "predict_time_series",
         "description": (
-            "PREREQUISITE: You must have completed all required feature extraction tools before calling this tool. "
-            "Do NOT call this until the runtime user message indicates the diagnostic stage is complete. "
+            "Call this only in the routing turn after completing your diagnostic analysis turn. "
             "Models: 'patchtst' (smooth windows with local periodicity), "
             "'arima' (stable trend/seasonality), 'chronos2' (irregular or noisy windows), "
             "'itransformer' (regime changes or longer-range dependencies). "
@@ -346,4 +336,12 @@ TIMESERIES_TOOL_SCHEMAS = [
     EXTRACT_DATA_QUALITY_SCHEMA,
     EXTRACT_EVENT_SUMMARY_SCHEMA,
     PREDICT_TIMESERIES_TOOL_SCHEMA,
+]
+
+FEATURE_TOOL_SCHEMAS = [
+    EXTRACT_BASIC_STATISTICS_SCHEMA,
+    EXTRACT_WITHIN_CHANNEL_DYNAMICS_SCHEMA,
+    EXTRACT_FORECAST_RESIDUALS_SCHEMA,
+    EXTRACT_DATA_QUALITY_SCHEMA,
+    EXTRACT_EVENT_SUMMARY_SCHEMA,
 ]

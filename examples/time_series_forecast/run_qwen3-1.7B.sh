@@ -77,9 +77,12 @@ TRAIN_FILES="$(resolve_consistent_env_value 'RL train jsonl' TRAIN_FILES RL_TRAI
 VAL_FILES="$(resolve_consistent_env_value 'RL val jsonl' VAL_FILES RL_VAL_FILES)"
 REWARD_FN_PATH="${REWARD_FN_PATH:-${RL_REWARD_FN_PATH:-$PROJECT_DIR/recipe/time_series_forecast/reward.py}}"
 REWARD_FN_NAME="${REWARD_FN_NAME:-${RL_REWARD_FN_NAME:-compute_score}}"
-MODEL_PATH="${MODEL_PATH:-}"
+MODEL_PATH="${RL_MODEL_PATH:-${MODEL_PATH:-}}"
+CURRICULUM_PHASE="${CURRICULUM_PHASE:-${RL_CURRICULUM_PHASE:-}}"
+ALLOW_NONCURRICULUM_TRAIN="${ALLOW_NONCURRICULUM_TRAIN:-${RL_ALLOW_NONCURRICULUM_TRAIN:-0}}"
 if [ -z "$MODEL_PATH" ]; then
-    echo "MODEL_PATH is required. Export MODEL_PATH to your base chat model checkpoint."
+    echo "RL model path is required." >&2
+    echo "Export RL_MODEL_PATH (recommended) or MODEL_PATH before launch." >&2
     exit 1
 fi
 if [ -z "$TRAIN_FILES" ] || [ -z "$VAL_FILES" ]; then
@@ -115,6 +118,38 @@ print(
     f"metadata={metadata_path}"
 )
 PY
+TRAIN_FILES="$(python3 - "$TRAIN_FILES" "$RL_METADATA_PATH" "$RUN_MODE" "$CURRICULUM_PHASE" "$ALLOW_NONCURRICULUM_TRAIN" <<'PY'
+import sys
+from recipe.time_series_forecast.curriculum_utils import resolve_curriculum_train_file
+from recipe.time_series_forecast.dataset_identity import load_metadata
+
+train_file, metadata_path, run_mode, curriculum_phase, allow_noncurriculum = sys.argv[1:6]
+payload = load_metadata(metadata_path)
+resolved = resolve_curriculum_train_file(
+    train_file=train_file,
+    metadata_payload=payload,
+    run_mode=run_mode,
+    curriculum_phase=curriculum_phase,
+    allow_noncurriculum_train=str(allow_noncurriculum).strip().lower() in {"1", "true", "yes"},
+)
+print(str(resolved))
+PY
+)"
+if [ ! -f "$TRAIN_FILES" ]; then
+    echo "Resolved RL train jsonl not found: $TRAIN_FILES" >&2
+    exit 1
+fi
+TRAIN_DIR="$(cd "$(dirname "$TRAIN_FILES")" && pwd)"
+VAL_DIR="$(cd "$(dirname "$VAL_FILES")" && pwd)"
+if [ "$TRAIN_DIR" != "$VAL_DIR" ]; then
+    echo "RL train/val jsonl must come from the same dataset directory." >&2
+    echo "train dir: $TRAIN_DIR" >&2
+    echo "val dir:   $VAL_DIR" >&2
+    exit 1
+fi
+if [ -n "$CURRICULUM_PHASE" ]; then
+    echo "[RL CURRICULUM] phase=$CURRICULUM_PHASE train=$TRAIN_FILES"
+fi
 
 PROJECT_NAME="${PROJECT_NAME:-${RL_PROJECT_NAME:-TimeSeriesForecast}}"
 EXP_NAME="${EXP_NAME:-${RL_EXP_NAME:-etth1_ot_qwen3_1_7b}}"
@@ -132,7 +167,7 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-${RL_TRAIN_BATCH_SIZE:-$NUM_GPUS}}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-${RL_PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}}"
 PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-${RL_PPO_MICRO_BATCH_SIZE:-1}}"
 LOGPROB_MICRO_BATCH_SIZE="${LOGPROB_MICRO_BATCH_SIZE:-${RL_LOGPROB_MICRO_BATCH_SIZE:-1}}"
-ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-${RL_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.35}}"
+ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-${RL_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.15}}"
 ROLLOUT_LOAD_FORMAT="${ROLLOUT_LOAD_FORMAT:-${RL_ROLLOUT_LOAD_FORMAT:-safetensors}}"
 ROLLOUT_N="${ROLLOUT_N:-${RL_ROLLOUT_N:-1}}"
 ROLLOUT_TP="${ROLLOUT_TP:-${RL_ROLLOUT_TP:-1}}"
@@ -142,10 +177,10 @@ DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-${RL_DATALOADER_NUM_WORKERS:-0
 ACTOR_MAX_TOKEN_LEN_PER_GPU="${ACTOR_MAX_TOKEN_LEN_PER_GPU:-${RL_ACTOR_MAX_TOKEN_LEN_PER_GPU:-8192}}"
 ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-${RL_ROLLOUT_MAX_MODEL_LEN:-}}"
 ROLLOUT_MAX_BATCHED_TOKENS="${ROLLOUT_MAX_BATCHED_TOKENS:-${RL_ROLLOUT_MAX_BATCHED_TOKENS:-4096}}"
-ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-${RL_ROLLOUT_MAX_NUM_SEQS:-32}}"
+ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-${RL_ROLLOUT_MAX_NUM_SEQS:-4}}"
 ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-${RL_ROLLOUT_ENFORCE_EAGER:-True}}"
 ROLLOUT_ENABLE_PREFIX_CACHING="${ROLLOUT_ENABLE_PREFIX_CACHING:-${RL_ROLLOUT_ENABLE_PREFIX_CACHING:-False}}"
-ROLLOUT_ENABLE_CHUNKED_PREFILL="${ROLLOUT_ENABLE_CHUNKED_PREFILL:-${RL_ROLLOUT_ENABLE_CHUNKED_PREFILL:-False}}"
+ROLLOUT_ENABLE_CHUNKED_PREFILL="${ROLLOUT_ENABLE_CHUNKED_PREFILL:-${RL_ROLLOUT_ENABLE_CHUNKED_PREFILL:-True}}"
 ROLLOUT_FREE_CACHE_ENGINE="${ROLLOUT_FREE_CACHE_ENGINE:-${RL_ROLLOUT_FREE_CACHE_ENGINE:-False}}"
 SAVE_FREQ="${SAVE_FREQ:-${RL_SAVE_FREQ:-10}}"
 TEST_FREQ="${TEST_FREQ:-${RL_TEST_FREQ:-5}}"
@@ -164,6 +199,15 @@ for REQUIRED_KEY in MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH TEMPERATURE VAL_TEMPER
         exit 1
     fi
 done
+
+if [ "${ROLLOUT_ENABLE_CHUNKED_PREFILL}" != "True" ] && [ -n "${ROLLOUT_MAX_MODEL_LEN:-}" ]; then
+    if [ "${ROLLOUT_MAX_BATCHED_TOKENS}" -lt "${ROLLOUT_MAX_MODEL_LEN}" ]; then
+        echo "Invalid rollout config: enable_chunked_prefill=False requires max_num_batched_tokens >= max_model_len."
+        echo "Current values: max_num_batched_tokens=${ROLLOUT_MAX_BATCHED_TOKENS}, max_model_len=${ROLLOUT_MAX_MODEL_LEN}."
+        echo "Set RL_ROLLOUT_ENABLE_CHUNKED_PREFILL=True or increase RL_ROLLOUT_MAX_BATCHED_TOKENS."
+        exit 1
+    fi
+fi
 
 CMD=(
     python3 -m arft.main_agent_ppo
