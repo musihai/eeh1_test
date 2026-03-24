@@ -9,10 +9,12 @@ from pathlib import Path
 import pandas as pd
 
 from recipe.time_series_forecast.build_etth1_high_quality_sft import (
+    _select_reference_teacher_model,
     build_local_model_device_map,
     ensure_service_ready,
     evenly_spaced_records,
     evaluate_teacher_for_sample,
+    load_existing_evaluations,
     main,
     process_split,
     select_curated_evaluations,
@@ -26,6 +28,36 @@ from recipe.time_series_forecast.dataset_identity import (
 
 
 class TestHighQualitySFTBuilder(unittest.TestCase):
+    def test_select_reference_teacher_model_prefers_lowest_orig_mse(self):
+        selected = _select_reference_teacher_model(
+            {
+                "arima": 0.72,
+                "itransformer": 0.61,
+                "patchtst": 0.59,
+            },
+            {
+                "arima": {"orig_mse": 6.82},
+                "itransformer": {"orig_mse": 5.42},
+                "patchtst": {"orig_mse": 6.40},
+            },
+        )
+
+        self.assertEqual(selected, "itransformer")
+
+    def test_select_reference_teacher_model_falls_back_to_reward_best_when_errors_missing(self):
+        selected = _select_reference_teacher_model(
+            {
+                "arima": 0.72,
+                "itransformer": 0.61,
+            },
+            {
+                "arima": {"orig_mse": float("nan")},
+                "itransformer": {},
+            },
+        )
+
+        self.assertEqual(selected, "arima")
+
     def test_build_local_model_device_map_uses_all_visible_gpus_round_robin(self):
         with mock.patch("recipe.time_series_forecast.build_etth1_high_quality_sft.torch.cuda.is_available", return_value=True):
             with mock.patch("recipe.time_series_forecast.build_etth1_high_quality_sft.torch.cuda.device_count", return_value=4):
@@ -260,6 +292,33 @@ class TestHighQualitySFTBuilder(unittest.TestCase):
             self.assertEqual(len(full_evaluations), 3)
             self.assertEqual(len(curated_records), 2)
             self.assertEqual(annotation_summary["turn3_annotation_error_count"], 0)
+
+    def test_load_existing_evaluations_normalizes_reference_teacher_fields(self):
+        existing_row = {
+            "sample_index": 0,
+            "best_model": "arima",
+            "best_score": 0.72,
+            "second_best_model": "itransformer",
+            "second_best_score": 0.61,
+            "score_margin": 0.11,
+            "selection_score": 0.7475,
+            "model_scores": {"arima": 0.72, "itransformer": 0.61},
+            "model_score_details": {
+                "arima": {"orig_mse": 6.82},
+                "itransformer": {"orig_mse": 5.42},
+            },
+            "teacher_prediction_text": "1.0\n2.0",
+            "teacher_prediction_source": "reference_teacher",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "train_teacher_eval.jsonl"
+            path.write_text(json.dumps(existing_row, ensure_ascii=False) + "\n", encoding="utf-8")
+            loaded = load_existing_evaluations(path)
+
+        self.assertEqual(loaded[0]["reference_teacher_model"], "itransformer")
+        self.assertAlmostEqual(loaded[0]["reference_teacher_error"], 5.42, places=6)
+        self.assertEqual(loaded[0]["reference_teacher_prediction_text"], "1.0\n2.0")
 
     def test_process_split_rejects_candidate_pool_larger_than_limited_eval_pool(self):
         records = [{"index": idx, "uid": f"sample-{idx}"} for idx in range(5)]

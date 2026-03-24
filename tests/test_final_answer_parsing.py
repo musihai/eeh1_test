@@ -209,7 +209,7 @@ class FinalAnswerParsingTest(unittest.TestCase):
         valid, penalty, message = agent._validate_workflow_completion(self._numeric_answer_lines(96))
         self.assertFalse(valid)
         self.assertLess(penalty, 0.0)
-        self.assertIn("diagnostic feature tool", message)
+        self.assertIn("Complete the required diagnostic feature tools", message)
 
     def test_execute_tool_call_blocks_prediction_during_diagnostic_turn(self) -> None:
         agent = self._make_agent()
@@ -261,13 +261,16 @@ class FinalAnswerParsingTest(unittest.TestCase):
         result = asyncio.run(agent._execute_tool_call(tool_call, turn_stage="diagnostic"))
         self.assertIsNone(result)
 
-    def test_current_turn_stage_switches_to_routing_after_any_diagnostic_tool(self) -> None:
+    def test_current_turn_stage_waits_until_required_diagnostics_finish(self) -> None:
         agent = self._make_agent()
         agent.prediction_results = None
         agent.basic_statistics = None
         agent.event_summary = None
+        agent.required_feature_tools = ["extract_basic_statistics", "extract_event_summary"]
         self.assertEqual(agent._current_turn_stage(), "diagnostic")
         agent.event_summary = {"event_segment_count": 4.0}
+        self.assertEqual(agent._current_turn_stage(), "diagnostic")
+        agent.basic_statistics = {"median": 1.0}
         self.assertEqual(agent._current_turn_stage(), "routing")
 
 

@@ -34,6 +34,13 @@ from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
 
 from arft.ray_agent_trainer import RayAgentTrainer
+from arft.task_runner_support import (
+    build_actor_rollout_spec,
+    build_critic_worker_spec,
+    build_resource_pool_spec,
+    build_reward_model_worker_spec,
+    should_register_ref_policy,
+)
 
 
 def _validate_model_path_config(model_path: str) -> str:
@@ -207,133 +214,45 @@ class TaskRunner:
         self.role_worker_mapping = {}
         self.mapping = {}
 
+    def _register_worker(self, role, worker_cls, pool_name: str = "global_pool") -> None:
+        self.role_worker_mapping[role] = ray.remote(worker_cls)
+        self.mapping[role] = pool_name
+
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker based on the actor strategy."""
-        from verl.single_controller.ray import RayWorkerGroup
         from verl.trainer.ppo.ray_trainer import Role
 
-        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-
-        # use new model engine implementation
-        if use_legacy_worker_impl == "disable":
-            from verl.workers.engine_workers import ActorRolloutRefWorker
-
-            actor_rollout_cls = ActorRolloutRefWorker
-            ray_worker_group_cls = RayWorkerGroup
-            # NOTE: In new model engine, ref policy and actor rollout are in same ActorRolloutRefWorker,
-            # while in legacy model engine, ref policy is in a separate ActorRolloutRefWorker.
-            if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-                role = Role.ActorRolloutRef
-            else:
-                role = Role.ActorRollout
-            self.role_worker_mapping[role] = ray.remote(actor_rollout_cls)
-            self.mapping[role] = "global_pool"
-            return actor_rollout_cls, ray_worker_group_cls
-
-        if config.actor_rollout_ref.rollout.mode == "sync":
-            raise ValueError(
-                "Rollout mode 'sync' has been removed. Please set "
-                "`actor_rollout_ref.rollout.mode=async` to use the native server rollout."
-            )
-
-        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
-
-            actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
-            )
-            ray_worker_group_cls = RayWorkerGroup
-
-        elif config.actor_rollout_ref.actor.strategy == "megatron":
-            from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
-
-            actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
-            )
-            ray_worker_group_cls = RayWorkerGroup
-
-        else:
-            raise NotImplementedError
-
-        self.role_worker_mapping[Role.ActorRollout] = ray.remote(actor_rollout_cls)
-        self.mapping[Role.ActorRollout] = "global_pool"
+        actor_spec = build_actor_rollout_spec(config)
+        actor_rollout_cls = actor_spec.worker.load()
+        ray_worker_group_cls = actor_spec.ray_worker_group.load()
+        self._register_worker(getattr(Role, actor_spec.role_name), actor_rollout_cls)
         return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
         """Add critic worker to role mapping."""
-        if config.critic.strategy in {"fsdp", "fsdp2"}:
-            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-            if use_legacy_worker_impl in ["auto", "enable"]:
-                from verl.workers.fsdp_workers import CriticWorker
-            elif use_legacy_worker_impl == "disable":
-                from verl.workers.engine_workers import CriticWorker
-
-                print("Using new worker implementation")
-            else:
-                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
-
-        elif config.critic.strategy == "megatron":
-            from verl.workers.megatron_workers import CriticWorker
-
-        else:
-            raise NotImplementedError
-
         from verl.trainer.ppo.ray_trainer import Role
 
-        self.role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
-        self.mapping[Role.Critic] = "global_pool"
+        critic_spec = build_critic_worker_spec(config)
+        self._register_worker(Role.Critic, critic_spec.worker.load(), critic_spec.pool_name)
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
-
-        global_pool_id = "global_pool"
-        resource_pool_spec = {
-            global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        }
-        # TODO Here you can use the new registration method to support dynamic registration of roles
-        if config.reward_model.enable_resource_pool:
-            if config.reward_model.n_gpus_per_node <= 0:
-                raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
-            if config.reward_model.nnodes <= 0:
-                raise ValueError("config.reward_model.nnodes must be greater than 0")
-
-            reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
-            resource_pool_spec["reward_pool"] = reward_pool
-
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+        resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec=build_resource_pool_spec(config),
+            mapping=self.mapping,
+        )
         return resource_pool_manager
 
     def add_reward_model_worker(self, config):
         """Add reward model worker if enabled."""
         from verl.trainer.ppo.ray_trainer import Role
 
-        if config.reward_model.enable:
-            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-            if use_legacy_worker_impl in ["auto", "enable", "disable"]:
-                if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-                    from verl.workers.fsdp_workers import RewardModelWorker
-                elif config.reward_model.strategy == "megatron":
-                    from verl.workers.megatron_workers import RewardModelWorker
-                else:
-                    raise NotImplementedError
-            # elif use_legacy_worker_impl == "disable":
-            #     from verl.workers.engine_workers import RewardModelWorker
-            #
-            #     print("Using new worker implementation")
-            else:
-                raise ValueError(f"Invalid use_legacy_worker_impl: {use_legacy_worker_impl}")
-
-            self.role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
-            if config.reward_model.enable_resource_pool:
-                self.mapping[Role.RewardModel] = "reward_pool"
-            else:
-                self.mapping[Role.RewardModel] = "global_pool"
+        reward_spec = build_reward_model_worker_spec(config)
+        if reward_spec is None:
+            return
+        self._register_worker(Role.RewardModel, reward_spec.worker.load(), reward_spec.pool_name)
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""
@@ -341,13 +260,8 @@ class TaskRunner:
 
         # Ref policy has been fused into ActorRolloutRefWorker in new model engine,
         # we don't need to add a separate ref policy worker group.
-        use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
-        if use_legacy_worker_impl == "disable":
-            return
-
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
-            self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
-            self.mapping[Role.RefPolicy] = "global_pool"
+        if should_register_ref_policy(config):
+            self._register_worker(Role.RefPolicy, ref_policy_cls)
 
     def run(self, config):
         """Execute the main PPO training workflow.

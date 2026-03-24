@@ -8,6 +8,12 @@ from recipe.time_series_forecast.reward import (
     ENABLE_SEASON_TREND_SCORE,
     compute_score,
 )
+from recipe.time_series_forecast.reward_metrics import (
+    CHANGE_POINT_COMPONENT_SCORE_WEIGHT,
+    PREDICTION_ERROR_SCORE_WEIGHT,
+    SEASON_COMPONENT_SCORE_WEIGHT,
+    TREND_COMPONENT_SCORE_WEIGHT,
+)
 from recipe.time_series_forecast.utils import compact_prediction_tool_output_from_string, format_prediction_tool_output
 
 
@@ -122,6 +128,10 @@ class CompactProtocolTests(unittest.TestCase):
     def test_composite_reward_uses_paper_aligned_defaults(self) -> None:
         self.assertTrue(ENABLE_CHANGE_POINT_SCORE)
         self.assertTrue(ENABLE_SEASON_TREND_SCORE)
+        self.assertGreater(
+            PREDICTION_ERROR_SCORE_WEIGHT,
+            2 * CHANGE_POINT_COMPONENT_SCORE_WEIGHT + SEASON_COMPONENT_SCORE_WEIGHT + TREND_COMPONENT_SCORE_WEIGHT,
+        )
 
         ground_truth = (
             "2017-05-02 00:00:00 10.0000\n"

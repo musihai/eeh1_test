@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 
@@ -92,6 +93,14 @@ class TestValidationRewardManager(unittest.TestCase):
 
         self.assertTrue(trainer._should_run_initial_validation())
 
+    def test_ray_ppo_trainer_resolves_epoch_zero_for_empty_train_loader_in_val_only(self) -> None:
+        trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+        trainer.config = OmegaConf.create({"trainer": {"val_only": True}})
+        trainer.global_steps = 0
+        trainer.train_dataloader = []
+
+        self.assertEqual(trainer._resolve_current_epoch(), 0)
+
     def test_ray_agent_trainer_runs_initial_validation_for_val_only_even_when_disabled_by_default(self) -> None:
         trainer = RayAgentTrainer.__new__(RayAgentTrainer)
         trainer.config = OmegaConf.create({"trainer": {"val_before_train": False, "val_only": True}})
@@ -101,6 +110,45 @@ class TestValidationRewardManager(unittest.TestCase):
 
         trainer.val_reward_fn = None
         self.assertFalse(trainer._should_run_initial_validation())
+
+    def test_ray_agent_trainer_resolves_epoch_zero_for_empty_train_loader_in_val_only(self) -> None:
+        trainer = RayAgentTrainer.__new__(RayAgentTrainer)
+        trainer.config = OmegaConf.create({"trainer": {"val_only": True}})
+        trainer.global_steps = 0
+        trainer.train_dataloader = []
+
+        self.assertEqual(trainer._resolve_current_epoch(), 0)
+
+    def test_rl_launcher_supports_val_only_mode(self) -> None:
+        project_dir = os.path.dirname(os.path.dirname(__file__))
+        script_path = os.path.join(project_dir, "examples/time_series_forecast/run_qwen3-1.7B.sh")
+        checkpoint_path = os.path.join(
+            project_dir,
+            "artifacts/checkpoints/sft/time_series_forecast_sft_paper_strict_heuristicroute_balanced_3gpu_20260323/global_step_33/huggingface",
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                script_path,
+            ],
+            cwd=project_dir,
+            env={
+                **os.environ,
+                "RUN_MODE": "val_only",
+                "PRINT_CMD_ONLY": "1",
+                "RL_MODEL_PATH": checkpoint_path,
+            },
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        self.assertIn("trainer.val_only=True", result.stdout)
+        self.assertIn("trainer.val_before_train=True", result.stdout)
+        self.assertIn("data.train_batch_size=3", result.stdout)
+        self.assertIn("actor_rollout_ref.actor.ppo_mini_batch_size=3", result.stdout)
+        self.assertIn("data.train_max_samples=32", result.stdout)
+        self.assertIn("data.val_max_samples=256", result.stdout)
 
     def test_reward_manager_merges_reward_extra_keys_into_extra_info(self) -> None:
         captured = {}

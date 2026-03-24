@@ -19,16 +19,21 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from recipe.time_series_forecast.build_etth1_sft_dataset import (
-    _distribution_from_series,
-    _rebalance_train_turn3_targets,
     build_sft_record,
     convert_jsonl_to_sft_parquet,
+    distribution_from_series,
+    rebalance_train_turn3_targets,
 )
 from recipe.time_series_forecast.dataset_identity import (
     DATASET_KIND_RL_JSONL,
     DATASET_KIND_RUNTIME_SFT_PARQUET,
     DATASET_KIND_TEACHER_CURATED_SFT,
     validate_sibling_metadata,
+)
+from recipe.time_series_forecast.dataset_file_utils import (
+    load_jsonl_records,
+    write_jsonl_records,
+    write_metadata_file,
 )
 from recipe.time_series_forecast.reward import compute_score
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
@@ -47,17 +52,6 @@ DEFAULT_VAL_JSONL = Path("dataset/ett_rl_etth1_paper_same2/val.jsonl")
 DEFAULT_TEST_JSONL = Path("dataset/ett_rl_etth1_paper_same2/test.jsonl")
 DEFAULT_MODEL_SERVICE_URL = os.environ.get("MODEL_SERVICE_URL", "http://localhost:8994")
 PYTORCH_TEACHER_MODELS = {"patchtst", "itransformer"}
-
-
-def load_jsonl_records(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            records.append(json.loads(line))
-    return records
-
 
 def evenly_spaced_records(records: Sequence[dict[str, Any]], count: int) -> list[dict[str, Any]]:
     if count <= 0 or len(records) <= count:
@@ -175,6 +169,50 @@ def score_prediction_text(
     return score_value, details
 
 
+def _select_reference_teacher_model(
+    model_scores: dict[str, float],
+    model_score_details: dict[str, dict[str, float]],
+) -> str:
+    error_ranked_models: list[tuple[float, str]] = []
+    for model_name, details in model_score_details.items():
+        try:
+            orig_mse = float(details.get("orig_mse", float("nan")))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(orig_mse):
+            error_ranked_models.append((orig_mse, str(model_name)))
+
+    if error_ranked_models:
+        error_ranked_models.sort(key=lambda item: (item[0], item[1]))
+        return error_ranked_models[0][1]
+
+    ranked_models = sorted(model_scores.items(), key=lambda item: item[1], reverse=True)
+    if not ranked_models:
+        raise RuntimeError("Cannot select reference teacher model without any successful model scores.")
+    return str(ranked_models[0][0])
+
+
+def _normalize_existing_evaluation_record(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(record)
+    model_scores = normalized.get("model_scores")
+    model_score_details = normalized.get("model_score_details")
+    if not isinstance(model_scores, dict) or not isinstance(model_score_details, dict):
+        return normalized
+    if not model_scores or not model_score_details:
+        return normalized
+
+    reference_teacher_model = _select_reference_teacher_model(model_scores, model_score_details)
+    reference_teacher_metrics = model_score_details.get(reference_teacher_model, {})
+    normalized["reference_teacher_model"] = reference_teacher_model
+    normalized["reference_teacher_score"] = float(model_scores.get(reference_teacher_model, float("nan")))
+    normalized["reference_teacher_error"] = reference_teacher_metrics.get("orig_mse")
+    normalized.setdefault(
+        "reference_teacher_prediction_text",
+        normalized.get("teacher_prediction_text"),
+    )
+    return normalized
+
+
 def finalize_teacher_evaluations(
     prepared_samples: Sequence[dict[str, Any]],
     sample_state: dict[int, dict[str, Any]],
@@ -196,6 +234,15 @@ def finalize_teacher_evaluations(
         margin = best_score - second_score
         best_metrics = state["model_score_details"].get(best_model, {})
         second_metrics = state["model_score_details"].get(second_model, {})
+        reference_teacher_model = _select_reference_teacher_model(
+            model_scores,
+            state["model_score_details"],
+        )
+        reference_teacher_metrics = state["model_score_details"].get(reference_teacher_model, {})
+        reference_teacher_prediction_text = state["model_predictions"].get(
+            reference_teacher_model,
+            state["model_predictions"][best_model],
+        )
         evaluations.append(
             {
                 "sample_index": sample_index,
@@ -208,10 +255,13 @@ def finalize_teacher_evaluations(
                 "model_scores": model_scores,
                 "model_score_details": state["model_score_details"],
                 "model_errors": state["model_errors"],
-                "teacher_prediction_text": state["model_predictions"][best_model],
+                "reference_teacher_model": reference_teacher_model,
+                "reference_teacher_score": float(model_scores.get(reference_teacher_model, best_score)),
+                "reference_teacher_prediction_text": reference_teacher_prediction_text,
+                "teacher_prediction_text": reference_teacher_prediction_text,
                 "teacher_prediction_source": "reference_teacher",
                 "forecast_horizon": int(prepared_sample["forecast_horizon"]),
-                "reference_teacher_error": best_metrics.get("orig_mse"),
+                "reference_teacher_error": reference_teacher_metrics.get("orig_mse"),
                 "best_orig_mse": best_metrics.get("orig_mse"),
                 "best_orig_mae": best_metrics.get("orig_mae"),
                 "best_norm_mse": best_metrics.get("norm_mse"),
@@ -550,6 +600,12 @@ async def evaluate_teacher_for_sample(
     margin = best_score - second_score
     best_metrics = model_score_details.get(best_model, {})
     second_metrics = model_score_details.get(second_model, {})
+    reference_teacher_model = _select_reference_teacher_model(model_scores, model_score_details)
+    reference_teacher_metrics = model_score_details.get(reference_teacher_model, {})
+    reference_teacher_prediction_text = model_predictions.get(
+        reference_teacher_model,
+        model_predictions[best_model],
+    )
 
     return {
         "sample_index": int(sample.get("index", -1)),
@@ -562,10 +618,13 @@ async def evaluate_teacher_for_sample(
         "model_scores": model_scores,
         "model_score_details": model_score_details,
         "model_errors": model_errors,
-        "teacher_prediction_text": model_predictions[best_model],
+        "reference_teacher_model": reference_teacher_model,
+        "reference_teacher_score": float(model_scores.get(reference_teacher_model, best_score)),
+        "reference_teacher_prediction_text": reference_teacher_prediction_text,
+        "teacher_prediction_text": reference_teacher_prediction_text,
         "teacher_prediction_source": "reference_teacher",
         "forecast_horizon": forecast_horizon,
-        "reference_teacher_error": best_metrics.get("orig_mse"),
+        "reference_teacher_error": reference_teacher_metrics.get("orig_mse"),
         "best_orig_mse": best_metrics.get("orig_mse"),
         "best_orig_mae": best_metrics.get("orig_mae"),
         "best_norm_mse": best_metrics.get("norm_mse"),
@@ -999,8 +1058,11 @@ def merge_evaluations_into_samples(
         sample_index = int(sample.get("index", -1))
         evaluation = evaluation_by_index[sample_index]
         enriched = dict(sample)
-        enriched["reference_teacher_model"] = evaluation["best_model"]
-        enriched["teacher_prediction_text"] = evaluation["teacher_prediction_text"]
+        enriched["reference_teacher_model"] = evaluation.get("reference_teacher_model") or evaluation["best_model"]
+        enriched["teacher_prediction_text"] = (
+            evaluation.get("reference_teacher_prediction_text")
+            or evaluation.get("teacher_prediction_text")
+        )
         enriched["teacher_prediction_source"] = evaluation["teacher_prediction_source"]
         enriched["teacher_eval_best_score"] = evaluation["best_score"]
         enriched["teacher_eval_second_best_model"] = evaluation["second_best_model"]
@@ -1018,31 +1080,16 @@ def merge_evaluations_into_samples(
     return curated
 
 
-def write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-
 def load_existing_evaluations(path: Path) -> dict[int, dict[str, Any]]:
     if not path.exists():
         return {}
     existing: dict[int, dict[str, Any]] = {}
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            sample_index = int(record.get("sample_index", -1))
-            if sample_index >= 0:
-                existing[sample_index] = record
+    for record in load_jsonl_records(path):
+        normalized = _normalize_existing_evaluation_record(record)
+        sample_index = int(record.get("sample_index", -1))
+        if sample_index >= 0:
+            existing[sample_index] = normalized
     return existing
-
-
-def write_metadata(output_dir: Path, **payload: Any) -> None:
-    metadata_path = output_dir / "metadata.json"
-    metadata_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def process_split(
@@ -1144,7 +1191,7 @@ def process_split(
     annotated_candidate_samples, annotation_errors = annotate_turn3_targets(candidate_samples)
     annotation_error_path = output_dir / f"{split_name}_turn3_annotation_errors.jsonl"
     if annotation_errors:
-        write_jsonl(annotation_error_path, annotation_errors)
+        write_jsonl_records(annotation_error_path, annotation_errors)
     annotation_error_count = len(annotation_errors)
     annotation_error_ratio = float(annotation_error_count / len(candidate_samples)) if candidate_samples else 0.0
     if annotation_error_count > 0:
@@ -1210,9 +1257,9 @@ def process_split(
         if sample_index in annotated_by_index
     ]
 
-    write_jsonl(eval_path, evaluations)
-    write_jsonl(curated_eval_path, selected_evaluations)
-    write_jsonl(curated_path, selected_records)
+    write_jsonl_records(eval_path, evaluations)
+    write_jsonl_records(curated_eval_path, selected_evaluations)
+    write_jsonl_records(curated_path, selected_records)
     print(
         f"[HQ-SFT] split={split_name} eval_rows={len(evaluations)} reused={len(reused_evaluations)} "
         f"selected={len(selected_records)}"
@@ -1449,7 +1496,7 @@ def main() -> None:
             )
             parquet_df = parquet_df_raw
             if split_name == "train":
-                parquet_df = _rebalance_train_turn3_targets(
+                parquet_df = rebalance_train_turn3_targets(
                     parquet_df_raw,
                     min_local_refine_ratio=float(args.train_min_local_refine_ratio),
                 )
@@ -1457,7 +1504,7 @@ def main() -> None:
                     parquet_df.to_parquet(parquet_path, index=False)
                     print(
                         f"Rebalanced {split_name}.parquet turn3_target_type distribution: "
-                        f"{_distribution_from_series(parquet_df['turn3_target_type'])}"
+                        f"{distribution_from_series(parquet_df['turn3_target_type'])}"
                     )
             teacher_distribution: dict[str, int] = {}
             for record in curated_records:
@@ -1478,26 +1525,26 @@ def main() -> None:
                 if split_name == "train":
                     metadata["train_samples_before_balance"] = len(parquet_df_raw)
                     metadata["train_min_local_refine_ratio"] = float(args.train_min_local_refine_ratio)
-                    metadata["train_turn3_target_type_distribution_before_balance"] = _distribution_from_series(
+                    metadata["train_turn3_target_type_distribution_before_balance"] = distribution_from_series(
                         parquet_df_raw["turn3_target_type"]
                     )
-                metadata[f"{split_name}_turn3_target_type_distribution"] = _distribution_from_series(
+                metadata[f"{split_name}_turn3_target_type_distribution"] = distribution_from_series(
                     parquet_df["turn3_target_type"]
                 )
             if "turn3_trigger_reason" in parquet_df.columns:
-                metadata[f"{split_name}_turn3_trigger_reason_distribution"] = _distribution_from_series(
+                metadata[f"{split_name}_turn3_trigger_reason_distribution"] = distribution_from_series(
                     parquet_df["turn3_trigger_reason"]
                 )
             if "refine_ops_signature" in parquet_df.columns:
-                metadata[f"{split_name}_refine_ops_signature_distribution"] = _distribution_from_series(
+                metadata[f"{split_name}_refine_ops_signature_distribution"] = distribution_from_series(
                     parquet_df["refine_ops_signature"]
                 )
             if "selected_feature_tool_signature" in parquet_df.columns:
-                metadata[f"{split_name}_selected_feature_tool_signature_distribution"] = _distribution_from_series(
+                metadata[f"{split_name}_selected_feature_tool_signature_distribution"] = distribution_from_series(
                     parquet_df["selected_feature_tool_signature"]
                 )
 
-        write_metadata(output_dir, **metadata)
+        write_metadata_file(output_dir, metadata)
     finally:
         if predictor is not None:
             predictor.close()

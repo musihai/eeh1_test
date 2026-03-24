@@ -1,22 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from typing import Any
 
+from recipe.time_series_forecast.dataset_file_utils import load_jsonl_records, write_jsonl_records
 from recipe.time_series_forecast.reward import extract_values_from_time_series_string, parse_final_answer_protocol
-
-
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            records.append(json.loads(line))
-    return records
 
 
 def get_last_assistant_content(record: dict[str, Any]) -> str:
@@ -143,7 +132,7 @@ def main() -> None:
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    records = load_jsonl(input_path)
+    records = load_jsonl_records(input_path)
     invalid: list[tuple[int, str, int, str, str]] = []
     valid_records: list[dict[str, Any]] = []
     source_count: dict[str, int] = {}
@@ -184,10 +173,7 @@ def main() -> None:
 
     if args.write_clean_jsonl:
         out_path = Path(args.write_clean_jsonl)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", encoding="utf-8") as f:
-            for rec in valid_records:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        write_jsonl_records(out_path, valid_records)
         print(f"\nWrote valid-only records: {out_path} ({len(valid_records)} samples)")
 
 

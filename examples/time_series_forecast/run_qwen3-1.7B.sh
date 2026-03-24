@@ -8,10 +8,14 @@ fi
 export VLLM_USE_V1=1
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export HYDRA_FULL_ERROR=1
+# Ray 2.52.0 + current host opentelemetry stack occasionally crashes in worker startup.
+# Disable open telemetry by default for this project; users can still re-enable explicitly.
+export RAY_enable_open_telemetry="${RAY_enable_open_telemetry:-0}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
+DEFAULT_PROFILE_PATH="$SCRIPT_DIR/configs/etth1_ot_qwen3_gpu012.sh"
 
 DEBUG_CHAIN="${DEBUG_CHAIN:-0}"
 if [ "$DEBUG_CHAIN" = "1" ] || [ "${DEBUG_CHAIN,,}" = "true" ]; then
@@ -37,11 +41,7 @@ resolve_profile_path() {
     return 1
 }
 
-PROFILE_PATH="${PROFILE_PATH:-}"
-if [ -z "$PROFILE_PATH" ]; then
-    echo "PROFILE_PATH is required. Set PROFILE_PATH to your single source-of-truth profile file."
-    exit 1
-fi
+PROFILE_PATH="${PROFILE_PATH:-$DEFAULT_PROFILE_PATH}"
 
 RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
     echo "PROFILE_PATH not found: $PROFILE_PATH"
@@ -49,6 +49,16 @@ RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
 }
 # shellcheck disable=SC1090
 source "$RESOLVED_PROFILE_PATH"
+
+resolve_transformers_model_dir() {
+    python3 - "$1" <<'PY'
+import sys
+
+from recipe.time_series_forecast.model_path_utils import resolve_transformers_model_dir
+
+print(resolve_transformers_model_dir(sys.argv[1]))
+PY
+}
 
 CONFIG_PATH="${CONFIG_PATH:-${RL_CONFIG_PATH:-$PROJECT_DIR/recipe/time_series_forecast/base.yaml}}"
 resolve_consistent_env_value() {
@@ -84,6 +94,12 @@ if [ -z "$MODEL_PATH" ]; then
     echo "RL model path is required." >&2
     echo "Export RL_MODEL_PATH (recommended) or MODEL_PATH before launch." >&2
     exit 1
+fi
+if [ "${PRINT_CMD_ONLY:-0}" != "1" ] || [[ "$MODEL_PATH" != *"<latest>"* ]]; then
+    MODEL_PATH="$(resolve_transformers_model_dir "$MODEL_PATH")" || {
+        echo "RL model path is not loadable: $MODEL_PATH" >&2
+        exit 1
+    }
 fi
 if [ -z "$TRAIN_FILES" ] || [ -z "$VAL_FILES" ]; then
     echo "RL dataset paths are required." >&2
@@ -291,8 +307,8 @@ echo "FINAL ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN:-<unset>}"
 echo "FINAL TEMPERATURE=$TEMPERATURE"
 echo "FINAL VAL_TEMPERATURE=$VAL_TEMPERATURE"
 
-mkdir -p "$PROJECT_DIR/debug_logs"
-FINAL_CMD_DUMP_PATH="$PROJECT_DIR/debug_logs/final_launch_cmd.txt"
+mkdir -p "$PROJECT_DIR/artifacts/reports"
+FINAL_CMD_DUMP_PATH="$PROJECT_DIR/artifacts/reports/final_launch_cmd.txt"
 {
     printf 'timestamp=%s\n' "$(date -Is)"
     printf 'profile_path=%s\n' "$RESOLVED_PROFILE_PATH"

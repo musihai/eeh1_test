@@ -7,6 +7,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+DEFAULT_PROFILE_PATH="$SCRIPT_DIR/configs/etth1_ot_qwen3_gpu012.sh"
 
 resolve_profile_path() {
     local candidate="$1"
@@ -24,21 +25,33 @@ resolve_profile_path() {
     return 1
 }
 
-PROFILE_PATH="${PROFILE_PATH:-}"
-if [ -n "$PROFILE_PATH" ]; then
-    RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
-        echo "PROFILE_PATH not found: $PROFILE_PATH"
-        exit 1
-    }
-    # shellcheck disable=SC1090
-    source "$RESOLVED_PROFILE_PATH"
-fi
+PROFILE_PATH="${PROFILE_PATH:-$DEFAULT_PROFILE_PATH}"
+RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
+    echo "PROFILE_PATH not found: $PROFILE_PATH"
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$RESOLVED_PROFILE_PATH"
+
+resolve_transformers_model_dir() {
+    python3 - "$1" <<'PY'
+import sys
+
+from recipe.time_series_forecast.model_path_utils import resolve_transformers_model_dir
+
+print(resolve_transformers_model_dir(sys.argv[1]))
+PY
+}
 
 INITIAL_MODEL_PATH="${RL_MODEL_PATH:-${MODEL_PATH:-}}"
 if [ -z "${INITIAL_MODEL_PATH}" ]; then
     echo "RL_MODEL_PATH (or MODEL_PATH) is required for curriculum RL." >&2
     exit 1
 fi
+INITIAL_MODEL_PATH="$(resolve_transformers_model_dir "$INITIAL_MODEL_PATH")" || {
+    echo "Initial RL model path is not loadable: $INITIAL_MODEL_PATH" >&2
+    exit 1
+}
 
 CURRICULUM_DATASET_DIR="${RL_CURRICULUM_DATASET_DIR:-$PROJECT_DIR/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2}"
 VAL_FILES="${RL_VAL_FILES:-$CURRICULUM_DATASET_DIR/val.jsonl}"
@@ -67,7 +80,7 @@ resolve_latest_actor_hf_model() {
         if [ -n "$latest_step" ]; then
             candidate="$phase_dir/global_step_${latest_step}/actor/huggingface"
             if [ -d "$candidate" ]; then
-                printf '%s\n' "$candidate"
+                resolve_transformers_model_dir "$candidate"
                 return 0
             fi
         fi
@@ -75,7 +88,7 @@ resolve_latest_actor_hf_model() {
 
     candidate="$(find "$phase_dir" -maxdepth 3 -type d -path "*/global_step_*/actor/huggingface" | sort -V | tail -1)"
     if [ -n "$candidate" ]; then
-        printf '%s\n' "$candidate"
+        resolve_transformers_model_dir "$candidate"
         return 0
     fi
     return 1

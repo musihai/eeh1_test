@@ -15,6 +15,9 @@
 from .agent_flow import AgentFlowBase, AgentFlowManager, AgentFlowWorker
 from .single_step_single_turn_agent_flow import SingleStepSingleTurnAgentFlow
 
-_ = [SingleStepSingleTurnAgentFlow]
-
-__all__ = ["AgentFlowBase", "AgentFlowManager", "AgentFlowWorker"]
+__all__ = [
+    "AgentFlowBase",
+    "AgentFlowManager",
+    "AgentFlowWorker",
+    "SingleStepSingleTurnAgentFlow",
+]

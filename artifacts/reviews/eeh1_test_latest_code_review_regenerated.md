@@ -893,7 +893,7 @@ pytest -q
 
 这些都应该删掉，不应该进仓库。
 
-### 3. `debug_logs/final_launch_cmd.txt`
+### 3. `artifacts/reports/final_launch_cmd.txt`
 - 这是运行产物，不是源码
 
 ### 4. `artifacts/reports/*`
@@ -1021,7 +1021,7 @@ pytest -q
 - `arft/agent_flow/tool_agent_flow.py`
 - 所有 `__pycache__`
 - `.pytest_cache`
-- `debug_logs/final_launch_cmd.txt`
+- `artifacts/reports/final_launch_cmd.txt`
 - 根目录历史报告文档（移到 `docs/`）
 - 非必要的 `artifacts/reports/*`
 - `utils.py` 里未使用的同步 `predict_time_series()`

@@ -1,9 +1,17 @@
 import unittest
 
-from recipe.time_series_forecast.diagnostic_policy import plan_diagnostic_tool_batches
+from recipe.time_series_forecast.diagnostic_policy import (
+    FEATURE_TOOL_ORDER,
+    plan_diagnostic_tool_batches,
+    select_feature_tool_names,
+)
 
 
 class TestDiagnosticPolicy(unittest.TestCase):
+    def test_select_feature_tool_names_returns_full_paper_diagnostic_set(self) -> None:
+        selected = select_feature_tool_names([1.0, 2.0, 3.0, 2.5, 1.5])
+        self.assertEqual(selected, list(FEATURE_TOOL_ORDER))
+
     def test_batches_keep_paper_turn1_parallel_when_capacity_allows(self) -> None:
         batches = plan_diagnostic_tool_batches(
             [

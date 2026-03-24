@@ -110,7 +110,7 @@ def get_runtime_turn_info(
             "Do NOT call predict_time_series yet."
         )
     if stage == "routing":
-        return "Routing", "Call predict_time_series with your chosen model (e.g., 'chronos2')."
+        return "Routing", "Call predict_time_series exactly once with the model chosen from the current diagnostic memory state."
     return "Refinement", (
         "Output your final answer in <think>...</think><answer>...</answer> format using the selected model prediction as the base forecast. "
         "Use <think> to briefly explain whether you keep the base forecast unchanged or apply a small local refinement. "
@@ -212,11 +212,9 @@ def build_runtime_user_prompt(
 
 **Instructions**:
 - Do NOT call feature extraction tools again.
-- Choose the model from the completed diagnostics, not from a fixed prior.
-- `patchtst`: smooth windows with strong local periodicity.
-- `arima`: stable linear trend and seasonality.
-- `chronos2`: irregular or noisy windows as a robust fallback.
-- `itransformer`: regime changes or longer-range dependencies.
+- Choose the model from the completed diagnostics and maintained memory state, not from a fixed default.
+- Compare the selected model against at least one plausible alternative in your reasoning before you call the tool.
+- Match the model to the observed evidence: `patchtst` for local motifs and regular seasonality, `arima` for stable autocorrelation structure, `chronos2` for irregular or quality-stressed windows, and `itransformer` for broader structural drift.
 - Call predict_time_series exactly once with your chosen model_name.
 """
 
@@ -232,7 +230,7 @@ PREDICT_TIMESERIES_TOOL_SCHEMA = {
             "Models: 'patchtst' (smooth windows with local periodicity), "
             "'arima' (stable trend/seasonality), 'chronos2' (irregular or noisy windows), "
             "'itransformer' (regime changes or longer-range dependencies). "
-            "Choose based on extracted features rather than a fixed preference."
+            "Choose from the maintained diagnostic state rather than a fixed preference."
         ),
         "parameters": {
             "type": "object",
@@ -240,7 +238,7 @@ PREDICT_TIMESERIES_TOOL_SCHEMA = {
                 "model_name": {
                     "type": "string",
                     "description": (
-                        "Model to use. Choose based on the extracted features rather than a fixed preference."
+                        "Model to use. Choose from the diagnostic evidence and maintained state rather than a fixed preference."
                     ),
                     "enum": ["patchtst", "itransformer", "arima", "chronos2"]
                 }

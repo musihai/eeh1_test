@@ -90,6 +90,30 @@ class TestETTh1RLDatasetBuilder(unittest.TestCase):
         )
         self.assertAlmostEqual(coverage, 0.4)
 
+    def test_iter_split_samples_prefers_reference_teacher_model_for_offline_best(self) -> None:
+        source = pd.read_csv(Path("dataset/ETT-small/ETTh1.csv")).iloc[:210].copy()
+        split = build_split_configs(total_rows=len(source), train_rows=210, val_rows=0, test_rows=0)[0]
+        first = next(
+            iter(
+                iter_split_samples(
+                    source,
+                    split,
+                    lookback_window=96,
+                    forecast_horizon=96,
+                    target_column="OT",
+                    teacher_metadata_by_index={
+                        0: {
+                            "best_model": "arima",
+                            "reference_teacher_model": "itransformer",
+                            "reference_teacher_error": 1.0,
+                        }
+                    },
+                )
+            )
+        )
+
+        self.assertEqual(first["offline_best_model"], "itransformer")
+
     def test_build_train_stage_slices_emits_stage1_stage12_stage123(self) -> None:
         records = [
             {"uid": "a", "curriculum_stage": "easy"},

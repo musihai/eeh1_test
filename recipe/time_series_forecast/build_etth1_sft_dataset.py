@@ -20,11 +20,13 @@ from recipe.time_series_forecast.prompts import (
     build_timeseries_system_prompt,
 )
 from recipe.time_series_forecast.dataset_identity import (
+    DATASET_KIND_RL_JSONL,
     DATASET_KIND_RUNTIME_SFT_PARQUET,
     DATASET_KIND_TEACHER_CURATED_SFT,
     validate_sibling_metadata,
 )
-from recipe.time_series_forecast.diagnostic_policy import plan_diagnostic_tool_batches
+from recipe.time_series_forecast.dataset_file_utils import write_metadata_file
+from recipe.time_series_forecast.diagnostic_policy import plan_diagnostic_tool_batches, select_feature_tool_names
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
 from recipe.time_series_forecast.utils import (
     compact_prediction_tool_output_from_string,
@@ -60,6 +62,7 @@ DEFAULT_TRAIN_JSONL = DEFAULT_CURATED_INPUT_DIR / "train_curated.jsonl"
 DEFAULT_VAL_JSONL = DEFAULT_CURATED_INPUT_DIR / "val_curated.jsonl"
 DEFAULT_TEST_JSONL = DEFAULT_CURATED_INPUT_DIR / "test_curated.jsonl"
 DEFAULT_TRAIN_STAGE_REPEAT_FACTORS = {"diagnostic": 1, "routing": 1, "refinement": 1}
+DEFAULT_BALANCE_TRAIN_ROUTING_MODELS = True
 
 
 @dataclass(frozen=True)
@@ -95,6 +98,22 @@ ROUTING_MODEL_RATIONALES = {
     "arima": "stable linear autocorrelation structure",
     "chronos2": "irregular dynamics that benefit from a strong general forecasting prior",
 }
+ROUTING_FALLBACK_PREFERENCE = {
+    "arima": 3,
+    "patchtst": 2,
+    "itransformer": 1,
+    "chronos2": 0,
+}
+
+
+def _select_model_from_scores(scores: dict[str, float]) -> str:
+    return max(
+        scores.items(),
+        key=lambda item: (
+            float(item[1]),
+            ROUTING_FALLBACK_PREFERENCE.get(str(item[0]), -1),
+        ),
+    )[0]
 
 
 def _last_assistant_content(messages: Any) -> str:
@@ -244,6 +263,14 @@ def _normalize_teacher_model(model_name: Any) -> str:
     return model if model in SUPPORTED_PREDICTION_MODELS else "patchtst"
 
 
+def _resolve_reference_teacher_model(sample: dict[str, Any]) -> str:
+    for key in ("reference_teacher_model", "offline_best_model"):
+        value = sample.get(key)
+        if str(value or "").strip():
+            return _normalize_teacher_model(value)
+    return _normalize_teacher_model(None)
+
+
 def _compute_routing_feature_snapshot(history_values: Sequence[float]) -> dict[str, Any]:
     values = [float(value) for value in history_values]
     basic = extract_basic_statistics(values)
@@ -281,90 +308,75 @@ def _heuristic_routing_scores(feature_snapshot: dict[str, Any]) -> dict[str, flo
     quality_saturation_ratio = float(feature_snapshot.get("quality_saturation_ratio", 0.0))
 
     scores = {model_name: 0.0 for model_name in sorted(SUPPORTED_PREDICTION_MODELS)}
+    scores["arima"] += 0.10
+    scores["patchtst"] += 0.15
+    scores["chronos2"] -= 0.50
 
-    scores["arima"] += 2.0 if acf1 >= 0.93 else (1.0 if acf1 >= 0.88 else 0.0)
-    scores["arima"] += 1.5 if abs(acf_seasonal) <= 0.15 else 0.0
-    scores["arima"] += 1.5 if changepoint_count <= 1.0 else (0.5 if changepoint_count <= 2.0 else -1.0)
-    scores["arima"] += 1.0 if residual_exceed_ratio <= 0.04 else (-0.5 if residual_exceed_ratio >= 0.06 else 0.0)
-    scores["arima"] += 0.5 if peak_count <= 3.0 else -0.5
+    scores["arima"] += 1.50 if acf1 >= 0.92 else (0.75 if acf1 >= 0.88 else 0.0)
+    scores["arima"] += 0.75 if changepoint_count <= 1.0 else 0.0
+    scores["arima"] += 0.50 if residual_exceed_ratio <= 0.05 else 0.0
 
-    scores["patchtst"] += 1.5 if acf_seasonal >= 0.12 else 0.0
-    scores["patchtst"] += 1.5 if 2.0 <= peak_count <= 4.0 else (0.5 if peak_count == 5.0 else -0.5)
-    scores["patchtst"] += 1.0 if peak_spacing_cv <= 0.22 else 0.0
-    scores["patchtst"] += 0.8 if changepoint_count <= 2.0 else 0.0
-    scores["patchtst"] += 0.5 if residual_exceed_ratio <= 0.05 else 0.0
+    scores["patchtst"] += 1.00 if 2.0 <= peak_count <= 5.0 else 0.0
+    scores["patchtst"] += 0.75 if peak_spacing_cv <= 0.30 else 0.0
+    scores["patchtst"] += 0.50 if acf_seasonal >= 0.05 else 0.0
 
-    scores["itransformer"] += 2.0 if changepoint_count >= 3.0 else (1.0 if changepoint_count >= 2.0 else 0.0)
-    scores["itransformer"] += 1.2 if cusum_max >= 90.0 else (0.5 if cusum_max >= 70.0 else 0.0)
-    scores["itransformer"] += 0.8 if monotone_duration >= 0.12 else 0.0
-    scores["itransformer"] += 0.5 if acf_seasonal >= 0.18 else 0.0
-    scores["itransformer"] += 0.5 if peak_count >= 4.0 else 0.0
+    scores["itransformer"] += 1.25 if changepoint_count >= 2.0 else 0.0
+    scores["itransformer"] += 0.75 if cusum_max >= 70.0 else 0.0
+    scores["itransformer"] += 0.50 if monotone_duration >= 0.10 else 0.0
 
-    scores["chronos2"] += 2.0 if residual_exceed_ratio >= 0.06 else (1.0 if residual_exceed_ratio >= 0.05 else 0.0)
-    scores["chronos2"] += 1.2 if peak_count >= 5.0 else 0.0
-    scores["chronos2"] += 1.0 if peak_spacing_cv >= 0.30 else 0.0
-    scores["chronos2"] += 0.8 if quality_saturation_ratio >= 0.05 or quality_quantization_score >= 0.16 else 0.0
-    scores["chronos2"] += 0.5 if acf1 <= 0.88 else 0.0
+    scores["chronos2"] += 0.75 if residual_exceed_ratio >= 0.08 else 0.0
+    scores["chronos2"] += 0.50 if quality_saturation_ratio >= 0.08 or quality_quantization_score >= 0.24 else 0.0
+    scores["chronos2"] += 0.50 if peak_count >= 6.0 and peak_spacing_cv >= 0.35 else 0.0
     return scores
 
 
 def _select_prediction_model_by_heuristic(history_values: Sequence[float]) -> tuple[str, dict[str, Any], str]:
     feature_snapshot = _compute_routing_feature_snapshot(history_values)
     acf1 = float(feature_snapshot["acf1"])
-    acf_seasonal = float(feature_snapshot["acf_seasonal"])
     changepoint_count = float(feature_snapshot["changepoint_count"])
     residual_exceed_ratio = float(feature_snapshot["residual_exceed_ratio"])
     peak_count = float(feature_snapshot["peak_count"])
     peak_spacing_cv = float(feature_snapshot["peak_spacing_cv"])
     monotone_duration = float(feature_snapshot["monotone_duration"])
     cusum_max = float(feature_snapshot["cusum_max"])
-    dominant_pattern = str(feature_snapshot["dominant_pattern"])
     quality_issue = (
-        float(feature_snapshot["quality_saturation_ratio"]) >= 0.05
-        or float(feature_snapshot["quality_quantization_score"]) >= 0.16
+        float(feature_snapshot["quality_saturation_ratio"]) >= 0.08
+        or float(feature_snapshot["quality_quantization_score"]) >= 0.24
     )
 
-    if residual_exceed_ratio >= 0.06 or quality_issue or (peak_count >= 5.0 and peak_spacing_cv >= 0.30):
+    if quality_issue or (residual_exceed_ratio >= 0.085 and peak_count >= 6.0 and peak_spacing_cv >= 0.40):
         return (
             "chronos2",
             feature_snapshot,
-            "The window is irregular or noisy, so I avoid brittle classical assumptions and prefer a robust foundation forecaster.",
+            "The diagnostics show strong irregularity or data-quality stress, so I choose the most robust general forecasting model.",
         )
-    if acf1 >= 0.93 and abs(acf_seasonal) <= 0.15 and changepoint_count <= 1.0 and residual_exceed_ratio <= 0.04 and peak_count <= 3.0:
+    if acf1 >= 0.93 and changepoint_count <= 1.0 and residual_exceed_ratio <= 0.05 and peak_count <= 4.0:
         return (
             "arima",
             feature_snapshot,
-            "The series remains stable with strong short-lag autocorrelation and limited structural change, so a linear seasonal forecaster is sufficient.",
+            "The diagnostics still look stable and locally predictable, so I begin with the simplest structured forecaster.",
         )
-    if changepoint_count >= 3.0 or (cusum_max >= 90.0 and monotone_duration >= 0.10):
+    if changepoint_count >= 3.0 and (cusum_max >= 70.0 or monotone_duration >= 0.10):
         return (
             "itransformer",
             feature_snapshot,
-            "The series shows regime shifts and longer-range structural drift, so I prefer a model that can absorb global dependency changes.",
+            "The diagnostics indicate structural drift across the window, so I prefer a model that captures longer-range dependency changes.",
         )
-    if acf_seasonal >= 0.12 and 2.0 <= peak_count <= 5.0 and peak_spacing_cv <= 0.25:
+    if 2.0 <= peak_count <= 5.0 and peak_spacing_cv <= 0.30:
         return (
             "patchtst",
             feature_snapshot,
-            "The window shows repeatable local seasonal motifs with reasonably regular peaks, so a patch-based temporal model is a good fit.",
+            "The window shows repeatable local motifs with reasonably regular peaks, so a patch-based temporal model is a good fit.",
         )
 
     scores = _heuristic_routing_scores(feature_snapshot)
-    selected_model = max(
-        scores.items(),
-        key=lambda item: (
-            float(item[1]),
-            {"arima": 0, "patchtst": 1, "itransformer": 2, "chronos2": 3}[str(item[0])],
-        ),
-    )[0]
+    selected_model = _select_model_from_scores(scores)
     fallback_reason_by_model = {
-        "arima": "The diagnostics still look comparatively stable, so I choose the simplest structured forecaster.",
+        "arima": "The diagnostics remain comparatively stable, so I start with the simplest structured forecaster.",
         "patchtst": "The diagnostics suggest local repeating motifs, so I choose the patch-based temporal model.",
-        "itransformer": "The diagnostics indicate structural drift, so I choose the global-dependency forecaster.",
-        "chronos2": "The diagnostics remain hard to explain with simple assumptions, so I choose the robust foundation forecaster.",
+        "itransformer": "The diagnostics indicate broader structural drift, so I choose the global-dependency forecaster.",
+        "chronos2": "The diagnostics remain highly irregular, so I choose the most robust general forecasting model.",
     }
-    if dominant_pattern == "oscillation" and selected_model == "arima":
-        selected_model = "chronos2"
     return selected_model, feature_snapshot, fallback_reason_by_model[selected_model]
 
 
@@ -401,10 +413,16 @@ async def _predict_with_runtime_tools(
     return format_predictions_to_string(pred_df, last_timestamp)
 
 
-def build_feature_tool_results(values: list[float]) -> list[ToolResult]:
+def build_feature_tool_results(
+    values: list[float],
+    *,
+    tool_names: Sequence[str] | None = None,
+) -> list[ToolResult]:
+    allowed_names = {str(name) for name in (tool_names or []) if str(name).strip()}
     return [
         ToolResult(tool_name=name, tool_output=builder(values))
         for name, builder in FEATURE_TOOL_BUILDERS
+        if not allowed_names or name in allowed_names
     ]
 
 
@@ -883,27 +901,143 @@ def _build_routing_metric_items(
     ]
 
 
+def _build_snapshot_grounded_routing_reason(
+    *,
+    model_name: str,
+    feature_snapshot: dict[str, Any],
+    selected_feature_tools: Sequence[str],
+) -> str:
+    selected = set(selected_feature_tools or [])
+    evidence_phrases: list[str] = []
+
+    acf1 = float(feature_snapshot.get("acf1", 0.0))
+    acf_seasonal = float(feature_snapshot.get("acf_seasonal", 0.0))
+    cusum_max = float(feature_snapshot.get("cusum_max", 0.0))
+    changepoint_count = float(feature_snapshot.get("changepoint_count", 0.0))
+    peak_count = float(feature_snapshot.get("peak_count", 0.0))
+    peak_spacing_cv = float(feature_snapshot.get("peak_spacing_cv", 0.0))
+    monotone_duration = float(feature_snapshot.get("monotone_duration", 0.0))
+    residual_exceed_ratio = float(feature_snapshot.get("residual_exceed_ratio", 0.0))
+    quality_quantization_score = float(feature_snapshot.get("quality_quantization_score", 0.0))
+    quality_saturation_ratio = float(feature_snapshot.get("quality_saturation_ratio", 0.0))
+    dominant_pattern = str(feature_snapshot.get("dominant_pattern", "") or "")
+
+    if model_name == "arima":
+        if "extract_basic_statistics" in selected and acf1 >= 0.88:
+            evidence_phrases.append("high short-lag autocorrelation")
+        if "extract_within_channel_dynamics" in selected and changepoint_count <= 1.0:
+            evidence_phrases.append("few structural breaks")
+        if "extract_forecast_residuals" in selected and residual_exceed_ratio <= 0.05:
+            evidence_phrases.append("small residual exceed ratio")
+        if not evidence_phrases:
+            evidence_phrases.append("stable and locally predictable dynamics")
+        evidence_text = _format_phrase_list(evidence_phrases)
+        return (
+            f"The diagnostics indicate {evidence_text}, so the structured autoregressive forecaster "
+            "is the best fit for this window."
+        )
+
+    if model_name == "patchtst":
+        if "extract_within_channel_dynamics" in selected and 2.0 <= peak_count <= 5.0:
+            evidence_phrases.append("repeatable local peaks")
+        if "extract_within_channel_dynamics" in selected and peak_spacing_cv <= 0.30:
+            evidence_phrases.append("regular peak spacing")
+        if "extract_basic_statistics" in selected and acf_seasonal >= 0.05:
+            evidence_phrases.append("seasonal correlation")
+        if dominant_pattern == "oscillation":
+            evidence_phrases.append("oscillatory local motifs")
+        if not evidence_phrases:
+            evidence_phrases.append("repeatable local motifs")
+        evidence_text = _format_phrase_list(evidence_phrases)
+        return (
+            f"The diagnostics indicate {evidence_text}, so the patch-based temporal model "
+            "is the best match for this window."
+        )
+
+    if model_name == "itransformer":
+        if "extract_within_channel_dynamics" in selected and changepoint_count >= 2.0:
+            evidence_phrases.append("multiple changepoints")
+        if "extract_basic_statistics" in selected and cusum_max >= 70.0:
+            evidence_phrases.append("large cumulative drift")
+        if "extract_within_channel_dynamics" in selected and monotone_duration >= 0.10:
+            evidence_phrases.append("persistent directional segments")
+        if dominant_pattern in {"rise", "fall"}:
+            evidence_phrases.append("broader regime movement")
+        if not evidence_phrases:
+            evidence_phrases.append("broader structural drift")
+        evidence_text = _format_phrase_list(evidence_phrases)
+        return (
+            f"The diagnostics indicate {evidence_text}, so the global-dependency forecaster "
+            "is the best fit for this window."
+        )
+
+    if "extract_forecast_residuals" in selected and residual_exceed_ratio >= 0.08:
+        evidence_phrases.append("large residual excursions")
+    if "extract_data_quality" in selected and (
+        quality_quantization_score >= 0.24 or quality_saturation_ratio >= 0.08
+    ):
+        evidence_phrases.append("data-quality stress")
+    if "extract_within_channel_dynamics" in selected and peak_count >= 6.0 and peak_spacing_cv >= 0.35:
+        evidence_phrases.append("highly irregular local dynamics")
+    if not evidence_phrases:
+        evidence_phrases.append("irregular or noisy behavior")
+    evidence_text = _format_phrase_list(evidence_phrases)
+    return (
+        f"The diagnostics indicate {evidence_text}, so the robust general forecasting model "
+        "is the best fit for this window."
+    )
+
+
 def build_routing_reflection(
     *,
     model_name: str,
     history_values: Sequence[float],
     selected_feature_tools: Sequence[str],
     decision_reason: str = "",
+    include_heuristic_comparison: bool = True,
 ) -> str:
     metric_items = _build_routing_metric_items(
         history_values=history_values,
         selected_feature_tools=selected_feature_tools,
     )
     if metric_items:
+        comparison_text = ""
+        if include_heuristic_comparison:
+            feature_snapshot = _compute_routing_feature_snapshot(history_values)
+            routing_scores = _heuristic_routing_scores(feature_snapshot)
+            alternative_candidates = sorted(
+                (
+                    (candidate, float(score))
+                    for candidate, score in routing_scores.items()
+                    if candidate != model_name
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )
+            selected_score = float(routing_scores.get(model_name, 0.0))
+            if alternative_candidates:
+                runner_up_name, runner_up_score = alternative_candidates[0]
+                score_margin = selected_score - runner_up_score
+                if score_margin >= 0.0:
+                    comparison_text = _build_routing_comparison_text(
+                        model_name=model_name,
+                        runner_up_name=runner_up_name,
+                    )
+                else:
+                    comparison_text = (
+                        f"A high-confidence trigger overrides the fallback order here, "
+                        f"so I still prefer {model_name} over {runner_up_name}."
+                    )
         reason_text = str(decision_reason or "").strip()
+        detail_lines = [
+            f"Observed diagnostics: {'; '.join(metric_items)}.",
+            f"Decision: {model_name}.",
+        ]
         if reason_text:
-            reason_text = f"\n{reason_text}"
-        return (
-            f"Observed diagnostics: {'; '.join(metric_items)}.\n"
-            f"Decision: {model_name}.\n"
-            f"{reason_text.lstrip()}\n"
-            f"I will call predict_time_series with {model_name}."
-        )
+            detail_lines.append(reason_text)
+        if comparison_text:
+            detail_lines.append(comparison_text)
+        detail_lines.append(f"I will call predict_time_series with {model_name}.")
+        return "\n".join(detail_lines)
 
     evidence_phrases = [
         FEATURE_TOOL_LABELS.get(tool_name, tool_name.replace("_", " "))
@@ -922,6 +1056,31 @@ def build_routing_reflection(
         f"Decision: {model_name}.\n"
         f"The observed series is most compatible with {model_rationale}, "
         f"so I will call predict_time_series with {model_name}."
+    )
+
+
+def _build_routing_comparison_text(*, model_name: str, runner_up_name: str) -> str:
+    comparison_by_model = {
+        "patchtst": (
+            f"Compared with {runner_up_name}, the local motif signal is stronger than the broad drift signal here, "
+            "so I prioritize the patch-based model."
+        ),
+        "itransformer": (
+            f"Compared with {runner_up_name}, the structural drift signal is stronger than the local motif signal here, "
+            "so I prioritize the global-dependency model."
+        ),
+        "arima": (
+            f"Compared with {runner_up_name}, the window looks more stable and locally predictable here, "
+            "so I prioritize the simpler structured model."
+        ),
+        "chronos2": (
+            f"Compared with {runner_up_name}, irregularity or data-quality stress is more dominant here, "
+            "so I prioritize the robust fallback."
+        ),
+    }
+    return comparison_by_model.get(
+        model_name,
+        f"Compared with {runner_up_name}, the evidence is more consistent with {model_name}.",
     )
 
 
@@ -1031,12 +1190,12 @@ def build_sft_records(
     if not history_values:
         raise ValueError("No valid ETTh1 values found in raw_prompt")
 
-    feature_results = build_feature_tool_results(history_values)
-    selected_feature_tools = [result.tool_name for result in feature_results]
+    selected_feature_tools = select_feature_tool_names(history_values)
+    feature_results = build_feature_tool_results(history_values, tool_names=selected_feature_tools)
     feature_result_by_name = {result.tool_name: result for result in feature_results}
     diagnostic_tool_batches = plan_diagnostic_tool_batches(selected_feature_tools, max_parallel_calls=5)
 
-    reference_teacher_model = _normalize_teacher_model(sample.get("reference_teacher_model"))
+    reference_teacher_model = _resolve_reference_teacher_model(sample)
     second_teacher_model = _normalize_teacher_model(sample.get("teacher_eval_second_best_model"))
     selected_prediction_model, routing_feature_snapshot, routing_policy_reason = _select_prediction_model_by_heuristic(
         history_values
@@ -1068,7 +1227,7 @@ def build_sft_records(
             try:
                 base_prediction_text, base_prediction_source = _resolve_selected_prediction(fallback_model)
                 selected_prediction_model = fallback_model
-                routing_policy_source = "heuristic_runtime_fallback"
+                routing_policy_source = "heuristic_rule_based_fallback"
                 routing_policy_reason = (
                     f"{routing_policy_reason} The planned model was unavailable during dataset construction, "
                     f"so I fallback to {fallback_model}."
@@ -1238,6 +1397,7 @@ def build_sft_records(
                         history_values=history_values,
                         selected_feature_tools=selected_feature_tools,
                         decision_reason=routing_policy_reason,
+                        include_heuristic_comparison=False,
                     ),
                     "tool_calls": [prediction_tool_call],
                 },
@@ -1341,12 +1501,7 @@ def convert_jsonl_to_sft_parquet(
     return dataframe
 
 
-def _write_metadata(output_dir: Path, **kwargs: Any) -> None:
-    metadata_path = output_dir / "metadata.json"
-    metadata_path.write_text(json.dumps(kwargs, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def _distribution_from_series(values: Iterable[Any]) -> dict[str, int]:
+def distribution_from_series(values: Iterable[Any]) -> dict[str, int]:
     counter: Counter[str] = Counter()
     for value in values:
         if value is None:
@@ -1359,7 +1514,7 @@ def _distribution_from_series(values: Iterable[Any]) -> dict[str, int]:
     return {str(k): int(v) for k, v in sorted(counter.items())}
 
 
-def _rebalance_train_turn3_targets(
+def rebalance_train_turn3_targets(
     dataframe: pd.DataFrame,
     *,
     min_local_refine_ratio: float,
@@ -1408,7 +1563,7 @@ def _rebalance_train_turn3_targets(
     return balanced
 
 
-def _rebalance_train_stage_records(
+def rebalance_train_stage_records(
     dataframe: pd.DataFrame,
     *,
     stage_repeat_factors: dict[str, int] | None,
@@ -1442,24 +1597,63 @@ def _rebalance_train_stage_records(
     return balanced
 
 
+def rebalance_train_routing_model_records(
+    dataframe: pd.DataFrame,
+    *,
+    enabled: bool,
+) -> pd.DataFrame:
+    if dataframe.empty or not enabled:
+        return dataframe
+    if "turn_stage" not in dataframe.columns or "selected_prediction_model" not in dataframe.columns:
+        return dataframe
+
+    routing_mask = dataframe["turn_stage"].astype(str).str.lower() == "routing"
+    routing_df = dataframe.loc[routing_mask].copy()
+    non_routing_df = dataframe.loc[~routing_mask].copy()
+    if routing_df.empty:
+        return dataframe
+
+    class_counts = routing_df["selected_prediction_model"].astype(str).value_counts()
+    if class_counts.empty or len(class_counts) <= 1:
+        return dataframe
+
+    max_count = int(class_counts.max())
+    repeated_frames: list[pd.DataFrame] = [non_routing_df]
+    sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in routing_df.columns]
+
+    for model_name, class_df in routing_df.groupby("selected_prediction_model", sort=False):
+        class_df = class_df.copy()
+        class_len = len(class_df)
+        repeat_factor, remainder = divmod(max_count, class_len)
+        repeated_frames.extend(class_df.copy() for _ in range(max(1, repeat_factor)))
+        if remainder > 0:
+            repeated_frames.append(class_df.iloc[:remainder].copy())
+
+    balanced = pd.concat(repeated_frames, ignore_index=True)
+    if sort_columns:
+        balanced = balanced.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+    if "sample_index" in balanced.columns:
+        balanced["sample_index"] = list(range(len(balanced)))
+    return balanced
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build ETTh1 OT step-wise runtime-aligned SFT parquet from teacher-curated jsonl samples."
+        description="Build ETTh1 OT step-wise runtime-aligned SFT parquet from teacher-curated or RL jsonl samples."
     )
     parser.add_argument(
         "--train-jsonl",
         default=str(DEFAULT_TRAIN_JSONL),
-        help="Teacher-curated train jsonl path.",
+        help="Teacher-curated or RL train jsonl path.",
     )
     parser.add_argument(
         "--val-jsonl",
         default=str(DEFAULT_VAL_JSONL),
-        help="Teacher-curated val jsonl path.",
+        help="Teacher-curated or RL val jsonl path.",
     )
     parser.add_argument(
         "--test-jsonl",
         default=str(DEFAULT_TEST_JSONL),
-        help="Optional teacher-curated test jsonl path.",
+        help="Optional teacher-curated or RL test jsonl path.",
     )
     parser.add_argument(
         "--output-dir",
@@ -1490,6 +1684,12 @@ def parse_args() -> argparse.Namespace:
             "Use {} to disable stage reweighting."
         ),
     )
+    parser.add_argument(
+        "--balance-train-routing-models",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_BALANCE_TRAIN_ROUTING_MODELS,
+        help="Whether to rebalance train routing rows across selected_prediction_model classes.",
+    )
     return parser.parse_args()
 
 
@@ -1516,14 +1716,18 @@ def main() -> None:
             continue
         _, source_metadata_path = validate_sibling_metadata(
             split_path,
-            expected_kind=(DATASET_KIND_TEACHER_CURATED_SFT, DATASET_KIND_RUNTIME_SFT_PARQUET),
+            expected_kind=(
+                DATASET_KIND_TEACHER_CURATED_SFT,
+                DATASET_KIND_RUNTIME_SFT_PARQUET,
+                DATASET_KIND_RL_JSONL,
+            ),
         )
         source_metadata_paths.append(source_metadata_path)
     if source_metadata_paths:
         unique_source_metadata_paths = {str(path) for path in source_metadata_paths}
         if len(unique_source_metadata_paths) != 1:
             raise ValueError(
-                "All source curated jsonl splits must come from the same teacher-curated dataset directory. "
+                "All source jsonl splits must come from the same dataset directory. "
                 f"Got metadata files: {sorted(unique_source_metadata_paths)}"
             )
 
@@ -1533,11 +1737,15 @@ def main() -> None:
         max_samples=args.max_train_samples,
         turn3_target_mode=turn3_target_mode,
     )
-    train_df = _rebalance_train_turn3_targets(
+    train_df = rebalance_train_turn3_targets(
         train_df_raw,
         min_local_refine_ratio=effective_train_min_local_refine_ratio,
     )
-    train_df = _rebalance_train_stage_records(
+    train_df = rebalance_train_routing_model_records(
+        train_df,
+        enabled=bool(args.balance_train_routing_models),
+    )
+    train_df = rebalance_train_stage_records(
         train_df,
         stage_repeat_factors=train_stage_repeat_factors,
     )
@@ -1546,11 +1754,11 @@ def main() -> None:
         train_df.to_parquet(output_dir / "train.parquet", index=False)
         print(
             f"Rebalanced train.parquet turn3_target_type distribution: "
-            f"{_distribution_from_series(train_df['turn3_target_type'])}"
+            f"{distribution_from_series(train_df['turn3_target_type'])}"
         )
         print(
             f"Rebalanced train.parquet turn_stage distribution: "
-            f"{_distribution_from_series(train_df['turn_stage'])}"
+            f"{distribution_from_series(train_df['turn_stage'])}"
         )
     val_df = convert_jsonl_to_sft_parquet(
         input_path=args.val_jsonl,
@@ -1591,28 +1799,35 @@ def main() -> None:
         requested_train_min_local_refine_ratio=float(args.train_min_local_refine_ratio),
         train_min_local_refine_ratio=effective_train_min_local_refine_ratio,
         train_stage_repeat_factors=train_stage_repeat_factors,
+        balance_train_routing_models=bool(args.balance_train_routing_models),
         source_train_jsonl=str(Path(args.train_jsonl)),
         source_val_jsonl=str(Path(args.val_jsonl)),
         source_test_jsonl=str(test_path),
         source_curated_metadata_path=str(source_metadata_paths[0]) if source_metadata_paths else "",
-        train_turn_stage_distribution=_distribution_from_series(train_df["turn_stage"]),
-        val_turn_stage_distribution=_distribution_from_series(val_df["turn_stage"]),
-        train_turn3_target_type_distribution_before_balance=_distribution_from_series(
+        train_turn_stage_distribution=distribution_from_series(train_df["turn_stage"]),
+        val_turn_stage_distribution=distribution_from_series(val_df["turn_stage"]),
+        train_turn3_target_type_distribution_before_balance=distribution_from_series(
             _source_level_frame(train_df_raw)["turn3_target_type"]
         ),
-        train_reference_teacher_model_distribution=_distribution_from_series(
+        train_reference_teacher_model_distribution=distribution_from_series(
             _source_level_frame(train_df)["reference_teacher_model"]
         ),
-        train_selected_prediction_model_distribution=_distribution_from_series(
+        train_selected_prediction_model_distribution=distribution_from_series(
             _source_level_frame(train_df)["selected_prediction_model"]
         ),
-        train_turn3_target_type_distribution=_distribution_from_series(_source_level_frame(train_df)["turn3_target_type"]),
-        train_turn3_trigger_reason_distribution=_distribution_from_series(_source_level_frame(train_df)["turn3_trigger_reason"]),
-        train_refine_ops_signature_distribution=_distribution_from_series(_source_level_frame(train_df)["refine_ops_signature"]),
-        train_selected_feature_tool_signature_distribution=_distribution_from_series(
+        train_routing_row_selected_prediction_model_distribution=distribution_from_series(
+            train_df.loc[train_df["turn_stage"] == "routing", "selected_prediction_model"]
+        ),
+        train_turn3_target_type_distribution=distribution_from_series(_source_level_frame(train_df)["turn3_target_type"]),
+        train_turn3_trigger_reason_distribution=distribution_from_series(_source_level_frame(train_df)["turn3_trigger_reason"]),
+        train_refine_ops_signature_distribution=distribution_from_series(_source_level_frame(train_df)["refine_ops_signature"]),
+        train_selected_feature_tool_signature_distribution=distribution_from_series(
             _source_level_frame(train_df)["selected_feature_tool_signature"]
         ),
-        train_base_prediction_source_distribution=_distribution_from_series(
+        train_routing_policy_source_distribution=distribution_from_series(
+            _source_level_frame(train_df)["routing_policy_source"]
+        ),
+        train_base_prediction_source_distribution=distribution_from_series(
             _source_level_frame(train_df)["base_prediction_source"]
         ),
         train_turn3_protocol_checked_count=int(train_protocol_summary.get("turn3_protocol_checked_count", 0)),
@@ -1621,19 +1836,22 @@ def main() -> None:
         train_turn3_protocol_invalid_count=int(train_protocol_summary.get("turn3_protocol_invalid_count", 0)),
         train_turn3_protocol_valid_ratio=float(train_protocol_summary.get("turn3_protocol_valid_ratio", 0.0)),
         train_turn3_protocol_reason_distribution=dict(train_protocol_summary.get("turn3_protocol_reason_distribution", {})),
-        val_reference_teacher_model_distribution=_distribution_from_series(
+        val_reference_teacher_model_distribution=distribution_from_series(
             _source_level_frame(val_df)["reference_teacher_model"]
         ),
-        val_selected_prediction_model_distribution=_distribution_from_series(
+        val_selected_prediction_model_distribution=distribution_from_series(
             _source_level_frame(val_df)["selected_prediction_model"]
         ),
-        val_turn3_target_type_distribution=_distribution_from_series(_source_level_frame(val_df)["turn3_target_type"]),
-        val_turn3_trigger_reason_distribution=_distribution_from_series(_source_level_frame(val_df)["turn3_trigger_reason"]),
-        val_refine_ops_signature_distribution=_distribution_from_series(_source_level_frame(val_df)["refine_ops_signature"]),
-        val_selected_feature_tool_signature_distribution=_distribution_from_series(
+        val_turn3_target_type_distribution=distribution_from_series(_source_level_frame(val_df)["turn3_target_type"]),
+        val_turn3_trigger_reason_distribution=distribution_from_series(_source_level_frame(val_df)["turn3_trigger_reason"]),
+        val_refine_ops_signature_distribution=distribution_from_series(_source_level_frame(val_df)["refine_ops_signature"]),
+        val_selected_feature_tool_signature_distribution=distribution_from_series(
             _source_level_frame(val_df)["selected_feature_tool_signature"]
         ),
-        val_base_prediction_source_distribution=_distribution_from_series(
+        val_routing_policy_source_distribution=distribution_from_series(
+            _source_level_frame(val_df)["routing_policy_source"]
+        ),
+        val_base_prediction_source_distribution=distribution_from_series(
             _source_level_frame(val_df)["base_prediction_source"]
         ),
         val_turn3_protocol_checked_count=int(val_protocol_summary.get("turn3_protocol_checked_count", 0)),
@@ -1645,26 +1863,29 @@ def main() -> None:
     )
     if test_df is not None and len(test_df) > 0:
         metadata_kwargs.update(
-            test_turn_stage_distribution=_distribution_from_series(test_df["turn_stage"]),
-            test_reference_teacher_model_distribution=_distribution_from_series(
+            test_turn_stage_distribution=distribution_from_series(test_df["turn_stage"]),
+            test_reference_teacher_model_distribution=distribution_from_series(
                 _source_level_frame(test_df)["reference_teacher_model"]
             ),
-            test_selected_prediction_model_distribution=_distribution_from_series(
+            test_selected_prediction_model_distribution=distribution_from_series(
                 _source_level_frame(test_df)["selected_prediction_model"]
             ),
-            test_turn3_target_type_distribution=_distribution_from_series(
+            test_turn3_target_type_distribution=distribution_from_series(
                 _source_level_frame(test_df)["turn3_target_type"]
             ),
-            test_turn3_trigger_reason_distribution=_distribution_from_series(
+            test_turn3_trigger_reason_distribution=distribution_from_series(
                 _source_level_frame(test_df)["turn3_trigger_reason"]
             ),
-            test_refine_ops_signature_distribution=_distribution_from_series(
+            test_refine_ops_signature_distribution=distribution_from_series(
                 _source_level_frame(test_df)["refine_ops_signature"]
             ),
-            test_selected_feature_tool_signature_distribution=_distribution_from_series(
+            test_selected_feature_tool_signature_distribution=distribution_from_series(
                 _source_level_frame(test_df)["selected_feature_tool_signature"]
             ),
-            test_base_prediction_source_distribution=_distribution_from_series(
+            test_routing_policy_source_distribution=distribution_from_series(
+                _source_level_frame(test_df)["routing_policy_source"]
+            ),
+            test_base_prediction_source_distribution=distribution_from_series(
                 _source_level_frame(test_df)["base_prediction_source"]
             ),
             test_turn3_protocol_checked_count=int(test_protocol_summary.get("turn3_protocol_checked_count", 0)),
@@ -1675,10 +1896,7 @@ def main() -> None:
             test_turn3_protocol_reason_distribution=dict(test_protocol_summary.get("turn3_protocol_reason_distribution", {})),
         )
 
-    _write_metadata(
-        output_dir,
-        **metadata_kwargs,
-    )
+    write_metadata_file(output_dir, metadata_kwargs)
 
 
 if __name__ == "__main__":

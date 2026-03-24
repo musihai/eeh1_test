@@ -175,7 +175,7 @@
 - `examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh`
 - `examples/time_series_forecast/run_qwen3-1.7B.sh`
 - `examples/time_series_forecast/run_qwen3-1.7B_sft.sh`
-- `debug_logs/final_launch_cmd.txt`
+- `artifacts/reports/final_launch_cmd.txt`
 - `README.md`
 
 关键改动：

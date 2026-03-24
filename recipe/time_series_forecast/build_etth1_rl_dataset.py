@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -11,6 +10,7 @@ from typing import Any, Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from recipe.time_series_forecast.dataset_file_utils import load_jsonl_records, write_jsonl_records, write_metadata_file
 from recipe.time_series_forecast.dataset_identity import DATASET_KIND_RL_JSONL
 from recipe.time_series_forecast.utils import extract_data_quality
 
@@ -185,15 +185,11 @@ def load_teacher_metadata(path: str | Path | None) -> dict[int, dict[str, Any]]:
         raise FileNotFoundError(f"Teacher metadata jsonl not found: {metadata_path}")
 
     metadata_by_index: dict[int, dict[str, Any]] = {}
-    with metadata_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            sample_index = int(record.get("sample_index", record.get("index", -1)))
-            if sample_index < 0:
-                continue
-            metadata_by_index[sample_index] = record
+    for record in load_jsonl_records(metadata_path):
+        sample_index = int(record.get("sample_index", record.get("index", -1)))
+        if sample_index < 0:
+            continue
+        metadata_by_index[sample_index] = record
     return metadata_by_index
 
 
@@ -273,7 +269,7 @@ def iter_split_samples(
                 },
                 "reference_teacher_error": reference_teacher_error,
                 "normalized_permutation_entropy": normalized_entropy,
-                "offline_best_model": teacher_metadata.get("best_model") or teacher_metadata.get("reference_teacher_model"),
+                "offline_best_model": teacher_metadata.get("reference_teacher_model") or teacher_metadata.get("best_model"),
                 "offline_margin": teacher_metadata.get("score_margin", teacher_metadata.get("teacher_eval_score_margin")),
                 "quality_issue_flag": bool(quality_issue_flag),
             }
@@ -294,16 +290,6 @@ def iter_split_samples(
         record["curriculum_stage"] = difficulty_stage
         record["curriculum_band"] = curriculum_band
         yield record
-
-
-def write_jsonl(records: Iterable[dict], output_path: Path) -> int:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    count = 0
-    with output_path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            count += 1
-    return count
 
 
 def build_train_stage_slices(records: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -421,7 +407,7 @@ def main() -> None:
             )
         )
         output_path = output_dir / f"{split.name}.jsonl"
-        count = write_jsonl(records, output_path)
+        count = write_jsonl_records(output_path, records)
 
         entropy_values = [float(record["normalized_permutation_entropy"]) for record in records]
         reference_teacher_errors = [
@@ -442,15 +428,14 @@ def main() -> None:
             staged_slices = build_train_stage_slices(records)
             for stage_name, stage_records in staged_slices.items():
                 stage_output_path = output_dir / f"{stage_name}.jsonl"
-                stage_count = write_jsonl(stage_records, stage_output_path)
+                stage_count = write_jsonl_records(stage_output_path, stage_records)
                 metadata[f"{stage_name}_samples"] = stage_count
                 metadata[f"{stage_name}_stage_distribution"] = dict(
                     sorted(Counter(str(record.get("curriculum_stage", "unknown")) for record in stage_records).items())
                 )
                 print(f"[RL-DATA] {stage_name} samples={stage_count} -> {stage_output_path}")
 
-    metadata_path = output_dir / "metadata.json"
-    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    metadata_path = write_metadata_file(output_dir, metadata)
     print(f"[RL-DATA] wrote metadata to {metadata_path}")
 
 

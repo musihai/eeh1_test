@@ -7,6 +7,7 @@ fi
 
 PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
+DEFAULT_PROFILE_PATH="$PROJECT_DIR/examples/time_series_forecast/configs/etth1_ot_qwen3_gpu012.sh"
 
 resolve_profile_path() {
     local candidate="$1"
@@ -24,14 +25,18 @@ resolve_profile_path() {
     return 1
 }
 
-PROFILE_PATH="${PROFILE_PATH:-}"
-if [ -n "$PROFILE_PATH" ]; then
-    RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
-        echo "PROFILE_PATH not found: $PROFILE_PATH"
-        exit 1
-    }
-    # shellcheck disable=SC1090
-    source "$RESOLVED_PROFILE_PATH"
+PROFILE_PATH="${PROFILE_PATH:-$DEFAULT_PROFILE_PATH}"
+RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
+    echo "PROFILE_PATH not found: $PROFILE_PATH"
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$RESOLVED_PROFILE_PATH"
+
+if [ -n "${SFT_CUDA_VISIBLE_DEVICES:-}" ]; then
+    export CUDA_VISIBLE_DEVICES="$SFT_CUDA_VISIBLE_DEVICES"
+elif [ -n "${SFT_GPU_IDS:-}" ]; then
+    export CUDA_VISIBLE_DEVICES="$SFT_GPU_IDS"
 fi
 
 MODEL_PATH="${MODEL_PATH:-}"

@@ -154,6 +154,36 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routing_names, ["predict_time_series"])
         self.assertEqual(refinement_names, [])
 
+    def test_current_turn_stage_waits_for_required_feature_coverage(self) -> None:
+        flow = self._make_flow()
+        flow.required_feature_tools = ["extract_basic_statistics", "extract_event_summary"]
+        flow.diagnostic_tool_batches = [["extract_basic_statistics", "extract_event_summary"]]
+        flow.basic_statistics = {"median": 1.0}
+
+        self.assertEqual(flow._current_turn_stage(), "diagnostic")
+
+        flow.event_summary = {"event_segment_count": 1.0}
+        self.assertEqual(flow._current_turn_stage(), "routing")
+
+    def test_tool_schemas_only_expose_current_diagnostic_batch(self) -> None:
+        flow = self._make_flow()
+        flow.required_feature_tools = [
+            "extract_basic_statistics",
+            "extract_event_summary",
+            "extract_forecast_residuals",
+        ]
+        flow.diagnostic_tool_batches = [
+            ["extract_basic_statistics", "extract_event_summary"],
+            ["extract_forecast_residuals"],
+        ]
+
+        first_batch_names = [tool["function"]["name"] for tool in flow._tool_schemas_for_turn("diagnostic")]
+        self.assertEqual(first_batch_names, ["extract_basic_statistics", "extract_event_summary"])
+
+        flow.basic_statistics = {"median": 1.0}
+        second_names = [tool["function"]["name"] for tool in flow._tool_schemas_for_turn("diagnostic")]
+        self.assertEqual(second_names, ["extract_event_summary"])
+
     def test_append_turn_debug_records_sample_uid(self) -> None:
         flow = self._make_flow()
         flow.required_feature_tools = ["extract_basic_statistics"]
