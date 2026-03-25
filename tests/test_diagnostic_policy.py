@@ -17,7 +17,7 @@ class TestDiagnosticPolicy(unittest.TestCase):
         self.assertNotIn("extract_data_quality", selected)
         self.assertLess(len(selected), len(FEATURE_TOOL_ORDER))
 
-    def test_build_diagnostic_plan_surfaces_candidate_models_and_rationale(self) -> None:
+    def test_build_diagnostic_plan_keeps_rationale_feature_first(self) -> None:
         values = [0.0, 1.0, 0.2, 1.2] * 24
         plan = build_diagnostic_plan(values)
         self.assertTrue(plan.tool_names)
@@ -25,6 +25,12 @@ class TestDiagnosticPolicy(unittest.TestCase):
         self.assertTrue(plan.runner_up_model)
         self.assertIsInstance(plan.score_gap, float)
         self.assertIn("I will inspect", plan.rationale)
+        self.assertNotIn("looks strongest", plan.rationale)
+        self.assertNotIn("distinguish `", plan.rationale)
+        self.assertNotIn("`patchtst`", plan.rationale)
+        self.assertNotIn("`arima`", plan.rationale)
+        self.assertNotIn("`itransformer`", plan.rationale)
+        self.assertNotIn("`chronos2`", plan.rationale)
 
     def test_batches_keep_paper_turn1_parallel_when_capacity_allows(self) -> None:
         batches = plan_diagnostic_tool_batches(

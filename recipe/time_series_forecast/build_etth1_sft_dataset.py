@@ -54,11 +54,34 @@ from recipe.time_series_forecast.utils import (
 SUPPORTED_PREDICTION_MODELS = {"patchtst", "itransformer", "arima", "chronos2"}
 TURN3_TARGET_MODE_PAPER_STRICT = "paper_strict"
 TURN3_TARGET_MODE_ENGINEERING_REFINE = "engineering_refine"
+ROUTING_LABEL_SOURCE_HEURISTIC = "heuristic"
+ROUTING_LABEL_SOURCE_REFERENCE_TEACHER = "reference_teacher"
+SFT_STAGE_MODE_FULL = "full"
+SFT_STAGE_MODE_ROUTING_ONLY = "routing_only"
+SFT_STAGE_MODE_REFINEMENT_ONLY = "refinement_only"
 SUPPORTED_TURN3_TARGET_MODES = {
     TURN3_TARGET_MODE_PAPER_STRICT,
     TURN3_TARGET_MODE_ENGINEERING_REFINE,
 }
+SUPPORTED_ROUTING_LABEL_SOURCES = {
+    ROUTING_LABEL_SOURCE_HEURISTIC,
+    ROUTING_LABEL_SOURCE_REFERENCE_TEACHER,
+}
+SUPPORTED_SFT_STAGE_MODES = {
+    SFT_STAGE_MODE_FULL,
+    SFT_STAGE_MODE_ROUTING_ONLY,
+    SFT_STAGE_MODE_REFINEMENT_ONLY,
+}
+TRAIN_TURN3_REBALANCE_MODE_DOWNSAMPLE_KEEP = "downsample_keep"
+TRAIN_TURN3_REBALANCE_MODE_OVERSAMPLE_LOCAL_REFINE = "oversample_local_refine"
+SUPPORTED_TRAIN_TURN3_REBALANCE_MODES = {
+    TRAIN_TURN3_REBALANCE_MODE_DOWNSAMPLE_KEEP,
+    TRAIN_TURN3_REBALANCE_MODE_OVERSAMPLE_LOCAL_REFINE,
+}
 DEFAULT_TURN3_TARGET_MODE = TURN3_TARGET_MODE_PAPER_STRICT
+DEFAULT_ROUTING_LABEL_SOURCE = ROUTING_LABEL_SOURCE_HEURISTIC
+DEFAULT_SFT_STAGE_MODE = SFT_STAGE_MODE_FULL
+DEFAULT_TRAIN_TURN3_REBALANCE_MODE = TRAIN_TURN3_REBALANCE_MODE_DOWNSAMPLE_KEEP
 DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise_heuristicroute")
 DEFAULT_CURATED_INPUT_DIR = Path("dataset/ett_sft_etth1_runtime_teacher200_paper_same2")
 DEFAULT_TRAIN_JSONL = DEFAULT_CURATED_INPUT_DIR / "train_curated.jsonl"
@@ -67,6 +90,7 @@ DEFAULT_TEST_JSONL = DEFAULT_CURATED_INPUT_DIR / "test_curated.jsonl"
 DEFAULT_TRAIN_STAGE_REPEAT_FACTORS = {"diagnostic": 1, "routing": 1, "refinement": 1}
 DEFAULT_BALANCE_TRAIN_ROUTING_MODELS = True
 DEFAULT_TRAIN_PRIORITY_VALIDATED_KEEP_REPEAT_FACTOR = 1
+DEFAULT_TRAIN_LOCAL_REFINE_REFINEMENT_REPEAT_FACTOR = 1
 
 
 @dataclass(frozen=True)
@@ -180,6 +204,45 @@ def _source_level_frame(dataframe: pd.DataFrame) -> pd.DataFrame:
     return dataframe.reset_index(drop=True)
 
 
+def _source_sample_unique_count(dataframe: pd.DataFrame | None) -> int:
+    if dataframe is None or dataframe.empty:
+        return 0
+    if "source_sample_index" in dataframe.columns:
+        return int(dataframe["source_sample_index"].nunique())
+    return int(len(_source_level_frame(dataframe)))
+
+
+def _stage_mode_allowed_turn_stages(sft_stage_mode: str) -> set[str]:
+    mode = _normalize_sft_stage_mode(sft_stage_mode)
+    if mode == SFT_STAGE_MODE_ROUTING_ONLY:
+        return {"routing"}
+    if mode == SFT_STAGE_MODE_REFINEMENT_ONLY:
+        return {"refinement"}
+    return {"diagnostic", "routing", "refinement"}
+
+
+def _filter_records_for_stage_mode(records: list[dict[str, Any]], *, sft_stage_mode: str) -> list[dict[str, Any]]:
+    allowed_turn_stages = _stage_mode_allowed_turn_stages(sft_stage_mode)
+    filtered: list[dict[str, Any]] = []
+    for record in records:
+        stage = str(record.get("turn_stage") or "").strip().lower()
+        if stage in allowed_turn_stages:
+            filtered.append(record)
+    return filtered
+
+
+def source_sample_coverage_by_stage(dataframe: pd.DataFrame | None) -> dict[str, int]:
+    if dataframe is None or dataframe.empty or "turn_stage" not in dataframe.columns:
+        return {}
+    coverage: dict[str, int] = {}
+    for stage_name, stage_df in dataframe.groupby(dataframe["turn_stage"].astype(str), sort=True):
+        if "source_sample_index" in stage_df.columns:
+            coverage[str(stage_name)] = int(stage_df["source_sample_index"].nunique())
+        else:
+            coverage[str(stage_name)] = int(len(stage_df))
+    return coverage
+
+
 def _paper_turn3_protocol_reason(content: str, expected_len: int) -> str:
     if not content:
         return "empty_last_assistant"
@@ -247,9 +310,17 @@ def _summarize_paper_turn3_protocol(dataframe: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def _validate_paper_turn3_protocol(dataframe: pd.DataFrame, *, split_name: str, output_path: Path) -> dict[str, Any]:
+def _validate_paper_turn3_protocol(
+    dataframe: pd.DataFrame,
+    *,
+    split_name: str,
+    output_path: Path,
+    allow_no_refinement: bool = False,
+) -> dict[str, Any]:
     summary = _summarize_paper_turn3_protocol(dataframe)
     if int(summary["turn3_protocol_checked_count"]) <= 0:
+        if allow_no_refinement:
+            return summary
         raise ValueError(
             f"{split_name} SFT parquet at {output_path} does not contain any refinement records to validate."
         )
@@ -265,6 +336,43 @@ def _validate_paper_turn3_protocol(dataframe: pd.DataFrame, *, split_name: str, 
 def _normalize_teacher_model(model_name: Any) -> str:
     model = str(model_name or "patchtst").strip().lower()
     return model if model in SUPPORTED_PREDICTION_MODELS else "patchtst"
+
+
+def _normalize_routing_label_source(routing_label_source: str | None) -> str:
+    source = str(routing_label_source or DEFAULT_ROUTING_LABEL_SOURCE).strip().lower()
+    if source not in SUPPORTED_ROUTING_LABEL_SOURCES:
+        raise ValueError(
+            f"Unsupported routing_label_source={routing_label_source!r}. "
+            f"Expected one of {sorted(SUPPORTED_ROUTING_LABEL_SOURCES)}."
+        )
+    return source
+
+
+def _normalize_sft_stage_mode(sft_stage_mode: str | None) -> str:
+    mode = str(sft_stage_mode or DEFAULT_SFT_STAGE_MODE).strip().lower()
+    if mode not in SUPPORTED_SFT_STAGE_MODES:
+        raise ValueError(
+            f"Unsupported sft_stage_mode={sft_stage_mode!r}. "
+            f"Expected one of {sorted(SUPPORTED_SFT_STAGE_MODES)}."
+        )
+    return mode
+
+
+def _normalize_train_turn3_rebalance_mode(train_turn3_rebalance_mode: str | None) -> str:
+    mode = str(train_turn3_rebalance_mode or DEFAULT_TRAIN_TURN3_REBALANCE_MODE).strip().lower()
+    if mode not in SUPPORTED_TRAIN_TURN3_REBALANCE_MODES:
+        raise ValueError(
+            f"Unsupported train_turn3_rebalance_mode={train_turn3_rebalance_mode!r}. "
+            f"Expected one of {sorted(SUPPORTED_TRAIN_TURN3_REBALANCE_MODES)}."
+        )
+    return mode
+
+
+def _sample_has_reference_teacher_model(sample: dict[str, Any]) -> bool:
+    for key in ("reference_teacher_model", "offline_best_model"):
+        if str(sample.get(key) or "").strip():
+            return True
+    return False
 
 
 def _resolve_reference_teacher_model(sample: dict[str, Any]) -> str:
@@ -352,34 +460,34 @@ def _select_prediction_model_by_heuristic(history_values: Sequence[float]) -> tu
         return (
             "chronos2",
             feature_snapshot,
-            "The diagnostics show strong irregularity or data-quality stress, so I choose the most robust general forecasting model.",
+            "The diagnostics show strong irregularity, residual stress, or data-quality risk in the current window.",
         )
     if acf1 >= 0.93 and changepoint_count <= 1.0 and residual_exceed_ratio <= 0.05 and peak_count <= 4.0:
         return (
             "arima",
             feature_snapshot,
-            "The diagnostics still look stable and locally predictable, so I begin with the simplest structured forecaster.",
+            "The diagnostics remain stable, with high short-lag autocorrelation, few structural breaks, and low residual stress.",
         )
     if changepoint_count >= 3.0 and (cusum_max >= 70.0 or monotone_duration >= 0.10):
         return (
             "itransformer",
             feature_snapshot,
-            "The diagnostics indicate structural drift across the window, so I prefer a model that captures longer-range dependency changes.",
+            "The diagnostics indicate broader structural change, with multiple changepoints or sustained drift across the window.",
         )
     if 2.0 <= peak_count <= 5.0 and peak_spacing_cv <= 0.30:
         return (
             "patchtst",
             feature_snapshot,
-            "The window shows repeatable local motifs with reasonably regular peaks, so a patch-based temporal model is a good fit.",
+            "The diagnostics indicate repeatable local peaks, stable spacing, and usable seasonal structure in the window.",
         )
 
     scores = _heuristic_routing_scores(feature_snapshot)
     selected_model = _select_model_from_scores(scores)
     fallback_reason_by_model = {
-        "arima": "The diagnostics remain comparatively stable, so I start with the simplest structured forecaster.",
-        "patchtst": "The diagnostics suggest local repeating motifs, so I choose the patch-based temporal model.",
-        "itransformer": "The diagnostics indicate broader structural drift, so I choose the global-dependency forecaster.",
-        "chronos2": "The diagnostics remain highly irregular, so I choose the most robust general forecasting model.",
+        "arima": "The diagnostics remain comparatively stable, with structured short-lag behavior and limited break activity.",
+        "patchtst": "The diagnostics suggest repeating local structure with relatively stable spacing and seasonal evidence.",
+        "itransformer": "The diagnostics indicate broader structural drift and longer-range dependency changes across the window.",
+        "chronos2": "The diagnostics remain highly irregular or quality-stressed, with evidence that the window is not cleanly structured.",
     }
     return selected_model, feature_snapshot, fallback_reason_by_model[selected_model]
 
@@ -996,8 +1104,8 @@ def _build_snapshot_grounded_routing_reason(
             evidence_phrases.append("stable and locally predictable dynamics")
         evidence_text = _format_phrase_list(evidence_phrases)
         return (
-            f"The diagnostics indicate {evidence_text}, so the structured autoregressive forecaster "
-            "is the best fit for this window."
+            f"The diagnostics indicate {evidence_text}. The selected routing label follows the expert whose "
+            "inductive bias best matches this window."
         )
 
     if model_name == "patchtst":
@@ -1013,8 +1121,8 @@ def _build_snapshot_grounded_routing_reason(
             evidence_phrases.append("repeatable local motifs")
         evidence_text = _format_phrase_list(evidence_phrases)
         return (
-            f"The diagnostics indicate {evidence_text}, so the patch-based temporal model "
-            "is the best match for this window."
+            f"The diagnostics indicate {evidence_text}. The selected routing label follows the expert whose "
+            "inductive bias best matches this window."
         )
 
     if model_name == "itransformer":
@@ -1030,8 +1138,8 @@ def _build_snapshot_grounded_routing_reason(
             evidence_phrases.append("broader structural drift")
         evidence_text = _format_phrase_list(evidence_phrases)
         return (
-            f"The diagnostics indicate {evidence_text}, so the global-dependency forecaster "
-            "is the best fit for this window."
+            f"The diagnostics indicate {evidence_text}. The selected routing label follows the expert whose "
+            "inductive bias best matches this window."
         )
 
     if "extract_forecast_residuals" in selected and residual_exceed_ratio >= 0.08:
@@ -1046,8 +1154,8 @@ def _build_snapshot_grounded_routing_reason(
         evidence_phrases.append("irregular or noisy behavior")
     evidence_text = _format_phrase_list(evidence_phrases)
     return (
-        f"The diagnostics indicate {evidence_text}, so the robust general forecasting model "
-        "is the best fit for this window."
+        f"The diagnostics indicate {evidence_text}. The selected routing label follows the expert whose "
+        "inductive bias best matches this window."
     )
 
 
@@ -1107,43 +1215,24 @@ def build_routing_reflection(
         for tool_name in selected_feature_tools
     ]
     evidence_text = _format_phrase_list(evidence_phrases)
-    model_rationale = ROUTING_MODEL_RATIONALES.get(model_name, "the observed temporal structure")
     if evidence_text:
         return (
             f"Decision: {model_name}.\n"
             f"I reviewed the diagnostic evidence from {evidence_text}. "
-            f"The observed series is most compatible with {model_rationale}, "
+            "The routing label follows the model whose inductive bias best matches the observed evidence in this window, "
             f"so I will call predict_time_series with {model_name}."
         )
     return (
         f"Decision: {model_name}.\n"
-        f"The observed series is most compatible with {model_rationale}, "
+        "The routing label follows the model whose inductive bias best matches the observed evidence in this window, "
         f"so I will call predict_time_series with {model_name}."
     )
 
 
 def _build_routing_comparison_text(*, model_name: str, runner_up_name: str) -> str:
-    comparison_by_model = {
-        "patchtst": (
-            f"Compared with {runner_up_name}, the local motif signal is stronger than the broad drift signal here, "
-            "so I prioritize the patch-based model."
-        ),
-        "itransformer": (
-            f"Compared with {runner_up_name}, the structural drift signal is stronger than the local motif signal here, "
-            "so I prioritize the global-dependency model."
-        ),
-        "arima": (
-            f"Compared with {runner_up_name}, the window looks more stable and locally predictable here, "
-            "so I prioritize the simpler structured model."
-        ),
-        "chronos2": (
-            f"Compared with {runner_up_name}, irregularity or data-quality stress is more dominant here, "
-            "so I prioritize the robust fallback."
-        ),
-    }
-    return comparison_by_model.get(
-        model_name,
-        f"Compared with {runner_up_name}, the evidence is more consistent with {model_name}.",
+    return (
+        f"Compared with {runner_up_name}, the observed evidence remains more consistent with {model_name} "
+        "for this window."
     )
 
 
@@ -1239,8 +1328,14 @@ def build_sft_records(
     sample: dict[str, Any],
     *,
     turn3_target_mode: str = DEFAULT_TURN3_TARGET_MODE,
+    routing_label_source: str = DEFAULT_ROUTING_LABEL_SOURCE,
+    sft_stage_mode: str = DEFAULT_SFT_STAGE_MODE,
 ) -> list[dict[str, Any]]:
     turn3_target_mode = _normalize_turn3_target_mode(turn3_target_mode)
+    sft_stage_mode = _normalize_sft_stage_mode(sft_stage_mode)
+    routing_label_source = _normalize_routing_label_source(routing_label_source)
+    if sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY:
+        routing_label_source = ROUTING_LABEL_SOURCE_REFERENCE_TEACHER
     raw_prompt = sample["raw_prompt"][0]["content"]
     reward_model = sample.get("reward_model", {}) if isinstance(sample.get("reward_model"), dict) else {}
     task_spec = parse_task_prompt(raw_prompt, data_source=sample.get("data_source"))
@@ -1261,10 +1356,23 @@ def build_sft_records(
 
     reference_teacher_model = _resolve_reference_teacher_model(sample)
     second_teacher_model = _normalize_teacher_model(sample.get("teacher_eval_second_best_model"))
-    selected_prediction_model, routing_feature_snapshot, routing_policy_reason = _select_prediction_model_by_heuristic(
+    heuristic_selected_prediction_model, routing_feature_snapshot, heuristic_routing_policy_reason = _select_prediction_model_by_heuristic(
         history_values
     )
+    selected_prediction_model = heuristic_selected_prediction_model
+    routing_policy_reason = heuristic_routing_policy_reason
     routing_policy_source = "heuristic_rule_based"
+    if (
+        routing_label_source == ROUTING_LABEL_SOURCE_REFERENCE_TEACHER
+        and _sample_has_reference_teacher_model(sample)
+    ):
+        selected_prediction_model = reference_teacher_model
+        routing_policy_source = "reference_teacher_offline_best"
+        routing_policy_reason = _build_snapshot_grounded_routing_reason(
+            model_name=selected_prediction_model,
+            feature_snapshot=routing_feature_snapshot,
+            selected_feature_tools=selected_feature_tools,
+        )
 
     def _resolve_selected_prediction(model_name: str) -> tuple[str, str]:
         return _resolve_prediction_text(
@@ -1329,12 +1437,14 @@ def build_sft_records(
     shared_fields = {
         "source_sample_index": source_sample_index,
         "source_uid": str(sample.get("uid") or ""),
+        "sft_stage_mode": sft_stage_mode,
         "data_source": data_source,
         "target_column": target_column,
         "forecast_horizon": forecast_horizon,
         "lookback_window": lookback_window,
         "reference_teacher_model": reference_teacher_model,
         "selected_prediction_model": selected_prediction_model,
+        "routing_label_source": routing_label_source,
         "diagnostic_plan_reason": diagnostic_plan.rationale,
         "diagnostic_primary_model": diagnostic_plan.primary_model,
         "diagnostic_runner_up_model": diagnostic_plan.runner_up_model,
@@ -1516,19 +1626,31 @@ def build_sft_records(
             paper_turn3_required=True,
         )
     )
-    return records
+    return _filter_records_for_stage_mode(records, sft_stage_mode=sft_stage_mode)
 
 
 def build_sft_record(
     sample: dict[str, Any],
     *,
     turn3_target_mode: str = DEFAULT_TURN3_TARGET_MODE,
+    routing_label_source: str = DEFAULT_ROUTING_LABEL_SOURCE,
+    sft_stage_mode: str = DEFAULT_SFT_STAGE_MODE,
 ) -> dict[str, Any]:
-    records = build_sft_records(sample, turn3_target_mode=turn3_target_mode)
+    records = build_sft_records(
+        sample,
+        turn3_target_mode=turn3_target_mode,
+        routing_label_source=routing_label_source,
+        sft_stage_mode=sft_stage_mode,
+    )
     if not records:
         raise ValueError("build_sft_records returned no records")
     for record in records:
         if str(record.get("turn_stage") or "").strip().lower() == "refinement":
+            compatible = dict(record)
+            compatible["sample_index"] = int(sample.get("index", -1))
+            return compatible
+    for record in records:
+        if str(record.get("turn_stage") or "").strip().lower() == "routing":
             compatible = dict(record)
             compatible["sample_index"] = int(sample.get("index", -1))
             return compatible
@@ -1543,8 +1665,14 @@ def convert_jsonl_to_sft_parquet(
     output_path: str | Path,
     max_samples: int = -1,
     turn3_target_mode: str = DEFAULT_TURN3_TARGET_MODE,
+    routing_label_source: str = DEFAULT_ROUTING_LABEL_SOURCE,
+    sft_stage_mode: str = DEFAULT_SFT_STAGE_MODE,
 ) -> pd.DataFrame:
     turn3_target_mode = _normalize_turn3_target_mode(turn3_target_mode)
+    routing_label_source = _normalize_routing_label_source(routing_label_source)
+    sft_stage_mode = _normalize_sft_stage_mode(sft_stage_mode)
+    if sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY:
+        routing_label_source = ROUTING_LABEL_SOURCE_REFERENCE_TEACHER
     input_path = Path(input_path)
     output_path = Path(output_path)
     records: list[dict[str, Any]] = []
@@ -1557,7 +1685,12 @@ def convert_jsonl_to_sft_parquet(
             if not line.strip():
                 continue
             sample = json.loads(line)
-            stage_records = build_sft_records(sample, turn3_target_mode=turn3_target_mode)
+            stage_records = build_sft_records(
+                sample,
+                turn3_target_mode=turn3_target_mode,
+                routing_label_source=routing_label_source,
+                sft_stage_mode=sft_stage_mode,
+            )
             for record in stage_records:
                 row = dict(record)
                 row["sample_index"] = len(records)
@@ -1567,7 +1700,12 @@ def convert_jsonl_to_sft_parquet(
                 print(f"Processed {line_idx + 1} samples from {input_path}")
 
     dataframe = pd.DataFrame(records)
-    _validate_paper_turn3_protocol(dataframe, split_name=input_path.stem, output_path=output_path)
+    _validate_paper_turn3_protocol(
+        dataframe,
+        split_name=input_path.stem,
+        output_path=output_path,
+        allow_no_refinement=(sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY),
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dataframe.to_parquet(output_path, index=False)
     checked_count = int(_summarize_paper_turn3_protocol(dataframe).get("turn3_protocol_checked_count", 0))
@@ -1589,6 +1727,31 @@ def distribution_from_series(values: Iterable[Any]) -> dict[str, int]:
             key = str(value)
         counter[key] += 1
     return {str(k): int(v) for k, v in sorted(counter.items())}
+
+
+def agreement_ratio_from_frame(
+    dataframe: pd.DataFrame,
+    *,
+    left_column: str,
+    right_column: str,
+) -> float:
+    if dataframe is None or dataframe.empty:
+        return 0.0
+    if left_column not in dataframe.columns or right_column not in dataframe.columns:
+        return 0.0
+
+    comparable = dataframe[[left_column, right_column]].copy()
+    comparable[left_column] = comparable[left_column].astype(str).str.strip().str.lower()
+    comparable[right_column] = comparable[right_column].astype(str).str.strip().str.lower()
+    comparable = comparable[
+        (comparable[left_column] != "")
+        & (comparable[right_column] != "")
+        & (comparable[left_column] != "__missing__")
+        & (comparable[right_column] != "__missing__")
+    ]
+    if comparable.empty:
+        return 0.0
+    return float((comparable[left_column] == comparable[right_column]).mean())
 
 
 def _tail_repeat_run_length(values: Sequence[float], *, atol: float = 1e-8) -> int:
@@ -1629,11 +1792,13 @@ def rebalance_train_turn3_targets(
     dataframe: pd.DataFrame,
     *,
     min_local_refine_ratio: float,
+    rebalance_mode: str = DEFAULT_TRAIN_TURN3_REBALANCE_MODE,
 ) -> pd.DataFrame:
     if dataframe.empty or min_local_refine_ratio <= 0:
         return dataframe
     if "turn3_target_type" not in dataframe.columns:
         return dataframe
+    rebalance_mode = _normalize_train_turn3_rebalance_mode(rebalance_mode)
 
     group_column = "source_sample_index" if "source_sample_index" in dataframe.columns else "sample_index"
     if group_column not in dataframe.columns:
@@ -1648,11 +1813,44 @@ def rebalance_train_turn3_targets(
 
     local_count = len(local_refine_df)
     keep_count = len(validated_keep_df)
+    other_count = len(other_df)
     if local_count <= 0 or keep_count <= 0:
         return dataframe
 
+    current_ratio = float(local_count / max(local_count + keep_count + other_count, 1))
+    if current_ratio >= min_local_refine_ratio:
+        return dataframe
+
+    if rebalance_mode == TRAIN_TURN3_REBALANCE_MODE_OVERSAMPLE_LOCAL_REFINE:
+        non_local_count = keep_count + other_count
+        target_local_count = int(np.ceil(min_local_refine_ratio * non_local_count / max(1.0 - min_local_refine_ratio, 1e-8)))
+        additional_local_count = max(target_local_count - local_count, 0)
+        if additional_local_count <= 0:
+            return dataframe
+
+        local_source_ids = local_refine_df[group_column].tolist()
+        if not local_source_ids:
+            return dataframe
+
+        source_frames = {
+            source_id: dataframe.loc[dataframe[group_column] == source_id].copy()
+            for source_id in local_source_ids
+        }
+        repeated_frames: list[pd.DataFrame] = [dataframe.copy()]
+        for repeat_index in range(additional_local_count):
+            source_id = local_source_ids[repeat_index % len(local_source_ids)]
+            repeated_frames.append(source_frames[source_id].copy())
+
+        balanced = pd.concat(repeated_frames, ignore_index=True)
+        sort_columns = [col for col in (group_column, "turn_stage_order", "sample_index") if col in balanced.columns]
+        if sort_columns:
+            balanced = balanced.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+        if "sample_index" in balanced.columns:
+            balanced["sample_index"] = list(range(len(balanced)))
+        return balanced
+
     max_keep_count = int(np.floor(local_count * (1.0 - min_local_refine_ratio) / min_local_refine_ratio))
-    max_keep_count = max(max_keep_count, 0)
+    max_keep_count = max(max_keep_count - other_count, 0)
     if keep_count <= max_keep_count:
         return dataframe
 
@@ -1687,6 +1885,105 @@ def rebalance_train_turn3_targets(
     sort_columns = [col for col in (group_column, "turn_stage_order", "sample_index") if col in balanced.columns]
     if sort_columns:
         balanced = balanced.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+    return balanced
+
+
+def rebalance_refinement_stage_targets(
+    dataframe: pd.DataFrame,
+    *,
+    min_local_refine_ratio: float,
+    rebalance_mode: str = DEFAULT_TRAIN_TURN3_REBALANCE_MODE,
+) -> pd.DataFrame:
+    if dataframe.empty or min_local_refine_ratio <= 0:
+        return dataframe
+    if "turn_stage" not in dataframe.columns or "turn3_target_type" not in dataframe.columns:
+        return dataframe
+    rebalance_mode = _normalize_train_turn3_rebalance_mode(rebalance_mode)
+
+    refinement_mask = dataframe["turn_stage"].astype(str).str.lower() == "refinement"
+    refinement_df = dataframe.loc[refinement_mask].copy()
+    non_refinement_df = dataframe.loc[~refinement_mask].copy()
+    if refinement_df.empty:
+        return dataframe
+
+    local_refine_df = refinement_df.loc[
+        refinement_df["turn3_target_type"].astype(str).str.lower() == "local_refine"
+    ].copy()
+    validated_keep_df = refinement_df.loc[
+        refinement_df["turn3_target_type"].astype(str).str.lower() == "validated_keep"
+    ].copy()
+    other_df = refinement_df.loc[
+        ~refinement_df["turn3_target_type"].astype(str).str.lower().isin({"local_refine", "validated_keep"})
+    ].copy()
+
+    local_count = len(local_refine_df)
+    keep_count = len(validated_keep_df)
+    other_count = len(other_df)
+    if local_count <= 0 or keep_count <= 0:
+        return dataframe
+
+    current_ratio = float(local_count / max(local_count + keep_count + other_count, 1))
+    if current_ratio >= min_local_refine_ratio:
+        return dataframe
+
+    if rebalance_mode == TRAIN_TURN3_REBALANCE_MODE_OVERSAMPLE_LOCAL_REFINE:
+        non_local_count = keep_count + other_count
+        target_local_count = int(np.ceil(min_local_refine_ratio * non_local_count / max(1.0 - min_local_refine_ratio, 1e-8)))
+        additional_local_count = max(target_local_count - local_count, 0)
+        if additional_local_count <= 0:
+            return dataframe
+
+        repeated_frames: list[pd.DataFrame] = [dataframe.copy()]
+        for repeat_index in range(additional_local_count):
+            repeated_frames.append(local_refine_df.iloc[[repeat_index % local_count]].copy())
+        balanced = pd.concat(repeated_frames, ignore_index=True)
+    else:
+        max_keep_count = int(np.floor(local_count * (1.0 - min_local_refine_ratio) / min_local_refine_ratio))
+        max_keep_count = max(max_keep_count - other_count, 0)
+        if keep_count <= max_keep_count:
+            return dataframe
+
+        sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in validated_keep_df.columns]
+        if sort_columns:
+            validated_keep_df = validated_keep_df.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+        else:
+            validated_keep_df = validated_keep_df.reset_index(drop=True)
+        if max_keep_count <= 0:
+            kept_validated_keep_df = validated_keep_df.iloc[0:0].copy()
+        else:
+            priority_mask = validated_keep_df.apply(_is_priority_validated_keep_row, axis=1)
+            priority_keep_df = validated_keep_df.loc[priority_mask].copy()
+            regular_keep_df = validated_keep_df.loc[~priority_mask].copy()
+            if len(priority_keep_df) >= max_keep_count:
+                kept_validated_keep_df = priority_keep_df.iloc[:max_keep_count].copy()
+            else:
+                keep_frames: list[pd.DataFrame] = [priority_keep_df]
+                remaining_count = max_keep_count - len(priority_keep_df)
+                if remaining_count > 0 and not regular_keep_df.empty:
+                    regular_count = len(regular_keep_df)
+                    if regular_count <= remaining_count:
+                        sampled_regular_keep_df = regular_keep_df.copy()
+                    else:
+                        take_positions = np.linspace(0, regular_count - 1, num=remaining_count, dtype=int)
+                        sampled_regular_keep_df = regular_keep_df.iloc[take_positions].copy()
+                    keep_frames.append(sampled_regular_keep_df)
+                kept_validated_keep_df = (
+                    pd.concat(keep_frames, ignore_index=True)
+                    if keep_frames
+                    else validated_keep_df.iloc[0:0].copy()
+                )
+
+        kept_refinement_df = pd.concat(
+            [local_refine_df, kept_validated_keep_df, other_df],
+            ignore_index=True,
+        )
+        balanced = pd.concat([non_refinement_df, kept_refinement_df], ignore_index=True)
+
+    sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in balanced.columns]
+    if sort_columns:
+        balanced = balanced.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+    if "sample_index" in balanced.columns:
+        balanced["sample_index"] = list(range(len(balanced)))
     return balanced
 
 
@@ -1746,6 +2043,35 @@ def repeat_priority_validated_keep_refinement_rows(
 
     repeated_frames: list[pd.DataFrame] = [dataframe.copy()]
     repeated_frames.extend(priority_df.copy() for _ in range(int(repeat_factor) - 1))
+    balanced = pd.concat(repeated_frames, ignore_index=True)
+    sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in balanced.columns]
+    if sort_columns:
+        balanced = balanced.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+    if "sample_index" in balanced.columns:
+        balanced["sample_index"] = list(range(len(balanced)))
+    return balanced
+
+
+def repeat_local_refine_refinement_rows(
+    dataframe: pd.DataFrame,
+    *,
+    repeat_factor: int,
+) -> pd.DataFrame:
+    if dataframe.empty or repeat_factor <= 1:
+        return dataframe
+    if "turn_stage" not in dataframe.columns or "turn3_target_type" not in dataframe.columns:
+        return dataframe
+
+    local_refine_mask = (
+        dataframe["turn_stage"].astype(str).str.lower().eq("refinement")
+        & dataframe["turn3_target_type"].astype(str).str.lower().eq("local_refine")
+    )
+    local_refine_df = dataframe.loc[local_refine_mask].copy()
+    if local_refine_df.empty:
+        return dataframe
+
+    repeated_frames: list[pd.DataFrame] = [dataframe.copy()]
+    repeated_frames.extend(local_refine_df.copy() for _ in range(int(repeat_factor) - 1))
     balanced = pd.concat(repeated_frames, ignore_index=True)
     sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in balanced.columns]
     if sort_columns:
@@ -1822,16 +2148,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-val-samples", type=int, default=-1, help="Limit val sample count for debugging.")
     parser.add_argument("--max-test-samples", type=int, default=-1, help="Limit test sample count for debugging.")
     parser.add_argument(
+        "--sft-stage-mode",
+        choices=sorted(SUPPORTED_SFT_STAGE_MODES),
+        default=DEFAULT_SFT_STAGE_MODE,
+        help=(
+            "Which stage records to keep in the generated parquet. "
+            "`full` keeps the full three-stage trajectory; "
+            "`routing_only` keeps only routing rows with reference-teacher routing supervision; "
+            "`refinement_only` keeps only refinement rows for stage-local Turn-3 training."
+        ),
+    )
+    parser.add_argument(
         "--turn3-target-mode",
         choices=sorted(SUPPORTED_TURN3_TARGET_MODES),
         default=DEFAULT_TURN3_TARGET_MODE,
         help="Turn-3 target generation mode. `paper_strict` keeps the strict <think><answer> protocol but still allows local refinement supervision when evidence supports it.",
     )
     parser.add_argument(
+        "--routing-label-source",
+        choices=sorted(SUPPORTED_ROUTING_LABEL_SOURCES),
+        default=DEFAULT_ROUTING_LABEL_SOURCE,
+        help=(
+            "Source for routing labels in step-wise SFT. "
+            "`heuristic` keeps the existing rule-based routing teacher; "
+            "`reference_teacher` uses the offline best/reference teacher model."
+        ),
+    )
+    parser.add_argument(
         "--train-min-local-refine-ratio",
         type=float,
         default=0.25,
         help="Minimum desired local_refine ratio in train parquet. Set <=0 to disable train rebalancing.",
+    )
+    parser.add_argument(
+        "--train-turn3-rebalance-mode",
+        choices=sorted(SUPPORTED_TRAIN_TURN3_REBALANCE_MODES),
+        default=DEFAULT_TRAIN_TURN3_REBALANCE_MODE,
+        help=(
+            "How to satisfy --train-min-local-refine-ratio when train local_refine rows are too scarce. "
+            "`downsample_keep` trims validated_keep source groups; "
+            "`oversample_local_refine` duplicates local_refine source groups to preserve source coverage."
+        ),
     )
     parser.add_argument(
         "--train-stage-repeat-factors",
@@ -1857,15 +2214,31 @@ def parse_args() -> argparse.Namespace:
             "and show a flat repeated tail. Set <=1 to disable."
         ),
     )
+    parser.add_argument(
+        "--train-local-refine-refinement-repeat-factor",
+        type=int,
+        default=DEFAULT_TRAIN_LOCAL_REFINE_REFINEMENT_REPEAT_FACTOR,
+        help=(
+            "Extra repeat factor applied only to train refinement rows with turn3_target_type=local_refine. "
+            "Set <=1 to disable."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    sft_stage_mode = _normalize_sft_stage_mode(args.sft_stage_mode)
     turn3_target_mode = _normalize_turn3_target_mode(args.turn3_target_mode)
+    routing_label_source = _normalize_routing_label_source(args.routing_label_source)
+    if sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY:
+        routing_label_source = ROUTING_LABEL_SOURCE_REFERENCE_TEACHER
+    train_turn3_rebalance_mode = _normalize_train_turn3_rebalance_mode(args.train_turn3_rebalance_mode)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_train_min_local_refine_ratio = float(args.train_min_local_refine_ratio)
+    if sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY:
+        effective_train_min_local_refine_ratio = 0.0
     raw_train_stage_repeat_factors = json.loads(str(args.train_stage_repeat_factors))
     train_stage_repeat_factors = {
         str(stage).strip().lower(): max(1, int(factor))
@@ -1899,15 +2272,28 @@ def main() -> None:
         output_path=output_dir / "train.parquet",
         max_samples=args.max_train_samples,
         turn3_target_mode=turn3_target_mode,
+        routing_label_source=routing_label_source,
+        sft_stage_mode=sft_stage_mode,
     )
-    train_df = rebalance_train_turn3_targets(
-        train_df_raw,
-        min_local_refine_ratio=effective_train_min_local_refine_ratio,
-    )
-    train_df = rebalance_train_routing_model_records(
-        train_df,
-        enabled=bool(args.balance_train_routing_models),
-    )
+    train_df = train_df_raw.copy()
+    if sft_stage_mode == SFT_STAGE_MODE_REFINEMENT_ONLY:
+        train_df = rebalance_refinement_stage_targets(
+            train_df,
+            min_local_refine_ratio=effective_train_min_local_refine_ratio,
+            rebalance_mode=train_turn3_rebalance_mode,
+        )
+    elif sft_stage_mode == SFT_STAGE_MODE_FULL:
+        train_df = rebalance_train_turn3_targets(
+            train_df,
+            min_local_refine_ratio=effective_train_min_local_refine_ratio,
+            rebalance_mode=train_turn3_rebalance_mode,
+        )
+
+    if sft_stage_mode in {SFT_STAGE_MODE_FULL, SFT_STAGE_MODE_ROUTING_ONLY}:
+        train_df = rebalance_train_routing_model_records(
+            train_df,
+            enabled=bool(args.balance_train_routing_models),
+        )
     train_df = rebalance_train_stage_records(
         train_df,
         stage_repeat_factors=train_stage_repeat_factors,
@@ -1919,12 +2305,28 @@ def main() -> None:
             DEFAULT_TRAIN_PRIORITY_VALIDATED_KEEP_REPEAT_FACTOR,
         )
     )
+    train_local_refine_refinement_repeat_factor = int(
+        getattr(
+            args,
+            "train_local_refine_refinement_repeat_factor",
+            DEFAULT_TRAIN_LOCAL_REFINE_REFINEMENT_REPEAT_FACTOR,
+        )
+    )
+    train_df = repeat_local_refine_refinement_rows(
+        train_df,
+        repeat_factor=train_local_refine_refinement_repeat_factor,
+    )
     train_df = repeat_priority_validated_keep_refinement_rows(
         train_df,
         repeat_factor=train_priority_validated_keep_repeat_factor,
     )
     if len(train_df) != len(train_df_raw) or not train_df.equals(train_df_raw):
-        _validate_paper_turn3_protocol(train_df, split_name="train", output_path=output_dir / "train.parquet")
+        _validate_paper_turn3_protocol(
+            train_df,
+            split_name="train",
+            output_path=output_dir / "train.parquet",
+            allow_no_refinement=(sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY),
+        )
         train_df.to_parquet(output_dir / "train.parquet", index=False)
         print(
             f"Rebalanced train.parquet turn3_target_type distribution: "
@@ -1939,6 +2341,8 @@ def main() -> None:
         output_path=output_dir / "val.parquet",
         max_samples=args.max_val_samples,
         turn3_target_mode=turn3_target_mode,
+        routing_label_source=routing_label_source,
+        sft_stage_mode=sft_stage_mode,
     )
 
     test_count = 0
@@ -1950,6 +2354,8 @@ def main() -> None:
             output_path=output_dir / "test.parquet",
             max_samples=args.max_test_samples,
             turn3_target_mode=turn3_target_mode,
+            routing_label_source=routing_label_source,
+            sft_stage_mode=sft_stage_mode,
         )
         test_count = len(test_df)
 
@@ -1960,27 +2366,39 @@ def main() -> None:
     metadata_kwargs = dict(
         dataset_kind=DATASET_KIND_RUNTIME_SFT_PARQUET,
         pipeline_stage="runtime_stepwise_sft",
+        sft_stage_mode=sft_stage_mode,
         turn3_protocol="paper_think_answer_xml",
         turn3_target_mode=turn3_target_mode,
+        routing_label_source=routing_label_source,
         train_samples_before_balance=len(train_df_raw),
         train_samples=len(train_df),
-        train_source_samples_before_balance=len(_source_level_frame(train_df_raw)),
-        train_source_samples=len(_source_level_frame(train_df)),
+        train_source_samples_before_balance=_source_sample_unique_count(train_df_raw),
+        train_source_samples=_source_sample_unique_count(train_df),
         val_samples=len(val_df),
-        val_source_samples=len(_source_level_frame(val_df)),
+        val_source_samples=_source_sample_unique_count(val_df),
         test_samples=test_count,
-        test_source_samples=len(_source_level_frame(test_df)) if test_df is not None else 0,
+        test_source_samples=_source_sample_unique_count(test_df),
         requested_train_min_local_refine_ratio=float(args.train_min_local_refine_ratio),
         train_min_local_refine_ratio=effective_train_min_local_refine_ratio,
+        train_turn3_rebalance_mode=train_turn3_rebalance_mode,
         train_stage_repeat_factors=train_stage_repeat_factors,
         balance_train_routing_models=bool(args.balance_train_routing_models),
         train_priority_validated_keep_repeat_factor=train_priority_validated_keep_repeat_factor,
+        train_local_refine_refinement_repeat_factor=train_local_refine_refinement_repeat_factor,
         source_train_jsonl=str(Path(args.train_jsonl)),
         source_val_jsonl=str(Path(args.val_jsonl)),
         source_test_jsonl=str(test_path),
         source_curated_metadata_path=str(source_metadata_paths[0]) if source_metadata_paths else "",
         train_turn_stage_distribution=distribution_from_series(train_df["turn_stage"]),
         val_turn_stage_distribution=distribution_from_series(val_df["turn_stage"]),
+        train_source_sample_coverage_by_stage=source_sample_coverage_by_stage(train_df),
+        val_source_sample_coverage_by_stage=source_sample_coverage_by_stage(val_df),
+        turn_stage_loss_weight_summary={
+            "stage_repeat_factors": train_stage_repeat_factors,
+            "local_refine_refinement_repeat_factor": train_local_refine_refinement_repeat_factor,
+            "priority_validated_keep_repeat_factor": train_priority_validated_keep_repeat_factor,
+            "routing_model_balance_enabled": bool(args.balance_train_routing_models),
+        },
         train_turn3_target_type_distribution_before_balance=distribution_from_series(
             _source_level_frame(train_df_raw)["turn3_target_type"]
         ),
@@ -1990,8 +2408,23 @@ def main() -> None:
         train_selected_prediction_model_distribution=distribution_from_series(
             _source_level_frame(train_df)["selected_prediction_model"]
         ),
+        train_selected_prediction_model_reference_teacher_agreement_ratio=agreement_ratio_from_frame(
+            _source_level_frame(train_df),
+            left_column="selected_prediction_model",
+            right_column="reference_teacher_model",
+        ),
         train_routing_row_selected_prediction_model_distribution=distribution_from_series(
             train_df.loc[train_df["turn_stage"] == "routing", "selected_prediction_model"]
+        ),
+        routing_only_selected_model_distribution=distribution_from_series(
+            train_df["selected_prediction_model"]
+            if sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY and "selected_prediction_model" in train_df.columns
+            else []
+        ),
+        refinement_target_distribution=distribution_from_series(
+            train_df.loc[train_df["turn_stage"] == "refinement", "turn3_target_type"]
+            if "turn_stage" in train_df.columns and "turn3_target_type" in train_df.columns
+            else []
         ),
         train_turn3_target_type_distribution=distribution_from_series(_source_level_frame(train_df)["turn3_target_type"]),
         train_turn3_trigger_reason_distribution=distribution_from_series(_source_level_frame(train_df)["turn3_trigger_reason"]),
@@ -2017,6 +2450,11 @@ def main() -> None:
         val_selected_prediction_model_distribution=distribution_from_series(
             _source_level_frame(val_df)["selected_prediction_model"]
         ),
+        val_selected_prediction_model_reference_teacher_agreement_ratio=agreement_ratio_from_frame(
+            _source_level_frame(val_df),
+            left_column="selected_prediction_model",
+            right_column="reference_teacher_model",
+        ),
         val_turn3_target_type_distribution=distribution_from_series(_source_level_frame(val_df)["turn3_target_type"]),
         val_turn3_trigger_reason_distribution=distribution_from_series(_source_level_frame(val_df)["turn3_trigger_reason"]),
         val_refine_ops_signature_distribution=distribution_from_series(_source_level_frame(val_df)["refine_ops_signature"]),
@@ -2039,11 +2477,17 @@ def main() -> None:
     if test_df is not None and len(test_df) > 0:
         metadata_kwargs.update(
             test_turn_stage_distribution=distribution_from_series(test_df["turn_stage"]),
+            test_source_sample_coverage_by_stage=source_sample_coverage_by_stage(test_df),
             test_reference_teacher_model_distribution=distribution_from_series(
                 _source_level_frame(test_df)["reference_teacher_model"]
             ),
             test_selected_prediction_model_distribution=distribution_from_series(
                 _source_level_frame(test_df)["selected_prediction_model"]
+            ),
+            test_selected_prediction_model_reference_teacher_agreement_ratio=agreement_ratio_from_frame(
+                _source_level_frame(test_df),
+                left_column="selected_prediction_model",
+                right_column="reference_teacher_model",
             ),
             test_turn3_target_type_distribution=distribution_from_series(
                 _source_level_frame(test_df)["turn3_target_type"]

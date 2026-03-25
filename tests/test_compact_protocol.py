@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -39,6 +40,26 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertIn("Median: 2.0000", prompt)
         self.assertNotIn("already present earlier in this conversation", prompt)
 
+    def test_turn_two_prompt_uses_neutral_routing_instruction(self) -> None:
+        prompt = build_runtime_user_prompt(
+            data_source="ETTh1",
+            target_column="OT",
+            lookback_window=96,
+            forecast_horizon=96,
+            time_series_data="1.0000\n2.0000\n3.0000",
+            history_analysis=["Basic Statistics:\n  Median: 2.0000"],
+            prediction_results=None,
+            required_feature_tools=["extract_basic_statistics"],
+            completed_feature_tools=["extract_basic_statistics"],
+            turn_stage="routing",
+        )
+        self.assertIn("inductive bias best matches the observed evidence", prompt)
+        self.assertIn("not on a fixed model-to-pattern template", prompt)
+        self.assertNotIn("patchtst` for local motifs", prompt)
+        self.assertNotIn("arima` for stable autocorrelation structure", prompt)
+        self.assertNotIn("chronos2` for irregular or quality-stressed windows", prompt)
+        self.assertNotIn("itransformer` for broader structural drift", prompt)
+
     def test_turn_three_prompt_omits_duplicate_predictions(self) -> None:
         prompt = build_runtime_user_prompt(
             data_source="ETTh1",
@@ -72,6 +93,27 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertNotIn("[Brief reflection", prompt)
         self.assertNotIn("[Final prediction", prompt)
 
+    def test_turn_three_prompt_relaxed_keep_bias_is_opt_in(self) -> None:
+        with patch.dict("os.environ", {"TS_RELAX_TURN3_KEEP_BIAS": "1"}):
+            prompt = build_runtime_user_prompt(
+                data_source="ETTh1",
+                target_column="OT",
+                lookback_window=96,
+                forecast_horizon=96,
+                time_series_data="1.0000\n2.0000\n3.0000",
+                history_analysis=["Basic Statistics:\n  Median: 2.0000"],
+                prediction_results="2017-05-02 00:00:00 4.0000",
+                prediction_model_used="patchtst",
+                required_feature_tools=["extract_basic_statistics"],
+                completed_feature_tools=["extract_basic_statistics"],
+                turn_stage="refinement",
+            )
+        self.assertIn("apply a limited local refinement", prompt)
+        self.assertIn("multiple short separated spans", prompt)
+        self.assertIn("constrained rewrite of more rows", prompt)
+        self.assertIn("Choose KEEP only when the base forecast already looks internally consistent", prompt)
+        self.assertNotIn("If unsure, choose KEEP", prompt)
+
     def test_turn_one_prompt_lists_available_diagnostic_tools(self) -> None:
         prompt = build_runtime_user_prompt(
             data_source="ETTh1",
@@ -89,13 +131,33 @@ class CompactProtocolTests(unittest.TestCase):
             turn_stage="diagnostic",
         )
         self.assertIn("### Diagnostic Plan", prompt)
-        self.assertIn("patchtst", prompt)
-        self.assertIn("itransformer", prompt)
+        self.assertNotIn("patchtst", prompt)
+        self.assertNotIn("itransformer", prompt)
         self.assertIn("### Diagnostic Tool Schemas Available This Turn", prompt)
         self.assertIn("extract_event_summary", prompt)
         self.assertIn("call one or more feature tools", prompt)
         self.assertIn("Follow the diagnostic plan", prompt)
         self.assertIn("Do NOT call predict_time_series", prompt)
+
+    def test_turn_one_prompt_can_opt_in_diagnostic_model_hints(self) -> None:
+        with patch.dict("os.environ", {"TS_INCLUDE_DIAGNOSTIC_MODEL_HINTS": "1"}):
+            prompt = build_runtime_user_prompt(
+                data_source="ETTh1",
+                target_column="OT",
+                lookback_window=96,
+                forecast_horizon=96,
+                time_series_data="1.0000\n2.0000\n3.0000",
+                history_analysis=["Basic Statistics:\n  Median: 2.0000"],
+                prediction_results=None,
+                required_feature_tools=["extract_basic_statistics", "extract_event_summary"],
+                completed_feature_tools=["extract_basic_statistics"],
+                diagnostic_plan_reason="The window shows local oscillation, so I need a focused diagnostic pass.",
+                diagnostic_primary_model="patchtst",
+                diagnostic_runner_up_model="itransformer",
+                turn_stage="diagnostic",
+            )
+        self.assertIn("patchtst", prompt)
+        self.assertIn("itransformer", prompt)
 
     def test_compact_prediction_tool_output_keeps_single_timestamp_anchor(self) -> None:
         prediction_text = (

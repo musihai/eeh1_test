@@ -218,12 +218,11 @@ def _build_plan_rationale(
     else:
         opener = "The window mixes stable and shifting behavior."
 
-    if score_gap <= 0.75 and runner_up_model != primary_model:
-        decision_text = f"I need enough evidence to distinguish `{primary_model}` from `{runner_up_model}`."
-    else:
-        decision_text = f"`{primary_model}` looks strongest, so I will gather the minimum evidence needed to confirm it before routing."
-
     tool_focus = ", ".join(_tool_focus_phrase(name) for name in tool_names)
+    if score_gap <= 0.75 and runner_up_model != primary_model:
+        decision_text = "I need a broader diagnostic pass to separate the competing temporal explanations before routing."
+    else:
+        decision_text = "I will gather the minimum evidence needed to establish a confident routing state."
     return f"{opener} {decision_text} I will inspect {tool_focus}."
 
 

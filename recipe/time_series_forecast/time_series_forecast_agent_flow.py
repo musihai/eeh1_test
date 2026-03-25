@@ -120,8 +120,6 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.required_feature_tools = []
         self.diagnostic_tool_batches = []
         self.diagnostic_plan_reason = ""
-        self.diagnostic_primary_model = ""
-        self.diagnostic_runner_up_model = ""
         self.absolute_step_budget = None
         self.final_answer = None
         self.final_answer_reject_reason = None
@@ -191,15 +189,11 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             diagnostic_plan = build_diagnostic_plan([float(value) for value in self.values])
             self.required_feature_tools = list(diagnostic_plan.tool_names)
             self.diagnostic_plan_reason = diagnostic_plan.rationale
-            self.diagnostic_primary_model = diagnostic_plan.primary_model
-            self.diagnostic_runner_up_model = diagnostic_plan.runner_up_model
         else:
             self.required_feature_tools = ["extract_basic_statistics"]
             self.diagnostic_plan_reason = (
                 "The series could not be parsed cleanly, so I start with baseline statistics before attempting routing."
             )
-            self.diagnostic_primary_model = "patchtst"
-            self.diagnostic_runner_up_model = "arima"
         self.diagnostic_tool_batches = plan_diagnostic_tool_batches(
             list(self.required_feature_tools),
             max_parallel_calls=int(self.max_parallel_calls or 1),
@@ -989,8 +983,6 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             required_feature_tools=self._current_prompt_required_feature_tools(),
             completed_feature_tools=self._executed_feature_tool_names(),
             diagnostic_plan_reason=str(getattr(self, "diagnostic_plan_reason", "") or ""),
-            diagnostic_primary_model=str(getattr(self, "diagnostic_primary_model", "") or ""),
-            diagnostic_runner_up_model=str(getattr(self, "diagnostic_runner_up_model", "") or ""),
             turn_stage=turn_stage,
         )
 

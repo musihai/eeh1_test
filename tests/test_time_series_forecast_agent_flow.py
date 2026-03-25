@@ -25,8 +25,6 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         flow.steps = []
         flow.diagnostic_tool_batches = []
         flow.diagnostic_plan_reason = ""
-        flow.diagnostic_primary_model = ""
-        flow.diagnostic_runner_up_model = ""
         flow.feature_tool_sequence = []
         flow.history_analysis = []
         flow.required_feature_tools = []
@@ -181,15 +179,15 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         flow.time_series_data = "1.0000\n2.0000\n3.0000"
         flow.required_feature_tools = ["extract_basic_statistics", "extract_event_summary"]
         flow.diagnostic_tool_batches = [["extract_basic_statistics", "extract_event_summary"]]
-        flow.diagnostic_plan_reason = "The window mixes oscillation and drift, so I need targeted diagnostics."
-        flow.diagnostic_primary_model = "patchtst"
-        flow.diagnostic_runner_up_model = "itransformer"
+        flow.diagnostic_plan_reason = (
+            "The window mixes oscillation and drift, so I will inspect baseline autocorrelation and segment-level events."
+        )
 
         prompt = flow._build_user_prompt()
 
         self.assertIn("### Diagnostic Plan", prompt)
-        self.assertIn("patchtst", prompt)
-        self.assertIn("itransformer", prompt)
+        self.assertNotIn("patchtst", prompt)
+        self.assertNotIn("itransformer", prompt)
         self.assertIn("Follow the diagnostic plan", prompt)
 
     def test_build_user_prompt_uses_canonical_timestamped_prediction_values_in_refinement(self) -> None:

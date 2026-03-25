@@ -10,7 +10,12 @@ import pandas as pd
 
 from recipe.time_series_forecast.build_etth1_sft_dataset import (
     DEFAULT_BALANCE_TRAIN_ROUTING_MODELS,
+    DEFAULT_SFT_STAGE_MODE,
+    DEFAULT_TRAIN_LOCAL_REFINE_REFINEMENT_REPEAT_FACTOR,
+    DEFAULT_TRAIN_TURN3_REBALANCE_MODE,
     FEATURE_TOOL_BUILDERS,
+    SFT_STAGE_MODE_REFINEMENT_ONLY,
+    SFT_STAGE_MODE_ROUTING_ONLY,
     SUPPORTED_PREDICTION_MODELS,
     TURN3_TARGET_MODE_ENGINEERING_REFINE,
     TURN3_TARGET_MODE_PAPER_STRICT,
@@ -21,9 +26,11 @@ from recipe.time_series_forecast.build_etth1_sft_dataset import (
     _select_prediction_model_by_heuristic,
     convert_jsonl_to_sft_parquet,
     parse_args,
+    rebalance_refinement_stage_targets,
     rebalance_train_routing_model_records,
     rebalance_train_stage_records,
     rebalance_train_turn3_targets,
+    repeat_local_refine_refinement_rows,
     repeat_priority_validated_keep_refinement_rows,
 )
 from recipe.time_series_forecast.diagnostic_policy import (
@@ -349,6 +356,12 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
         with mock.patch("sys.argv", ["build_etth1_sft_dataset.py"]):
             args = parse_args()
         self.assertEqual(bool(args.balance_train_routing_models), DEFAULT_BALANCE_TRAIN_ROUTING_MODELS)
+        self.assertEqual(str(args.sft_stage_mode), DEFAULT_SFT_STAGE_MODE)
+        self.assertEqual(str(args.train_turn3_rebalance_mode), DEFAULT_TRAIN_TURN3_REBALANCE_MODE)
+        self.assertEqual(
+            int(args.train_local_refine_refinement_repeat_factor),
+            DEFAULT_TRAIN_LOCAL_REFINE_REFINEMENT_REPEAT_FACTOR,
+        )
 
     def test_resolve_reference_teacher_model_uses_offline_best_model_for_rl_source(self):
         sample = self._load_base_sample()
@@ -440,6 +453,70 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                 )
 
         self.assertEqual(set(dataframe["reference_teacher_model"].astype(str)), {"itransformer"})
+
+    def test_convert_can_build_routing_only_records_with_reference_teacher_labels(self):
+        sample = self._load_base_sample()
+
+        async def fake_predict_with_runtime_tools(**kwargs):
+            self.assertIn(kwargs["model_name"], SUPPORTED_PREDICTION_MODELS)
+            return str(sample["teacher_prediction_text"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "single.jsonl"
+            output_path = Path(tmpdir) / "routing_only.parquet"
+            input_path.write_text(json.dumps(sample, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            with mock.patch(
+                "recipe.time_series_forecast.build_etth1_sft_dataset._predict_with_runtime_tools",
+                new=fake_predict_with_runtime_tools,
+            ):
+                dataframe = convert_jsonl_to_sft_parquet(
+                    input_path=input_path,
+                    output_path=output_path,
+                    max_samples=1,
+                    routing_label_source="heuristic",
+                    sft_stage_mode=SFT_STAGE_MODE_ROUTING_ONLY,
+                )
+
+        self.assertEqual(set(dataframe["turn_stage"].astype(str)), {"routing"})
+        self.assertEqual(set(dataframe["sft_stage_mode"].astype(str)), {SFT_STAGE_MODE_ROUTING_ONLY})
+        self.assertEqual(set(dataframe["routing_label_source"].astype(str)), {"reference_teacher"})
+        self.assertEqual(
+            set(dataframe["selected_prediction_model"].astype(str)),
+            {str(sample["reference_teacher_model"])},
+        )
+        self.assertEqual(set(dataframe["routing_policy_source"].astype(str)), {"reference_teacher_offline_best"})
+        reasoning_content = str(dataframe.iloc[0]["messages"][-1]["reasoning_content"])
+        self.assertNotIn("heuristic guess", reasoning_content)
+        self.assertNotIn("patch-based temporal model", reasoning_content)
+        self.assertIn("inductive bias best matches", reasoning_content)
+
+    def test_convert_can_build_refinement_only_records(self):
+        sample = self._load_base_sample()
+
+        async def fake_predict_with_runtime_tools(**kwargs):
+            self.assertIn(kwargs["model_name"], SUPPORTED_PREDICTION_MODELS)
+            return str(sample["teacher_prediction_text"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "single.jsonl"
+            output_path = Path(tmpdir) / "refinement_only.parquet"
+            input_path.write_text(json.dumps(sample, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            with mock.patch(
+                "recipe.time_series_forecast.build_etth1_sft_dataset._predict_with_runtime_tools",
+                new=fake_predict_with_runtime_tools,
+            ):
+                dataframe = convert_jsonl_to_sft_parquet(
+                    input_path=input_path,
+                    output_path=output_path,
+                    max_samples=1,
+                    sft_stage_mode=SFT_STAGE_MODE_REFINEMENT_ONLY,
+                )
+
+        self.assertEqual(set(dataframe["turn_stage"].astype(str)), {"refinement"})
+        self.assertEqual(set(dataframe["sft_stage_mode"].astype(str)), {SFT_STAGE_MODE_REFINEMENT_ONLY})
+        self.assertTrue(all(bool(flag) for flag in dataframe["paper_turn3_required"].tolist()))
 
     def test_build_turn3_target_does_not_refine_without_evidence(self):
         sample = self._load_base_sample()
@@ -574,21 +651,35 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                 max_train_samples=1,
                 max_val_samples=1,
                 max_test_samples=0,
+                sft_stage_mode="full",
                 turn3_target_mode=TURN3_TARGET_MODE_PAPER_STRICT,
+                routing_label_source="heuristic",
                 train_min_local_refine_ratio=0.35,
+                train_turn3_rebalance_mode="downsample_keep",
                 train_stage_repeat_factors='{"diagnostic":1,"routing":1,"refinement":1}',
                 balance_train_routing_models=True,
+                train_priority_validated_keep_repeat_factor=1,
+                train_local_refine_refinement_repeat_factor=1,
             )
 
             captured_ratios: list[float] = []
 
-            def _fake_convert_jsonl_to_sft_parquet(*, input_path, output_path, max_samples=-1, turn3_target_mode=None):
+            def _fake_convert_jsonl_to_sft_parquet(
+                *,
+                input_path,
+                output_path,
+                max_samples=-1,
+                turn3_target_mode=None,
+                routing_label_source=None,
+                sft_stage_mode=None,
+            ):
                 if Path(input_path).name == "train.jsonl":
                     return _make_df("local_refine")
                 return _make_df("validated_keep")
 
-            def _fake_rebalance_train_turn3_targets(dataframe, min_local_refine_ratio):
+            def _fake_rebalance_train_turn3_targets(dataframe, min_local_refine_ratio, rebalance_mode):
                 captured_ratios.append(float(min_local_refine_ratio))
+                self.assertEqual(str(rebalance_mode), "downsample_keep")
                 return dataframe
 
             with mock.patch("recipe.time_series_forecast.build_etth1_sft_dataset.parse_args", return_value=args):
@@ -676,7 +767,7 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             model_name, _snapshot, routing_reason = _select_prediction_model_by_heuristic([0.0, 1.0, 2.0])
 
         self.assertEqual(model_name, "patchtst")
-        self.assertIn("patch", routing_reason.lower())
+        self.assertIn("repeatable local peaks", routing_reason.lower())
 
     def test_heuristic_keeps_chronos2_for_strong_irregularity(self):
         feature_snapshot = {
@@ -700,7 +791,7 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             model_name, _snapshot, routing_reason = _select_prediction_model_by_heuristic([0.0, 1.0, 2.0])
 
         self.assertEqual(model_name, "chronos2")
-        self.assertIn("robust", routing_reason.lower())
+        self.assertIn("irregular", routing_reason.lower())
 
     def test_rebalance_keeps_complete_source_trajectories(self):
         dataframe = pd.DataFrame(
@@ -751,6 +842,80 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
         self.assertEqual(sorted(balanced["source_sample_index"].unique().tolist()), [1, 2])
         kept_refine = balanced.loc[balanced["turn_stage"] == "refinement"].sort_values("source_sample_index")
         self.assertEqual(kept_refine["selected_prediction_model"].tolist(), ["patchtst", "arima"])
+
+    def test_rebalance_can_oversample_local_refine_without_dropping_sources(self):
+        dataframe = pd.DataFrame(
+            [
+                {"sample_index": 0, "source_sample_index": 10, "turn_stage": "diagnostic", "turn_stage_order": 0, "turn3_target_type": "local_refine"},
+                {"sample_index": 1, "source_sample_index": 10, "turn_stage": "refinement", "turn_stage_order": 1, "turn3_target_type": "local_refine"},
+                {"sample_index": 2, "source_sample_index": 11, "turn_stage": "diagnostic", "turn_stage_order": 0, "turn3_target_type": "validated_keep"},
+                {"sample_index": 3, "source_sample_index": 11, "turn_stage": "refinement", "turn_stage_order": 1, "turn3_target_type": "validated_keep"},
+                {"sample_index": 4, "source_sample_index": 12, "turn_stage": "diagnostic", "turn_stage_order": 0, "turn3_target_type": "validated_keep"},
+                {"sample_index": 5, "source_sample_index": 12, "turn_stage": "refinement", "turn_stage_order": 1, "turn3_target_type": "validated_keep"},
+            ]
+        )
+
+        balanced = rebalance_train_turn3_targets(
+            dataframe,
+            min_local_refine_ratio=0.5,
+            rebalance_mode="oversample_local_refine",
+        )
+
+        self.assertEqual(sorted(balanced["source_sample_index"].unique().tolist()), [10, 11, 12])
+        refine_rows = balanced.loc[balanced["turn_stage"] == "refinement"]
+        self.assertEqual(refine_rows["turn3_target_type"].value_counts().to_dict(), {"local_refine": 2, "validated_keep": 2})
+        self.assertEqual(list(balanced["sample_index"]), list(range(len(balanced))))
+
+    def test_rebalance_refinement_stage_targets_keeps_changes_local_to_refinement_rows(self):
+        dataframe = pd.DataFrame(
+            [
+                {"sample_index": 0, "source_sample_index": 10, "turn_stage": "diagnostic", "turn_stage_order": 0, "turn3_target_type": "local_refine"},
+                {"sample_index": 1, "source_sample_index": 10, "turn_stage": "refinement", "turn_stage_order": 1, "turn3_target_type": "local_refine"},
+                {"sample_index": 2, "source_sample_index": 11, "turn_stage": "routing", "turn_stage_order": 1, "turn3_target_type": "validated_keep"},
+                {"sample_index": 3, "source_sample_index": 11, "turn_stage": "refinement", "turn_stage_order": 2, "turn3_target_type": "validated_keep"},
+                {"sample_index": 4, "source_sample_index": 12, "turn_stage": "refinement", "turn_stage_order": 2, "turn3_target_type": "validated_keep"},
+            ]
+        )
+
+        balanced = rebalance_refinement_stage_targets(
+            dataframe,
+            min_local_refine_ratio=0.5,
+            rebalance_mode="oversample_local_refine",
+        )
+
+        self.assertEqual(
+            balanced.loc[balanced["turn_stage"] == "diagnostic", "source_sample_index"].tolist(),
+            [10],
+        )
+        self.assertEqual(
+            balanced.loc[balanced["turn_stage"] == "routing", "source_sample_index"].tolist(),
+            [11],
+        )
+        self.assertEqual(
+            balanced.loc[balanced["turn_stage"] == "refinement", "turn3_target_type"].value_counts().to_dict(),
+            {"local_refine": 2, "validated_keep": 2},
+        )
+        self.assertEqual(list(balanced["sample_index"]), list(range(len(balanced))))
+
+    def test_repeat_local_refine_refinement_rows_duplicates_only_local_refine_rows(self):
+        dataframe = pd.DataFrame(
+            [
+                {"sample_index": 0, "source_sample_index": 1, "turn_stage": "diagnostic", "turn_stage_order": 0, "turn3_target_type": "local_refine"},
+                {"sample_index": 1, "source_sample_index": 1, "turn_stage": "refinement", "turn_stage_order": 1, "turn3_target_type": "local_refine"},
+                {"sample_index": 2, "source_sample_index": 2, "turn_stage": "refinement", "turn_stage_order": 1, "turn3_target_type": "validated_keep"},
+            ]
+        )
+
+        repeated = repeat_local_refine_refinement_rows(
+            dataframe,
+            repeat_factor=3,
+        )
+
+        repeated_refine = repeated.loc[repeated["turn_stage"] == "refinement"]
+        self.assertEqual(
+            repeated_refine["turn3_target_type"].astype(str).value_counts().to_dict(),
+            {"local_refine": 3, "validated_keep": 1},
+        )
 
     def test_repeat_priority_validated_keep_refinement_rows_duplicates_only_priority_refinement(self):
         def _timestamp_line(idx: int, value: float) -> str:
