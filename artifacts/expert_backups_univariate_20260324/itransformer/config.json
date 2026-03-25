@@ -1,0 +1,14 @@
+{
+  "model_name": "iTransformer",
+  "seq_len": 96,
+  "pred_len": 96,
+  "enc_in": 1,
+  "d_model": 256,
+  "n_heads": 8,
+  "e_layers": 2,
+  "d_ff": 256,
+  "dropout": 0.1,
+  "features": "S",
+  "target": "OT",
+  "description": "iTransformer retrained on ETTh1 TRAIN split only (rows [0,12251)) with strict provenance."
+}

@@ -26,6 +26,7 @@ DEFAULT_OUTPUT_DIR = Path("dataset/ett_rl_etth1_paper_same2")
 DEFAULT_TRAIN_ROWS = 12251
 DEFAULT_VAL_ROWS = 1913
 DEFAULT_TEST_ROWS = 3256
+DEFAULT_ETTH1_FEATURE_COLUMNS = ("HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT")
 
 
 @dataclass(frozen=True)
@@ -40,16 +41,38 @@ class SplitConfig:
 
 
 def build_prompt(
-    historical_values: Iterable[float],
+    historical_context: Iterable[float] | pd.DataFrame,
     *,
     lookback_window: int,
     forecast_horizon: int,
     target_column: str,
 ) -> str:
-    value_lines = "\n".join(f"{float(value):.4f}" for value in historical_values)
+    if isinstance(historical_context, pd.DataFrame):
+        feature_columns = [column for column in DEFAULT_ETTH1_FEATURE_COLUMNS if column in historical_context.columns]
+        if target_column not in feature_columns and target_column in historical_context.columns:
+            feature_columns.append(target_column)
+        if not feature_columns:
+            raise ValueError("Historical ETTh1 prompt context must contain at least the target column")
+
+        value_lines = "\n".join(
+            f"{row.date} "
+            + " ".join(f"{column}={float(getattr(row, column)):.4f}" for column in feature_columns)
+            for row in historical_context.itertuples(index=False)
+        )
+        task_header = "[Task] Multivariate time-series forecasting."
+        covariate_columns = [column for column in feature_columns if column != target_column]
+        covariate_line = (
+            f"Observed Covariates: {', '.join(covariate_columns)}\n" if covariate_columns else ""
+        )
+    else:
+        value_lines = "\n".join(f"{float(value):.4f}" for value in historical_context)
+        task_header = "[Task] Single-variable time-series forecasting."
+        covariate_line = ""
+
     return (
-        "[Task] Single-variable time-series forecasting.\n"
+        f"{task_header}\n"
         f"Target Column: {target_column}\n"
+        f"{covariate_line}"
         f"Lookback Window: {lookback_window}\n"
         f"Forecast Horizon: {forecast_horizon}\n"
         "Requirements:\n"
@@ -236,7 +259,7 @@ def iter_split_samples(
         historical_values = historical[target_column].tolist()
 
         prompt_text = build_prompt(
-            historical_values,
+            historical,
             lookback_window=lookback_window,
             forecast_horizon=forecast_horizon,
             target_column=target_column,

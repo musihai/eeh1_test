@@ -1,0 +1,98 @@
+{
+  "schema_version": "1.0",
+  "timestamp_utc": "2026-03-18T01:59:23.345293+00:00",
+  "model_name": "patchtst",
+  "data": {
+    "source_csv": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/dataset/ETT-small/ETTh1.csv",
+    "target_column": "OT",
+    "total_rows": 17420,
+    "split_boundaries": [
+      {
+        "name": "train",
+        "start_row": 0,
+        "end_row": 12251
+      },
+      {
+        "name": "val",
+        "start_row": 12251,
+        "end_row": 14164
+      },
+      {
+        "name": "test",
+        "start_row": 14164,
+        "end_row": 17420
+      }
+    ],
+    "training_rows_used": {
+      "start_row": 0,
+      "end_row": 12251,
+      "exclusive_end": true,
+      "policy": "train_split_only"
+    },
+    "lookback_window": 96,
+    "forecast_horizon": 96,
+    "num_windows_used": 12060
+  },
+  "training": {
+    "epochs": 10,
+    "batch_size": 128,
+    "learning_rate": 0.0001,
+    "num_workers": 0,
+    "num_windows": 12060,
+    "device": "cuda",
+    "seed": 42,
+    "metrics": {
+      "epoch": 10,
+      "train_loss": 12.3113844219007,
+      "train_mae": 2.581604654028509,
+      "train_mse": 11.862953082707259,
+      "model": "patchtst",
+      "dataset": "ETTh1",
+      "batch_size": 128,
+      "learning_rate": 0.0001,
+      "split_policy": "train_only"
+    }
+  },
+  "artifacts": {
+    "checkpoint_path": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/recipe/time_series_forecast/models/patchtst/checkpoint.pth",
+    "checkpoint_sha256": "3a18300a5b1485178b0364813410b3ebcbec8a2494abcb2cec970c448e0efb07",
+    "checkpoint_size_bytes": 482997,
+    "config_path": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/recipe/time_series_forecast/models/patchtst/config.json",
+    "config_sha256": "fbbdc6d158c3f4ae6b84e3969eb623bfcd4674c1e4fb69c5d24b2a7e8ca23328",
+    "provenance_path": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/recipe/time_series_forecast/models/patchtst/provenance.json"
+  },
+  "code_version": {
+    "project_root": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main",
+    "git_commit": "eaf9873e26caf41f4942f47dbd9b9ec9db719230",
+    "git_dirty": true,
+    "train_script_path": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/recipe/time_series_forecast/retrain_expert_models_train_split.py",
+    "train_script_sha256": "5e7169a1c097f20921692d97309e77211574a988487b287bd267b9a7062db087",
+    "model_definition_path": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/recipe/time_series_forecast/models/patchtst/model.py",
+    "model_definition_sha256": "99e2781ea6cfa4f422fd529c4aafc04ad490f6ba4331c2f3426c59b0580f0c01"
+  },
+  "command": {
+    "cwd": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main",
+    "argv": [
+      "recipe/time_series_forecast/retrain_expert_models_train_split.py",
+      "--csv-path",
+      "dataset/ETT-small/ETTh1.csv",
+      "--models",
+      "patchtst,itransformer",
+      "--train-rows",
+      "12251",
+      "--val-rows",
+      "1913",
+      "--test-rows",
+      "3256",
+      "--target-column",
+      "OT",
+      "--lookback-window",
+      "96",
+      "--forecast-horizon",
+      "96",
+      "--device",
+      "cuda"
+    ],
+    "command_line": "/data/linyujie/miniconda3/envs/cast-r1-ts/bin/python recipe/time_series_forecast/retrain_expert_models_train_split.py --csv-path dataset/ETT-small/ETTh1.csv --models patchtst,itransformer --train-rows 12251 --val-rows 1913 --test-rows 3256 --target-column OT --lookback-window 96 --forecast-horizon 96 --device cuda"
+  }
+}

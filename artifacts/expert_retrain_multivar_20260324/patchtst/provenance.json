@@ -1,0 +1,95 @@
+{
+  "schema_version": "1.0",
+  "timestamp_utc": "2026-03-24T10:00:22.871929+00:00",
+  "model_name": "patchtst",
+  "data": {
+    "source_csv": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/dataset/ETT-small/ETTh1.csv",
+    "target_column": "OT",
+    "feature_columns": [
+      "HUFL",
+      "HULL",
+      "MUFL",
+      "MULL",
+      "LUFL",
+      "LULL",
+      "OT"
+    ],
+    "features": "MS",
+    "total_rows": 17420,
+    "split_boundaries": [
+      {
+        "name": "train",
+        "start_row": 0,
+        "end_row": 12251
+      },
+      {
+        "name": "val",
+        "start_row": 12251,
+        "end_row": 14164
+      },
+      {
+        "name": "test",
+        "start_row": 14164,
+        "end_row": 17420
+      }
+    ],
+    "training_rows_used": {
+      "start_row": 0,
+      "end_row": 12251,
+      "exclusive_end": true,
+      "policy": "train_split_only"
+    },
+    "lookback_window": 96,
+    "forecast_horizon": 96,
+    "num_windows_used": 12060
+  },
+  "training": {
+    "epochs": 10,
+    "batch_size": 128,
+    "learning_rate": 0.0001,
+    "num_workers": 0,
+    "num_windows": 12060,
+    "device": "cuda",
+    "seed": 42,
+    "metrics": {
+      "epoch": 10,
+      "train_loss": 12.304067698679555,
+      "train_mae": 2.6450258009337535,
+      "train_mse": 12.304067458389476,
+      "model": "patchtst",
+      "dataset": "ETTh1",
+      "batch_size": 128,
+      "learning_rate": 0.0001,
+      "split_policy": "train_only_multivariate_ms",
+      "train_batches": 95
+    }
+  },
+  "artifacts": {
+    "checkpoint_path": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/expert_retrain_multivar_20260324/patchtst/checkpoint.pth",
+    "checkpoint_sha256": "8b015729b85534f18ca9ad2807cb018dd434d633f49a37d4655a5c98a1eef7a1",
+    "checkpoint_size_bytes": 482805,
+    "config_path": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/expert_retrain_multivar_20260324/patchtst/config.json",
+    "config_sha256": "03cbda3a88e207fcce1e523df979a028c5904a8c8a3a06a458db1bb9eff011ef",
+    "provenance_path": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/expert_retrain_multivar_20260324/patchtst/provenance.json"
+  },
+  "code_version": {
+    "project_root": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main",
+    "git_commit": "46c6ed5213ccceb655c11bef12c1885f0bf57bc5",
+    "git_dirty": true,
+    "train_script_path": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/recipe/time_series_forecast/retrain_expert_models_train_split.py",
+    "model_definition_path": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/recipe/time_series_forecast/models/patchtst/model.py"
+  },
+  "command": {
+    "cwd": "/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main",
+    "argv": [
+      "recipe/time_series_forecast/retrain_expert_models_train_split.py",
+      "--models",
+      "patchtst",
+      "--output-root",
+      "artifacts/expert_retrain_multivar_20260324",
+      "--device",
+      "cuda"
+    ],
+    "command_line": "recipe/time_series_forecast/retrain_expert_models_train_split.py --models patchtst --output-root artifacts/expert_retrain_multivar_20260324 --device cuda"
+  }
+}

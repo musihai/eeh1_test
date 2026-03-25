@@ -16,11 +16,24 @@ from recipe.time_series_forecast.build_etth1_rl_dataset import (
 
 
 class TestETTh1RLDatasetBuilder(unittest.TestCase):
-    def test_build_prompt_uses_value_only_protocol(self) -> None:
-        prompt = build_prompt([1.0, 2.5, 3.75], lookback_window=3, forecast_horizon=2, target_column="OT")
-        self.assertIn("Historical Data:\n1.0000\n2.5000\n3.7500", prompt)
+    def test_build_prompt_uses_multivariate_history_protocol(self) -> None:
+        history = pd.DataFrame(
+            {
+                "date": ["2016-01-01 00:00:00", "2016-01-01 01:00:00", "2016-01-01 02:00:00"],
+                "HUFL": [10.0, 11.0, 12.0],
+                "HULL": [20.0, 21.0, 22.0],
+                "MUFL": [30.0, 31.0, 32.0],
+                "MULL": [40.0, 41.0, 42.0],
+                "LUFL": [50.0, 51.0, 52.0],
+                "LULL": [60.0, 61.0, 62.0],
+                "OT": [1.0, 2.5, 3.75],
+            }
+        )
+        prompt = build_prompt(history, lookback_window=3, forecast_horizon=2, target_column="OT")
+        self.assertIn("[Task] Multivariate time-series forecasting.", prompt)
+        self.assertIn("Observed Covariates: HUFL, HULL, MUFL, MULL, LUFL, LULL", prompt)
+        self.assertIn("2016-01-01 00:00:00 HUFL=10.0000 HULL=20.0000 MUFL=30.0000 MULL=40.0000 LUFL=50.0000 LULL=60.0000 OT=1.0000", prompt)
         self.assertIn("Target Column: OT", prompt)
-        self.assertNotIn("OT=", prompt)
 
     def test_build_ground_truth_preserves_timestamps(self) -> None:
         df = pd.DataFrame(
@@ -65,7 +78,8 @@ class TestETTh1RLDatasetBuilder(unittest.TestCase):
         hist_start = prompt_lines.index("Historical Data:") + 1
         history_lines = prompt_lines[hist_start:]
         self.assertEqual(len(history_lines), 96)
-        self.assertTrue(all("=" not in line for line in history_lines))
+        self.assertTrue(all("OT=" in line for line in history_lines))
+        self.assertTrue(all("HUFL=" in line for line in history_lines))
 
         gt_lines = first["reward_model"]["ground_truth"].splitlines()
         self.assertEqual(len(gt_lines), 96)

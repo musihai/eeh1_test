@@ -25,10 +25,19 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
         df = pd.read_csv("dataset/ETT-small/ETTh1.csv").iloc[:96]
         self.timestamped_expected_first = str(df.iloc[0]["date"])
         self.timestamped_expected_last = str(df.iloc[-1]["date"])
-        lines = [f"{row.date} OT={float(row.OT):.4f}" for row in df.itertuples(index=False)]
+        lines = [
+            (
+                f"{row.date} "
+                f"HUFL={float(row.HUFL):.4f} HULL={float(row.HULL):.4f} "
+                f"MUFL={float(row.MUFL):.4f} MULL={float(row.MULL):.4f} "
+                f"LUFL={float(row.LUFL):.4f} LULL={float(row.LULL):.4f} OT={float(row.OT):.4f}"
+            )
+            for row in df.itertuples(index=False)
+        ]
         return (
-            "[Task] Single-variable time-series forecasting.\n"
+            "[Task] Multivariate time-series forecasting.\n"
             "Target Column: OT\n"
+            "Observed Covariates: HUFL, HULL, MUFL, MULL, LUFL, LULL\n"
             "Lookback Window: 96\n"
             "Forecast Horizon: 96\n"
             "Requirements:\n"
@@ -67,9 +76,16 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
             spec.historical_data,
             series_id="ETTh1",
             target_column=spec.target_column,
+            include_covariates=(protocol_kind == "timestamped"),
         )
         self.assertEqual(len(df), 96)
-        self.assertEqual(list(df.columns), ["id", "timestamp", "target"])
+        if protocol_kind == "value_only":
+            self.assertEqual(list(df.columns), ["id", "timestamp", "target"])
+        else:
+            self.assertEqual(
+                list(df.columns),
+                ["id", "timestamp", "target", "HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"],
+            )
         if protocol_kind == "value_only":
             self.assertEqual(str(df.iloc[0]["timestamp"]), "2000-01-01 00:00:00")
             self.assertEqual(str(df.iloc[1]["timestamp"]), "2000-01-01 01:00:00")

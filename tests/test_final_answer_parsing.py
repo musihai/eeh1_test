@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
+from recipe.time_series_forecast.reward_protocol import extract_values_from_time_series_string
 from recipe.time_series_forecast.time_series_forecast_agent_flow import TimeSeriesForecastAgentFlow
 
 
@@ -71,6 +72,21 @@ class FinalAnswerParsingTest(unittest.TestCase):
         self.assertIsNone(answer)
         self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "invalid_answer_shape:lines=24,expected=96")
+
+    def test_rejects_invalid_timestamp_hour_in_answer_block(self) -> None:
+        agent = self._make_agent()
+        timestamped_lines = []
+        for idx in range(96):
+            hour = idx % 24
+            if idx == 95:
+                hour = 24
+            timestamped_lines.append(f"2026-03-20 {hour:02d}:00:00 {30.0 + idx / 1000:.4f}")
+        text = f"<think>x</think><answer>\n{chr(10).join(timestamped_lines)}\n</answer>"
+        answer, penalty = agent._extract_final_answer(text)
+        self.assertIsNone(answer)
+        self.assertEqual(penalty, 0.0)
+        self.assertEqual(agent.final_answer_reject_reason, "invalid_answer_shape:values=95,expected=96")
+        self.assertEqual(len(extract_values_from_time_series_string(text)), 95)
 
     def test_rejects_bare_forecast_block(self) -> None:
         agent = self._make_agent()
@@ -157,9 +173,10 @@ class FinalAnswerParsingTest(unittest.TestCase):
         params = agent._prepare_sampling_params({"temperature": 0.3, "top_p": 0.95})
         self.assertEqual(params["stop"], ["</answer>"])
         self.assertTrue(params["include_stop_str_in_output"])
-        self.assertEqual(params["max_tokens"], 1408)
-        self.assertAlmostEqual(params["temperature"], 0.2, places=6)
-        self.assertAlmostEqual(params["top_p"], 0.9, places=6)
+        self.assertEqual(params["max_tokens"], 2944)
+        self.assertAlmostEqual(params["temperature"], 0.0, places=6)
+        self.assertAlmostEqual(params["top_p"], 1.0, places=6)
+        self.assertAlmostEqual(params["repetition_penalty"], 1.05, places=6)
 
     def test_non_final_turn_sampling_params_add_stop_and_cap_tokens(self) -> None:
         agent = self._make_agent()

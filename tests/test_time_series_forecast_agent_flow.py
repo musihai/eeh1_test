@@ -24,6 +24,9 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         flow.response_length = 4096
         flow.steps = []
         flow.diagnostic_tool_batches = []
+        flow.diagnostic_plan_reason = ""
+        flow.diagnostic_primary_model = ""
+        flow.diagnostic_runner_up_model = ""
         flow.feature_tool_sequence = []
         flow.history_analysis = []
         flow.required_feature_tools = []
@@ -61,7 +64,7 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
 
     def test_final_answer_budget_leaves_headroom_for_closing_tag(self) -> None:
         flow = self._make_flow()
-        self.assertGreater(flow._final_answer_max_tokens(), 1024)
+        self.assertEqual(flow._final_answer_max_tokens(), 2944)
 
         flow.response_length = 1200
         self.assertEqual(flow._final_answer_max_tokens(), 1200)
@@ -111,6 +114,22 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(flow.prediction_call_count, 0)
         self.assertEqual(flow._run_prediction_tool.await_count, 2)
 
+    async def test_invalid_prediction_model_is_rejected_without_defaulting(self) -> None:
+        flow = self._make_flow()
+        flow.basic_statistics = {}
+        tool_call = SimpleNamespace(name="predict_time_series", arguments={"model_name": "unknown_model"})
+        flow._run_prediction_tool = AsyncMock()
+
+        output = await flow._execute_tool_call(tool_call, turn_stage="routing")
+
+        self.assertIsNone(output)
+        self.assertEqual(flow.prediction_requested_model, "unknown_model")
+        self.assertFalse(flow.prediction_model_defaulted)
+        self.assertIn("Invalid model_name", flow.prediction_tool_error)
+        self.assertEqual(flow.prediction_attempt_count, 0)
+        self.assertEqual(flow.prediction_call_count, 0)
+        self.assertEqual(flow._run_prediction_tool.await_count, 0)
+
     def test_shared_reward_tracking_fields_include_required_feature_metrics_and_uid(self) -> None:
         flow = self._make_flow()
         flow.required_feature_tools = [
@@ -153,6 +172,48 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("predict_time_series", diagnostic_names)
         self.assertEqual(routing_names, ["predict_time_series"])
         self.assertEqual(refinement_names, [])
+
+    def test_build_user_prompt_includes_diagnostic_plan(self) -> None:
+        flow = self._make_flow()
+        flow.data_source = "ETTh1"
+        flow.target_column = "OT"
+        flow.lookback_window = 96
+        flow.time_series_data = "1.0000\n2.0000\n3.0000"
+        flow.required_feature_tools = ["extract_basic_statistics", "extract_event_summary"]
+        flow.diagnostic_tool_batches = [["extract_basic_statistics", "extract_event_summary"]]
+        flow.diagnostic_plan_reason = "The window mixes oscillation and drift, so I need targeted diagnostics."
+        flow.diagnostic_primary_model = "patchtst"
+        flow.diagnostic_runner_up_model = "itransformer"
+
+        prompt = flow._build_user_prompt()
+
+        self.assertIn("### Diagnostic Plan", prompt)
+        self.assertIn("patchtst", prompt)
+        self.assertIn("itransformer", prompt)
+        self.assertIn("Follow the diagnostic plan", prompt)
+
+    def test_build_user_prompt_uses_canonical_timestamped_prediction_values_in_refinement(self) -> None:
+        flow = self._make_flow()
+        flow.data_source = "ETTh1"
+        flow.target_column = "OT"
+        flow.lookback_window = 96
+        flow.time_series_data = "2024-01-01 00:00:00 1.0000\n2024-01-01 01:00:00 2.0000"
+        flow.history_analysis = ["diagnostic complete"]
+        flow.prediction_results = "2024-01-02 00:00:00 3.1000\n2024-01-02 01:00:00 3.2000"
+        flow.prediction_tool_output = "Model: arima\nForecast Values:\n3.1000\n3.2000"
+        flow.prediction_model_used = "arima"
+        flow.forecast_horizon = 2
+
+        prompt = flow._build_user_prompt()
+
+        self.assertIn("### Final Allowed Forecast Timestamp: 2024-01-02 01:00:00", prompt)
+        self.assertIn("### Prediction Tool Output", prompt)
+        self.assertIn("2024-01-02 00:00:00 3.1000", prompt)
+        self.assertIn("2024-01-02 01:00:00 3.2000", prompt)
+        self.assertIn("### Selected Forecast Model: arima", prompt)
+        self.assertNotIn("Forecast Values:", prompt)
+        self.assertIn("must use `YYYY-MM-DD HH:MM:SS value`", prompt)
+        self.assertIn("Do NOT emit any later timestamp", prompt)
 
     def test_current_turn_stage_waits_for_required_feature_coverage(self) -> None:
         flow = self._make_flow()

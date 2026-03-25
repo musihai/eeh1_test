@@ -65,8 +65,10 @@ from recipe.time_series_forecast.reward import (
     normalize_for_reward,
     parse_final_answer_protocol,
 )
+from recipe.time_series_forecast.reward_protocol import extract_forecast_block, normalized_nonempty_lines
 from recipe.time_series_forecast.diagnostic_policy import (
     FEATURE_TOOL_ORDER,
+    build_diagnostic_plan,
     plan_diagnostic_tool_batches,
     select_feature_tool_names,
 )
@@ -117,6 +119,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.steps = []
         self.required_feature_tools = []
         self.diagnostic_tool_batches = []
+        self.diagnostic_plan_reason = ""
+        self.diagnostic_primary_model = ""
+        self.diagnostic_runner_up_model = ""
         self.absolute_step_budget = None
         self.final_answer = None
         self.final_answer_reject_reason = None
@@ -183,9 +188,18 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             self.timestamps, self.values = [], []
 
         if self.values:
-            self.required_feature_tools = select_feature_tool_names([float(value) for value in self.values])
+            diagnostic_plan = build_diagnostic_plan([float(value) for value in self.values])
+            self.required_feature_tools = list(diagnostic_plan.tool_names)
+            self.diagnostic_plan_reason = diagnostic_plan.rationale
+            self.diagnostic_primary_model = diagnostic_plan.primary_model
+            self.diagnostic_runner_up_model = diagnostic_plan.runner_up_model
         else:
             self.required_feature_tools = ["extract_basic_statistics"]
+            self.diagnostic_plan_reason = (
+                "The series could not be parsed cleanly, so I start with baseline statistics before attempting routing."
+            )
+            self.diagnostic_primary_model = "patchtst"
+            self.diagnostic_runner_up_model = "arima"
         self.diagnostic_tool_batches = plan_diagnostic_tool_batches(
             list(self.required_feature_tools),
             max_parallel_calls=int(self.max_parallel_calls or 1),
@@ -712,10 +726,12 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
     def _final_answer_max_tokens(self) -> int:
         expected = self._expected_prediction_count()
         response_cap = int(self.response_length or 0) or 2048
-        # Qwen-style tokenization for one-value-per-line forecasts is denser than
-        # the old 10-token heuristic. In validation, exact-copy 96-line answers
-        # repeatedly hit a 1024-token cap before `</answer>` was emitted.
-        return min(response_cap, max(384, expected * 12 + 256))
+        # Paper-style timestamp-value answers are much longer than the old
+        # numeric-only format. On the rebuilt mv1 tsfix SFT set, 96-step
+        # refinement responses cluster around ~2.7k tokens with Qwen3
+        # tokenization, so the old `expected * 12 + 256` cap truncates every
+        # valid answer before `</answer>`.
+        return min(response_cap, max(768, expected * 28 + 256))
 
     def _tool_turn_max_tokens(self) -> int:
         response_cap = int(self.response_length or 0) or 2048
@@ -747,14 +763,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         if stage == "refinement":
             params["stop"] = self._merge_stop_strings(params.get("stop"), ["</answer>"])
             params["include_stop_str_in_output"] = True
-            if "temperature" in params:
-                params["temperature"] = min(float(params["temperature"]), 0.2)
-            else:
-                params["temperature"] = 0.2
-            if "top_p" in params:
-                params["top_p"] = min(float(params["top_p"]), 0.9)
-            else:
-                params["top_p"] = 0.9
+            params["temperature"] = 0.0
+            params["top_p"] = 1.0
+            params["repetition_penalty"] = max(float(params.get("repetition_penalty", 1.0)), 1.05)
             final_turn_max_tokens = self._final_answer_max_tokens()
             if existing_max_tokens is None:
                 params["max_tokens"] = final_turn_max_tokens
@@ -880,11 +891,13 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             return -0.5
 
     def _canonical_answer_from_prediction_text(self, prediction_text: str) -> str:
-        values = extract_values_from_time_series_string(prediction_text or "")
         expected = self._expected_prediction_count()
-        if len(values) < expected:
-            raise ValueError(f"prediction_text has {len(values)} values, expected at least {expected}")
-        return "\n".join(f"{float(value):.4f}" for value in values[:expected])
+        forecast_block = extract_forecast_block(prediction_text or "")
+        candidate_text = forecast_block if forecast_block is not None else str(prediction_text or "")
+        lines = normalized_nonempty_lines(candidate_text)
+        if len(lines) < expected:
+            raise ValueError(f"prediction_text has {len(lines)} forecast lines, expected at least {expected}")
+        return "\n".join(lines[:expected])
 
     def _compute_selected_forecast_reward(self, ground_truth: str) -> float:
         if not self.prediction_results or not ground_truth:
@@ -953,6 +966,17 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         await self.loop.run_in_executor(None, _write_records)
 
     def _build_user_prompt(self) -> str:
+        turn_stage = self._current_turn_stage()
+        prediction_payload = getattr(self, "prediction_tool_output", None) or self.prediction_results
+        if turn_stage == "refinement" and self.prediction_results:
+            try:
+                # Present a clean horizon-length base forecast in Turn 3 so the
+                # model can copy/refine the selected prediction without parsing
+                # tool headers or timestamps again.
+                prediction_payload = self._canonical_answer_from_prediction_text(self.prediction_results)
+            except ValueError:
+                prediction_payload = self.prediction_results
+
         return build_runtime_user_prompt(
             data_source=self.data_source,
             target_column=self.target_column,
@@ -960,11 +984,14 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             forecast_horizon=self.forecast_horizon,
             time_series_data=self.time_series_data,
             history_analysis=self.history_analysis,
-            prediction_results=self.prediction_tool_output or self.prediction_results,
-            prediction_model_used=self.prediction_model_used,
+            prediction_results=prediction_payload,
+            prediction_model_used=getattr(self, "prediction_model_used", None),
             required_feature_tools=self._current_prompt_required_feature_tools(),
             completed_feature_tools=self._executed_feature_tool_names(),
-            turn_stage=self._current_turn_stage(),
+            diagnostic_plan_reason=str(getattr(self, "diagnostic_plan_reason", "") or ""),
+            diagnostic_primary_model=str(getattr(self, "diagnostic_primary_model", "") or ""),
+            diagnostic_runner_up_model=str(getattr(self, "diagnostic_runner_up_model", "") or ""),
+            turn_stage=turn_stage,
         )
 
     async def _execute_tool_call(self, tool_call: FunctionCall, **kwargs) -> Optional[str]:
@@ -998,9 +1025,34 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 return None
 
             model_name = requested_model_name
-            if model_name not in {"chronos2", "arima", "patchtst", "itransformer"}:
-                model_name = "chronos2"
-            self.prediction_model_defaulted = bool(requested_model_name != model_name)
+            valid_model_names = {"chronos2", "arima", "patchtst", "itransformer"}
+            if model_name not in valid_model_names:
+                self.prediction_model_defaulted = False
+                self.prediction_tool_error = (
+                    f"Invalid model_name: {requested_model_name}. "
+                    f"Supported models: {sorted(valid_model_names)}"
+                )
+                logger.warning("predict_time_series called with invalid model_name=%s", requested_model_name)
+                append_chain_debug(
+                    "prediction_tool_result",
+                    build_prediction_tool_debug_payload(
+                        model_name=model_name,
+                        prediction_requested_model=self.prediction_requested_model or "",
+                        prediction_model_defaulted=False,
+                        prediction_attempt_count=int(self.prediction_attempt_count),
+                        prediction_step_index=self.prediction_step_index,
+                        prediction_call_count=int(self.prediction_call_count),
+                        analysis_state_signature_value=self._analysis_state_signature(),
+                        feature_tool_signature_value=self._feature_tool_signature(),
+                        forecast_horizon=self.forecast_horizon,
+                        prediction_results="",
+                        extract_values_fn=extract_values_from_time_series_string,
+                        success=False,
+                        error=self.prediction_tool_error,
+                    ),
+                )
+                return None
+            self.prediction_model_defaulted = False
             if int(self.prediction_attempt_count) >= self._max_prediction_attempts():
                 logger.warning(
                     "predict_time_series attempted after retry budget exhausted; max_prediction_attempts=%s",
@@ -1071,6 +1123,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 self.time_series_data,
                 series_id=self.data_source or "series_0",
                 target_column=self.target_column,
+                include_covariates=True,
             )
 
             last_ts = get_last_timestamp(self.time_series_data)

@@ -12,7 +12,10 @@ from recipe.time_series_forecast.reward_metrics import (
     CHANGE_POINT_COMPONENT_SCORE_WEIGHT,
     PREDICTION_ERROR_SCORE_WEIGHT,
     SEASON_COMPONENT_SCORE_WEIGHT,
+    STRUCTURAL_TIE_BREAK_MAX_NORM_MSE,
+    STRUCTURAL_TIE_BREAK_SCALE,
     TREND_COMPONENT_SCORE_WEIGHT,
+    compute_structural_tie_break_gate,
 )
 from recipe.time_series_forecast.utils import compact_prediction_tool_output_from_string, format_prediction_tool_output
 
@@ -44,7 +47,7 @@ class CompactProtocolTests(unittest.TestCase):
             forecast_horizon=96,
             time_series_data="1.0000\n2.0000\n3.0000",
             history_analysis=["Basic Statistics:\n  Median: 2.0000"],
-            prediction_results="Start Timestamp: 2017-05-02 00:00:00\nFrequency Hours: 1\nForecast Values:\n4.0000",
+            prediction_results="2017-05-02 00:00:00 4.0000",
             prediction_model_used="patchtst",
             required_feature_tools=["extract_basic_statistics"],
             completed_feature_tools=["extract_basic_statistics"],
@@ -53,11 +56,17 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertIn("### Analysis Summary", prompt)
         self.assertIn("### Recent Historical Window", prompt)
         self.assertIn("### Prediction Tool Output", prompt)
-        self.assertIn("Forecast Values:", prompt)
-        self.assertIn("base forecast produced by the selected model", prompt)
-        self.assertIn("Do NOT rewrite the forecast arbitrarily", prompt)
+        self.assertIn("2017-05-02 00:00:00 4.0000", prompt)
+        self.assertIn("canonical base forecast produced by the selected model", prompt)
+        self.assertIn("You must choose exactly one action", prompt)
+        self.assertIn("KEEP: copy the 96 forecast rows", prompt)
+        self.assertIn("LOCAL_REFINE", prompt)
+        self.assertIn("If unsure, choose KEEP", prompt)
         self.assertIn("No tool schema is available in this turn", prompt)
         self.assertIn("Output ONLY one <think>...</think> block followed immediately by one <answer>...</answer> block", prompt)
+        self.assertIn("must use `YYYY-MM-DD HH:MM:SS value`", prompt)
+        self.assertIn("Never synthesize timestamps such as `24:00:00` or `25:00:00`", prompt)
+        self.assertIn("exact row-for-row copy of \"Prediction Tool Output\"", prompt)
         self.assertIn("Your reply must start with <think>", prompt)
         self.assertNotIn("already present earlier in this conversation", prompt)
         self.assertNotIn("[Brief reflection", prompt)
@@ -74,11 +83,18 @@ class CompactProtocolTests(unittest.TestCase):
             prediction_results=None,
             required_feature_tools=["extract_basic_statistics", "extract_event_summary"],
             completed_feature_tools=["extract_basic_statistics"],
+            diagnostic_plan_reason="The window shows local oscillation, so I need a focused diagnostic pass.",
+            diagnostic_primary_model="patchtst",
+            diagnostic_runner_up_model="itransformer",
             turn_stage="diagnostic",
         )
+        self.assertIn("### Diagnostic Plan", prompt)
+        self.assertIn("patchtst", prompt)
+        self.assertIn("itransformer", prompt)
         self.assertIn("### Diagnostic Tool Schemas Available This Turn", prompt)
         self.assertIn("extract_event_summary", prompt)
         self.assertIn("call one or more feature tools", prompt)
+        self.assertIn("Follow the diagnostic plan", prompt)
         self.assertIn("Do NOT call predict_time_series", prompt)
 
     def test_compact_prediction_tool_output_keeps_single_timestamp_anchor(self) -> None:
@@ -125,13 +141,38 @@ class CompactProtocolTests(unittest.TestCase):
         value_only_score = value_only_result["score"] if isinstance(value_only_result, dict) else value_only_result
         self.assertAlmostEqual(timestamped_score, value_only_score, places=6)
 
-    def test_composite_reward_uses_paper_aligned_defaults(self) -> None:
+    def test_reward_rejects_mixed_timestamped_and_value_only_answer_lines(self) -> None:
+        ground_truth = (
+            "2017-05-02 00:00:00 12.3450\n"
+            "2017-05-02 01:00:00 12.6780\n"
+            "2017-05-02 02:00:00 13.0010"
+        )
+        mixed_solution = (
+            "<think>x</think><answer>\n"
+            "2017-05-02 00:00:00 12.3450\n"
+            "12.6780\n"
+            "2017-05-02 02:00:00 13.0010\n"
+            "</answer>"
+        )
+        result = compute_score(
+            data_source="time_series",
+            solution_str=mixed_solution,
+            ground_truth=ground_truth,
+            allow_recovery=False,
+        )
+        self.assertEqual(result["format_failure_reason"], "invalid_answer_shape:mixed_line_formats")
+        self.assertAlmostEqual(result["score"], -1.0, places=6)
+
+    def test_composite_reward_uses_mse_first_structural_tie_break(self) -> None:
         self.assertTrue(ENABLE_CHANGE_POINT_SCORE)
         self.assertTrue(ENABLE_SEASON_TREND_SCORE)
         self.assertGreater(
             PREDICTION_ERROR_SCORE_WEIGHT,
             2 * CHANGE_POINT_COMPONENT_SCORE_WEIGHT + SEASON_COMPONENT_SCORE_WEIGHT + TREND_COMPONENT_SCORE_WEIGHT,
         )
+        self.assertGreater(STRUCTURAL_TIE_BREAK_MAX_NORM_MSE, 0.0)
+        self.assertGreater(STRUCTURAL_TIE_BREAK_SCALE, 0.0)
+        self.assertLess(STRUCTURAL_TIE_BREAK_SCALE, 1.0)
 
         ground_truth = (
             "2017-05-02 00:00:00 10.0000\n"
@@ -153,10 +194,35 @@ class CompactProtocolTests(unittest.TestCase):
             places=6,
         )
         self.assertTrue(result["strict_length_match"])
+        self.assertAlmostEqual(result["structural_tie_break_gate"], STRUCTURAL_TIE_BREAK_SCALE, places=6)
         self.assertAlmostEqual(result["change_point_score"], 0.0, places=6)
         self.assertAlmostEqual(result["season_trend_score"], 0.0, places=6)
         self.assertAlmostEqual(result["orig_mse"], 0.0, places=6)
         self.assertAlmostEqual(result["norm_mse"], 0.0, places=6)
+
+    def test_structural_tie_break_gate_turns_off_for_large_norm_mse(self) -> None:
+        self.assertAlmostEqual(compute_structural_tie_break_gate(STRUCTURAL_TIE_BREAK_MAX_NORM_MSE), 0.0, places=6)
+        self.assertAlmostEqual(compute_structural_tie_break_gate(STRUCTURAL_TIE_BREAK_MAX_NORM_MSE * 2), 0.0, places=6)
+
+    def test_composite_reward_adds_only_small_structural_bonus_when_prediction_is_close(self) -> None:
+        ground_truth_values = [10.0, 12.0, 15.0, 18.0, 16.0, 13.0, 11.0, 14.0]
+        prediction_values = [10.1, 12.1, 15.1, 18.1, 16.1, 13.1, 11.1, 14.1]
+        ground_truth = "\n".join(
+            f"2017-05-02 {idx:02d}:00:00 {value:.4f}" for idx, value in enumerate(ground_truth_values)
+        )
+        solution = "<think>x</think><answer>\n" + "\n".join(f"{value:.4f}" for value in prediction_values) + "\n</answer>"
+
+        result = compute_score(data_source="time_series", solution_str=solution, ground_truth=ground_truth)
+
+        self.assertGreater(result["mse_score"], 0.0)
+        self.assertGreater(result["structural_tie_break_gate"], 0.0)
+        self.assertGreaterEqual(result["change_point_score"] + result["season_trend_score"], 0.0)
+        self.assertLessEqual(
+            result["change_point_score"] + result["season_trend_score"],
+            (2 * CHANGE_POINT_COMPONENT_SCORE_WEIGHT + SEASON_COMPONENT_SCORE_WEIGHT + TREND_COMPONENT_SCORE_WEIGHT)
+            * STRUCTURAL_TIE_BREAK_SCALE
+            + 1e-6,
+        )
 
     def test_reward_rejects_under_generation_against_ground_truth_length(self) -> None:
         ground_truth = (

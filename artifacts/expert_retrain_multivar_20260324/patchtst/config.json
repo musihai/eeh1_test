@@ -1,0 +1,29 @@
+{
+  "model_name": "PatchTST",
+  "d_model": 16,
+  "n_heads": 4,
+  "e_layers": 3,
+  "d_ff": 128,
+  "dropout": 0.3,
+  "patch_len": 16,
+  "stride": 8,
+  "batch_size": 128,
+  "learning_rate": 0.0001,
+  "epochs": 10,
+  "seq_len": 96,
+  "pred_len": 96,
+  "enc_in": 7,
+  "features": "MS",
+  "target": "OT",
+  "feature_columns": [
+    "HUFL",
+    "HULL",
+    "MUFL",
+    "MULL",
+    "LUFL",
+    "LULL",
+    "OT"
+  ],
+  "target_channel_index": 6,
+  "description": "PatchTST retrained on ETTh1 TRAIN split only with multivariate input (7 variables) and OT-target supervision."
+}

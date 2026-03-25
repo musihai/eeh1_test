@@ -115,6 +115,109 @@ class TestHighQualitySFTBuilder(unittest.TestCase):
         selected = select_curated_evaluations(evaluations, 4)
         self.assertEqual({item["best_model"] for item in selected}, {"arima", "patchtst", "itransformer", "chronos2"})
 
+    def test_select_curated_evaluations_can_balance_selected_prediction_model(self):
+        evaluations = [
+            {
+                "sample_index": idx,
+                "best_model": "patchtst",
+                "selected_prediction_model": model_name,
+                "selection_score": 0.99 - idx * 0.01,
+                "best_score": 0.99 - idx * 0.01,
+                "score_margin": 0.1,
+            }
+            for idx, model_name in enumerate(
+                [
+                    "patchtst",
+                    "patchtst",
+                    "itransformer",
+                    "itransformer",
+                    "arima",
+                    "arima",
+                    "chronos2",
+                    "chronos2",
+                ]
+            )
+        ]
+        selected = select_curated_evaluations(
+            evaluations,
+            4,
+            balance_key="selected_prediction_model",
+        )
+        self.assertEqual(
+            {item["selected_prediction_model"] for item in selected},
+            {"arima", "patchtst", "itransformer", "chronos2"},
+        )
+
+    def test_select_curated_evaluations_uses_selected_model_support_when_balancing_route_labels(self):
+        evaluations = [
+            {
+                "sample_index": 0,
+                "best_model": "patchtst",
+                "selected_prediction_model": "patchtst",
+                "selection_score": 0.95,
+                "best_score": 0.95,
+                "score_margin": 0.30,
+                "teacher_eval_scores": {
+                    "patchtst": 0.55,
+                    "itransformer": 0.70,
+                    "arima": 0.40,
+                    "chronos2": 0.35,
+                },
+            },
+            {
+                "sample_index": 1,
+                "best_model": "itransformer",
+                "selected_prediction_model": "patchtst",
+                "selection_score": 0.80,
+                "best_score": 0.80,
+                "score_margin": 0.10,
+                "teacher_eval_scores": {
+                    "patchtst": 0.72,
+                    "itransformer": 0.70,
+                    "arima": 0.40,
+                    "chronos2": 0.35,
+                },
+            },
+            {
+                "sample_index": 2,
+                "best_model": "itransformer",
+                "selected_prediction_model": "itransformer",
+                "selection_score": 0.79,
+                "best_score": 0.79,
+                "score_margin": 0.09,
+                "teacher_eval_scores": {
+                    "patchtst": 0.60,
+                    "itransformer": 0.73,
+                    "arima": 0.30,
+                    "chronos2": 0.28,
+                },
+            },
+            {
+                "sample_index": 3,
+                "best_model": "arima",
+                "selected_prediction_model": "arima",
+                "selection_score": 0.78,
+                "best_score": 0.78,
+                "score_margin": 0.08,
+                "teacher_eval_scores": {
+                    "patchtst": 0.50,
+                    "itransformer": 0.48,
+                    "arima": 0.66,
+                    "chronos2": 0.20,
+                },
+            },
+        ]
+
+        selected = select_curated_evaluations(
+            evaluations,
+            3,
+            balance_key="selected_prediction_model",
+        )
+
+        selected_indices = {item["sample_index"] for item in selected}
+        self.assertIn(1, selected_indices)
+        self.assertNotIn(0, selected_indices)
+
     def test_select_curated_evaluations_preserves_local_refine_quota(self):
         evaluations = [
             {
@@ -134,6 +237,69 @@ class TestHighQualitySFTBuilder(unittest.TestCase):
         )
         local_refine_count = sum(1 for item in selected if item["turn3_target_type"] == "local_refine")
         self.assertGreaterEqual(local_refine_count, 2)
+
+    def test_select_curated_evaluations_preserves_arima_plateau_keep_quota(self):
+        def _prediction_text(value: float, tail_repeat: int) -> str:
+            lines = []
+            for idx in range(96):
+                if idx >= 96 - tail_repeat:
+                    current = value
+                else:
+                    current = value + idx * 0.001
+                lines.append(f"2016-01-01 {idx % 24:02d}:00:00 {current:.4f}")
+            return "\n".join(lines)
+
+        evaluations = [
+            {
+                "sample_index": 0,
+                "best_model": "arima",
+                "selected_prediction_model": "arima",
+                "turn3_target_type": "validated_keep",
+                "teacher_prediction_text": _prediction_text(3.0, 32),
+                "selection_score": 0.70,
+                "best_score": 0.70,
+                "score_margin": 0.10,
+            },
+            {
+                "sample_index": 1,
+                "best_model": "arima",
+                "selected_prediction_model": "arima",
+                "turn3_target_type": "validated_keep",
+                "teacher_prediction_text": _prediction_text(4.0, 28),
+                "selection_score": 0.69,
+                "best_score": 0.69,
+                "score_margin": 0.10,
+            },
+            {
+                "sample_index": 2,
+                "best_model": "patchtst",
+                "selected_prediction_model": "patchtst",
+                "turn3_target_type": "validated_keep",
+                "teacher_prediction_text": _prediction_text(1.0, 1),
+                "selection_score": 0.95,
+                "best_score": 0.95,
+                "score_margin": 0.10,
+            },
+            {
+                "sample_index": 3,
+                "best_model": "itransformer",
+                "selected_prediction_model": "itransformer",
+                "turn3_target_type": "validated_keep",
+                "teacher_prediction_text": _prediction_text(2.0, 1),
+                "selection_score": 0.94,
+                "best_score": 0.94,
+                "score_margin": 0.10,
+            },
+        ]
+        selected = select_curated_evaluations(
+            evaluations,
+            4,
+            min_arima_validated_keep_plateau_ratio=0.50,
+            min_arima_validated_keep_plateau_tail_run=24,
+        )
+        selected_indices = {item["sample_index"] for item in selected}
+        self.assertIn(0, selected_indices)
+        self.assertIn(1, selected_indices)
 
     def test_process_split_writes_full_eval_and_curated_eval(self):
         records = [{"index": idx, "uid": f"sample-{idx}"} for idx in range(4)]
@@ -545,6 +711,8 @@ class TestHighQualitySFTBuilder(unittest.TestCase):
                 val_candidate_samples=4,
                 test_candidate_samples=0,
                 train_min_local_refine_ratio=0.30,
+                train_min_arima_validated_keep_plateau_ratio=0.0,
+                train_min_arima_validated_keep_plateau_tail_run=24,
                 max_concurrency=1,
                 num_workers=2,
                 local_batch_size=8,

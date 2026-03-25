@@ -2,6 +2,7 @@ import copy
 import json
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
@@ -23,6 +24,7 @@ from recipe.time_series_forecast.build_etth1_sft_dataset import (
     rebalance_train_routing_model_records,
     rebalance_train_stage_records,
     rebalance_train_turn3_targets,
+    repeat_priority_validated_keep_refinement_rows,
 )
 from recipe.time_series_forecast.diagnostic_policy import (
     FEATURE_TOOL_ORDER,
@@ -30,7 +32,6 @@ from recipe.time_series_forecast.diagnostic_policy import (
     select_feature_tool_names,
 )
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
-from recipe.time_series_forecast.utils import compact_prediction_tool_output_from_string
 from recipe.time_series_forecast.utils import parse_time_series_string
 
 
@@ -64,7 +65,7 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                 max_samples=1,
             )
 
-        expected_tool_names = list(FEATURE_TOOL_ORDER)
+        expected_tool_names = self._selected_feature_tools_for_sample(sample)
         first_row = dataframe.sort_values("turn_stage_order").iloc[0]
         self.assertEqual(list(first_row["selected_feature_tools"]), expected_tool_names)
         self.assertEqual(int(first_row["selected_feature_tool_count"]), len(expected_tool_names))
@@ -176,6 +177,8 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                 self.assertLessEqual(len(first_tool_calls), 5)
                 self.assertEqual(first_tool_calls[0]["function"]["name"], "extract_basic_statistics")
                 self.assertTrue(all(call["function"]["name"] != "predict_time_series" for call in first_tool_calls))
+                self.assertTrue(str(first_diag_messages[-1]["reasoning_content"]).strip())
+                self.assertIn("I will", first_diag_messages[-1]["reasoning_content"])
                 first_diag_tools = list(frame.iloc[0]["tools"])
                 self.assertEqual(
                     [tool["function"]["name"] for tool in first_diag_tools],
@@ -199,8 +202,16 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                 refinement_messages = frame.iloc[-1]["messages"]
                 self.assertEqual([msg["role"] for msg in refinement_messages], ["system", "user", "assistant"])
                 self.assertIn("### Prediction Tool Output", refinement_messages[1]["content"])
+                self.assertRegex(
+                    refinement_messages[1]["content"],
+                    r"### Prediction Tool Output\n\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -?\d+(?:\.\d+)?",
+                )
                 self.assertIn("<think>", refinement_messages[-1]["content"])
                 self.assertIn("<answer>", refinement_messages[-1]["content"])
+                self.assertRegex(
+                    refinement_messages[-1]["content"],
+                    r"<answer>\n\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -?\d+(?:\.\d+)?",
+                )
                 self.assertIsNone(frame.iloc[-1]["tools"])
                 self.assertEqual(frame.iloc[-1]["turn3_target_type"], "validated_keep")
                 self.assertEqual(frame.iloc[-1]["turn3_target_mode"], TURN3_TARGET_MODE_PAPER_STRICT)
@@ -242,6 +253,14 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             self.assertAlmostEqual(float(refinement_row["refine_gain_mse"]), 0.0, places=6)
             self.assertEqual(int(refinement_row["refine_changed_value_count"]), 0)
             self.assertEqual(int(refinement_row["refine_first_changed_index"]), -1)
+            self.assertRegex(
+                str(refinement_row["base_teacher_prediction_text"]).splitlines()[0],
+                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -?\d+(?:\.\d+)?$",
+            )
+            self.assertRegex(
+                str(refinement_row["refined_prediction_text"]).splitlines()[0],
+                r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -?\d+(?:\.\d+)?$",
+            )
 
     def test_convert_uses_cached_teacher_prediction_when_present(self):
         sample = self._load_base_sample()
@@ -262,13 +281,9 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
 
             refinement_row = dataframe.loc[dataframe["turn_stage"] == "refinement"].iloc[0]
             messages = refinement_row["messages"]
-            expected_tool_output = compact_prediction_tool_output_from_string(
-                sample["teacher_prediction_text"],
-                model_name=str(sample["reference_teacher_model"]),
-            )
             self.assertEqual(refinement_row["base_prediction_source"], "reference_teacher_cached")
             self.assertIn(
-                expected_tool_output,
+                str(sample["teacher_prediction_text"]),
                 messages[1]["content"],
             )
 
@@ -433,6 +448,7 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
 
         turn3_target = _build_turn3_target(
             sample=sample,
+            historical_data=str(sample["raw_prompt"][0]["content"]),
             history_values=[float(idx) for idx in range(128)],
             base_prediction_text=spike_prediction,
             forecast_horizon=96,
@@ -444,6 +460,14 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
         self.assertEqual(turn3_target["turn3_target_type"], "validated_keep")
         self.assertEqual(turn3_target["refine_ops_signature"], "none")
         self.assertEqual(int(turn3_target["refine_changed_value_count"]), 0)
+        self.assertRegex(
+            str(turn3_target["base_teacher_prediction_text"]).splitlines()[0],
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -?\d+(?:\.\d+)?$",
+        )
+        self.assertRegex(
+            str(turn3_target["refined_prediction_text"]).splitlines()[0],
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -?\d+(?:\.\d+)?$",
+        )
 
     def test_build_turn3_target_paper_strict_keeps_selected_forecast_even_with_refine_signal(self):
         sample = self._load_base_sample()
@@ -452,6 +476,7 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
 
         turn3_target = _build_turn3_target(
             sample=sample,
+            historical_data=str(sample["raw_prompt"][0]["content"]),
             history_values=[float(idx) for idx in range(128)],
             base_prediction_text=spike_prediction,
             forecast_horizon=96,
@@ -460,10 +485,149 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             turn3_target_mode=TURN3_TARGET_MODE_PAPER_STRICT,
         )
 
-        self.assertEqual(turn3_target["turn3_target_type"], "validated_keep")
-        self.assertEqual(turn3_target["refine_ops_signature"], "none")
-        self.assertEqual(float(turn3_target["refine_gain_mse"]), 0.0)
-        self.assertEqual(turn3_target["turn3_trigger_reason"], "evidence_consistent")
+        self.assertEqual(turn3_target["turn3_target_type"], "local_refine")
+        self.assertIn("isolated_spike_smoothing", turn3_target["refine_ops_signature"])
+        self.assertGreater(float(turn3_target["refine_gain_mse"]), 0.0)
+        self.assertGreater(int(turn3_target["refine_changed_value_count"]), 0)
+        self.assertRegex(
+            str(turn3_target["refined_prediction_text"]).splitlines()[0],
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -?\d+(?:\.\d+)?$",
+        )
+
+    def test_convert_builds_local_refine_target_for_spike_teacher_prediction_in_paper_strict_mode(self):
+        sample = self._load_base_sample()
+        sample["teacher_eval_score_margin"] = 0.01
+        sample["teacher_prediction_text"] = self._make_spike_teacher_prediction(sample)
+
+        async def fake_predict_with_runtime_tools(**kwargs):
+            self.assertIn(kwargs["model_name"], SUPPORTED_PREDICTION_MODELS)
+            return str(sample["teacher_prediction_text"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            jsonl_path = Path(tmpdir) / "spike_paper.jsonl"
+            parquet_path = Path(tmpdir) / "spike_paper.parquet"
+            jsonl_path.write_text(json.dumps(sample, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            with mock.patch(
+                "recipe.time_series_forecast.build_etth1_sft_dataset._predict_with_runtime_tools",
+                new=fake_predict_with_runtime_tools,
+            ):
+                dataframe = convert_jsonl_to_sft_parquet(
+                    input_path=jsonl_path,
+                    output_path=parquet_path,
+                    max_samples=1,
+                    turn3_target_mode=TURN3_TARGET_MODE_PAPER_STRICT,
+                )
+
+        refinement_row = dataframe.loc[dataframe["turn_stage"] == "refinement"].iloc[0]
+        self.assertEqual(refinement_row["turn3_target_mode"], TURN3_TARGET_MODE_PAPER_STRICT)
+        self.assertEqual(refinement_row["turn3_target_type"], "local_refine")
+        self.assertIn("isolated_spike_smoothing", refinement_row["refine_ops_signature"])
+        self.assertRegex(
+            str(refinement_row["messages"][-1]["content"]),
+            r"<answer>\n\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -?\d+(?:\.\d+)?",
+        )
+
+    def test_main_keeps_train_local_refine_ratio_enabled_in_paper_strict_mode(self):
+        def _protocol_messages() -> list[dict]:
+            return [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "user"},
+                {"role": "assistant", "content": "<think>\nkeep\n</think>\n<answer>\n1.0000\n</answer>"},
+            ]
+
+        def _make_df(turn3_target_type: str) -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {
+                        "sample_index": 0,
+                        "source_sample_index": 0,
+                        "turn_stage": "refinement",
+                        "turn_stage_order": 2,
+                        "forecast_horizon": 1,
+                        "messages": _protocol_messages(),
+                        "turn3_target_type": turn3_target_type,
+                        "reference_teacher_model": "patchtst",
+                        "selected_prediction_model": "patchtst",
+                        "turn3_trigger_reason": "evidence_consistent",
+                        "refine_ops_signature": "none",
+                        "selected_feature_tool_signature": "extract_basic_statistics",
+                        "routing_policy_source": "heuristic_rule_based",
+                        "base_prediction_source": "reference_teacher_cached",
+                    }
+                ]
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            train_jsonl = tmp_path / "train.jsonl"
+            val_jsonl = tmp_path / "val.jsonl"
+            train_jsonl.write_text("{}\n", encoding="utf-8")
+            val_jsonl.write_text("{}\n", encoding="utf-8")
+            output_dir = tmp_path / "out"
+
+            args = Namespace(
+                train_jsonl=str(train_jsonl),
+                val_jsonl=str(val_jsonl),
+                test_jsonl=str(tmp_path / "missing_test.jsonl"),
+                output_dir=str(output_dir),
+                max_train_samples=1,
+                max_val_samples=1,
+                max_test_samples=0,
+                turn3_target_mode=TURN3_TARGET_MODE_PAPER_STRICT,
+                train_min_local_refine_ratio=0.35,
+                train_stage_repeat_factors='{"diagnostic":1,"routing":1,"refinement":1}',
+                balance_train_routing_models=True,
+            )
+
+            captured_ratios: list[float] = []
+
+            def _fake_convert_jsonl_to_sft_parquet(*, input_path, output_path, max_samples=-1, turn3_target_mode=None):
+                if Path(input_path).name == "train.jsonl":
+                    return _make_df("local_refine")
+                return _make_df("validated_keep")
+
+            def _fake_rebalance_train_turn3_targets(dataframe, min_local_refine_ratio):
+                captured_ratios.append(float(min_local_refine_ratio))
+                return dataframe
+
+            with mock.patch("recipe.time_series_forecast.build_etth1_sft_dataset.parse_args", return_value=args):
+                with mock.patch(
+                    "recipe.time_series_forecast.build_etth1_sft_dataset.validate_sibling_metadata",
+                    return_value=(None, tmp_path / "metadata.json"),
+                ):
+                    with mock.patch(
+                        "recipe.time_series_forecast.build_etth1_sft_dataset.convert_jsonl_to_sft_parquet",
+                        side_effect=_fake_convert_jsonl_to_sft_parquet,
+                    ):
+                        with mock.patch(
+                            "recipe.time_series_forecast.build_etth1_sft_dataset.rebalance_train_turn3_targets",
+                            side_effect=_fake_rebalance_train_turn3_targets,
+                        ):
+                            with mock.patch(
+                                "recipe.time_series_forecast.build_etth1_sft_dataset.rebalance_train_routing_model_records",
+                                side_effect=lambda dataframe, enabled: dataframe,
+                            ):
+                                with mock.patch(
+                                    "recipe.time_series_forecast.build_etth1_sft_dataset.rebalance_train_stage_records",
+                                    side_effect=lambda dataframe, stage_repeat_factors: dataframe,
+                                ):
+                                    with mock.patch(
+                                        "recipe.time_series_forecast.build_etth1_sft_dataset._validate_paper_turn3_protocol",
+                                        return_value={"turn3_protocol_checked_count": 1, "turn3_protocol_invalid_count": 0},
+                                    ):
+                                        with mock.patch(
+                                            "recipe.time_series_forecast.build_etth1_sft_dataset.write_metadata_file",
+                                        ) as mock_write_metadata:
+                                            from recipe.time_series_forecast.build_etth1_sft_dataset import main
+
+                                            main()
+
+            self.assertEqual(captured_ratios, [0.35])
+            metadata_kwargs = mock_write_metadata.call_args.args[1]
+            self.assertEqual(metadata_kwargs["turn3_target_mode"], TURN3_TARGET_MODE_PAPER_STRICT)
+            self.assertAlmostEqual(metadata_kwargs["train_min_local_refine_ratio"], 0.35, places=6)
+            self.assertAlmostEqual(metadata_kwargs["requested_train_min_local_refine_ratio"], 0.35, places=6)
 
     def test_select_prediction_model_by_heuristic_returns_supported_model_and_reason(self):
         sample = self._load_base_sample()
@@ -556,6 +720,65 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
         self.assertEqual(len(balanced), 4)
         grouped_counts = balanced.groupby("source_sample_index").size().to_dict()
         self.assertEqual(grouped_counts, {10: 2, 11: 2})
+
+    def test_rebalance_prioritizes_arima_validated_keep_flat_tail_examples(self):
+        def _timestamp_line(idx: int, value: float) -> str:
+            day = 20 + idx // 24
+            hour = idx % 24
+            return f"2026-03-{day:02d} {hour:02d}:00:00 {value:.4f}"
+
+        plateau_prediction = "\n".join(
+            _timestamp_line(idx, 2.5) for idx in range(96)
+        )
+        varied_prediction = "\n".join(
+            _timestamp_line(idx, 2.0 + idx / 100.0) for idx in range(96)
+        )
+        dataframe = pd.DataFrame(
+            [
+                {"sample_index": 0, "source_sample_index": 1, "turn_stage": "diagnostic", "turn_stage_order": 0, "turn3_target_type": "local_refine"},
+                {"sample_index": 1, "source_sample_index": 1, "turn_stage": "refinement", "turn_stage_order": 1, "turn3_target_type": "local_refine", "selected_prediction_model": "patchtst", "base_teacher_prediction_text": varied_prediction},
+                {"sample_index": 2, "source_sample_index": 2, "turn_stage": "diagnostic", "turn_stage_order": 0, "turn3_target_type": "validated_keep"},
+                {"sample_index": 3, "source_sample_index": 2, "turn_stage": "refinement", "turn_stage_order": 1, "turn3_target_type": "validated_keep", "selected_prediction_model": "arima", "base_teacher_prediction_text": plateau_prediction},
+                {"sample_index": 4, "source_sample_index": 3, "turn_stage": "diagnostic", "turn_stage_order": 0, "turn3_target_type": "validated_keep"},
+                {"sample_index": 5, "source_sample_index": 3, "turn_stage": "refinement", "turn_stage_order": 1, "turn3_target_type": "validated_keep", "selected_prediction_model": "patchtst", "base_teacher_prediction_text": varied_prediction},
+                {"sample_index": 6, "source_sample_index": 4, "turn_stage": "diagnostic", "turn_stage_order": 0, "turn3_target_type": "validated_keep"},
+                {"sample_index": 7, "source_sample_index": 4, "turn_stage": "refinement", "turn_stage_order": 1, "turn3_target_type": "validated_keep", "selected_prediction_model": "patchtst", "base_teacher_prediction_text": varied_prediction},
+            ]
+        )
+
+        balanced = rebalance_train_turn3_targets(dataframe, min_local_refine_ratio=0.5)
+
+        self.assertEqual(sorted(balanced["source_sample_index"].unique().tolist()), [1, 2])
+        kept_refine = balanced.loc[balanced["turn_stage"] == "refinement"].sort_values("source_sample_index")
+        self.assertEqual(kept_refine["selected_prediction_model"].tolist(), ["patchtst", "arima"])
+
+    def test_repeat_priority_validated_keep_refinement_rows_duplicates_only_priority_refinement(self):
+        def _timestamp_line(idx: int, value: float) -> str:
+            day = 20 + idx // 24
+            hour = idx % 24
+            return f"2026-03-{day:02d} {hour:02d}:00:00 {value:.4f}"
+
+        plateau_prediction = "\n".join(_timestamp_line(idx, 2.5) for idx in range(96))
+        varied_prediction = "\n".join(_timestamp_line(idx, 2.0 + idx / 100.0) for idx in range(96))
+        dataframe = pd.DataFrame(
+            [
+                {"sample_index": 0, "source_sample_index": 2, "turn_stage": "diagnostic", "turn_stage_order": 0, "turn3_target_type": "validated_keep"},
+                {"sample_index": 1, "source_sample_index": 2, "turn_stage": "routing", "turn_stage_order": 1, "turn3_target_type": "validated_keep", "selected_prediction_model": "arima"},
+                {"sample_index": 2, "source_sample_index": 2, "turn_stage": "refinement", "turn_stage_order": 2, "turn3_target_type": "validated_keep", "selected_prediction_model": "arima", "base_teacher_prediction_text": plateau_prediction},
+                {"sample_index": 3, "source_sample_index": 3, "turn_stage": "refinement", "turn_stage_order": 2, "turn3_target_type": "validated_keep", "selected_prediction_model": "patchtst", "base_teacher_prediction_text": varied_prediction},
+            ]
+        )
+
+        repeated = repeat_priority_validated_keep_refinement_rows(
+            dataframe,
+            repeat_factor=3,
+        )
+
+        repeated_refine = repeated.loc[repeated["turn_stage"] == "refinement"]
+        self.assertEqual(
+            repeated_refine["selected_prediction_model"].astype(str).value_counts().to_dict(),
+            {"arima": 3, "patchtst": 1},
+        )
 
 
 if __name__ == "__main__":

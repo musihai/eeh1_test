@@ -9,7 +9,7 @@ import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import pandas as pd
 import torch
@@ -108,12 +108,18 @@ def prepare_teacher_sample(sample: dict[str, Any]) -> dict[str, Any]:
         historical_data,
         series_id=data_source,
         target_column=target_column,
+        include_covariates=True,
     )
     timestamps = [
         ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, pd.Timestamp) else str(ts)
         for ts in context_df["timestamp"]
     ]
     values = [float(value) for value in context_df["target"].tolist()]
+    feature_columns = list(context_df.attrs.get("feature_columns") or [target_column])
+    if len(feature_columns) > 1:
+        model_input_values = context_df.loc[:, feature_columns].astype(float).values.tolist()
+    else:
+        model_input_values = [float(value) for value in context_df[feature_columns[0]].tolist()]
     series_id = str(context_df["id"].iloc[0]) if "id" in context_df.columns else "series_0"
     return {
         "sample_index": int(sample.get("index", -1)),
@@ -123,6 +129,9 @@ def prepare_teacher_sample(sample: dict[str, Any]) -> dict[str, Any]:
         "last_timestamp": get_last_timestamp(historical_data),
         "timestamps": timestamps,
         "values": values,
+        "model_input_values": model_input_values,
+        "feature_columns": feature_columns,
+        "target_column": target_column,
         "series_id": series_id,
         "curriculum_stage": sample.get("curriculum_stage"),
         "curriculum_band": sample.get("curriculum_band"),
@@ -137,10 +146,12 @@ def build_predict_request_from_prepared(
 ) -> Any:
     return model_server.PredictRequest(
         timestamps=list(prepared_sample["timestamps"]),
-        values=list(prepared_sample["values"]),
+        values=list(prepared_sample.get("model_input_values", prepared_sample["values"])),
         series_id=str(prepared_sample.get("series_id") or "series_0"),
         prediction_length=int(prepared_sample["forecast_horizon"]),
         model_name=model_name,
+        feature_columns=list(prepared_sample.get("feature_columns") or []),
+        target_column=str(prepared_sample.get("target_column") or "OT"),
     )
 
 
@@ -447,10 +458,16 @@ class LocalTeacherPredictor:
                 ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, pd.Timestamp) else str(ts)
                 for ts in context_df["timestamp"]
             ],
-            values=[float(value) for value in context_df["target"].tolist()],
+            values=(
+                context_df.loc[:, context_df.attrs["feature_columns"]].astype(float).values.tolist()
+                if len(list(context_df.attrs.get("feature_columns") or [])) > 1
+                else [float(value) for value in context_df["target"].tolist()]
+            ),
             series_id=str(context_df["id"].iloc[0]) if "id" in context_df.columns else "series_0",
             prediction_length=prediction_length,
             model_name=model_name,
+            feature_columns=list(context_df.attrs.get("feature_columns") or []),
+            target_column=str(context_df.attrs.get("target_column") or "OT"),
         )
 
         loop = asyncio.get_event_loop()
@@ -528,6 +545,7 @@ async def evaluate_teacher_for_sample(
         historical_data,
         series_id=data_source,
         target_column=target_column,
+        include_covariates=True,
     )
     last_timestamp = get_last_timestamp(historical_data)
 
@@ -762,7 +780,10 @@ def evaluate_local_samples(
 ) -> list[dict[str, Any]]:
     prepared_samples = [prepare_teacher_sample(sample) for sample in samples]
     evaluations: list[dict[str, Any]] = []
-    for prepared_chunk in chunked(prepared_samples, local_batch_size):
+    prepared_chunks = chunked(prepared_samples, local_batch_size)
+    total_chunks = len(prepared_chunks)
+    progress_every = max(1, total_chunks // 10)
+    for chunk_index, prepared_chunk in enumerate(prepared_chunks, start=1):
         evaluations.extend(
             evaluate_prepared_chunk_local(
                 prepared_chunk,
@@ -770,6 +791,16 @@ def evaluate_local_samples(
                 predictor=predictor,
             )
         )
+        if (
+            chunk_index == 1
+            or chunk_index == total_chunks
+            or chunk_index % progress_every == 0
+        ):
+            processed = min(chunk_index * local_batch_size, len(prepared_samples))
+            print(
+                f"[HQ-SFT local] processed_samples={processed}/{len(prepared_samples)} "
+                f"chunks={chunk_index}/{total_chunks}"
+            )
     return evaluations
 
 
@@ -842,10 +873,19 @@ def evaluate_local_samples_multiprocess(
 def _select_bucketed_evaluations(
     evaluations: Sequence[dict[str, Any]],
     target_count: int,
+    *,
+    rank_fn: Callable[[dict[str, Any]], tuple[float, float, float]] | None = None,
 ) -> list[dict[str, Any]]:
     if target_count <= 0 or len(evaluations) <= target_count:
         return sorted(evaluations, key=lambda item: int(item["sample_index"]))
 
+    effective_rank_fn = rank_fn or (
+        lambda item: (
+            float(item["selection_score"]),
+            float(item["best_score"]),
+            float(item["score_margin"]),
+        )
+    )
     ordered = sorted(evaluations, key=lambda item: int(item["sample_index"]))
     selected: list[dict[str, Any]] = []
 
@@ -853,14 +893,7 @@ def _select_bucketed_evaluations(
         start = math.floor(bucket_idx * len(ordered) / target_count)
         end = math.floor((bucket_idx + 1) * len(ordered) / target_count)
         bucket = ordered[start:max(end, start + 1)]
-        best = max(
-            bucket,
-            key=lambda item: (
-                float(item["selection_score"]),
-                float(item["best_score"]),
-                float(item["score_margin"]),
-            ),
-        )
+        best = max(bucket, key=effective_rank_fn)
         selected.append(best)
 
     deduped: dict[int, dict[str, Any]] = {}
@@ -871,15 +904,7 @@ def _select_bucketed_evaluations(
             deduped[sample_index] = item
 
     if len(deduped) < target_count:
-        for item in sorted(
-            ordered,
-            key=lambda current: (
-                float(current["selection_score"]),
-                float(current["best_score"]),
-                float(current["score_margin"]),
-            ),
-            reverse=True,
-        ):
+        for item in sorted(ordered, key=effective_rank_fn, reverse=True):
             sample_index = int(item["sample_index"])
             if sample_index not in deduped:
                 deduped[sample_index] = item
@@ -890,21 +915,71 @@ def _select_bucketed_evaluations(
     return sorted(final_items, key=lambda item: int(item["sample_index"]))
 
 
+def _selected_model_support_rank(
+    item: dict[str, Any],
+) -> tuple[float, float, float]:
+    selected_model = str(item.get("selected_prediction_model") or "").strip().lower()
+    if not selected_model:
+        return (
+            float(item.get("selection_score", 0.0)),
+            float(item.get("best_score", 0.0)),
+            float(item.get("score_margin", 0.0)),
+        )
+
+    scores = item.get("teacher_eval_scores") or item.get("model_scores") or {}
+    if selected_model not in scores:
+        return (
+            float(item.get("selection_score", 0.0)),
+            float(item.get("best_score", 0.0)),
+            float(item.get("score_margin", 0.0)),
+        )
+
+    selected_score = float(scores[selected_model])
+    runner_up_score = max(
+        (
+            float(score)
+            for model_name, score in scores.items()
+            if str(model_name).strip().lower() != selected_model
+        ),
+        default=selected_score,
+    )
+    support_margin = selected_score - runner_up_score
+    return (
+        support_margin,
+        selected_score,
+        float(item.get("selection_score", 0.0)),
+    )
+
+
+def _curation_rank_tuple(
+    item: dict[str, Any],
+    *,
+    balance_key: str | None,
+) -> tuple[float, float, float]:
+    if str(balance_key or "").strip().lower() == "selected_prediction_model":
+        return _selected_model_support_rank(item)
+    return (
+        float(item.get("selection_score", 0.0)),
+        float(item.get("best_score", 0.0)),
+        float(item.get("score_margin", 0.0)),
+    )
+
+
 def _select_curated_evaluations_by_model_balance(
     evaluations: Sequence[dict[str, Any]],
     target_count: int,
     *,
-    balance_by_best_model: bool,
+    balance_key: str | None,
 ) -> list[dict[str, Any]]:
     if target_count <= 0 or len(evaluations) <= target_count:
         return sorted(evaluations, key=lambda item: int(item["sample_index"]))
 
-    if not balance_by_best_model:
+    if not balance_key:
         return _select_bucketed_evaluations(evaluations, target_count)
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item in evaluations:
-        model_name = str(item.get("best_model") or "").strip().lower()
+        model_name = str(item.get(balance_key) or "").strip().lower()
         if not model_name:
             return _select_bucketed_evaluations(evaluations, target_count)
         grouped.setdefault(model_name, []).append(item)
@@ -918,7 +993,15 @@ def _select_curated_evaluations_by_model_balance(
 
     if base_quota > 0:
         for model_name in present_models:
-            for item in _select_bucketed_evaluations(grouped[model_name], base_quota):
+            rank_fn = lambda item, *, _balance_key=balance_key: _curation_rank_tuple(
+                item,
+                balance_key=_balance_key,
+            )
+            for item in _select_bucketed_evaluations(
+                grouped[model_name],
+                base_quota,
+                rank_fn=rank_fn,
+            ):
                 selected_by_index[int(item["sample_index"])] = item
 
     remaining_target = max(0, target_count - len(selected_by_index))
@@ -928,54 +1011,149 @@ def _select_curated_evaluations_by_model_balance(
             for item in evaluations
             if int(item["sample_index"]) not in selected_by_index
         ]
-        for item in _select_bucketed_evaluations(remaining_pool, remaining_target):
+        rank_fn = lambda item, *, _balance_key=balance_key: _curation_rank_tuple(
+            item,
+            balance_key=_balance_key,
+        )
+        for item in _select_bucketed_evaluations(
+            remaining_pool,
+            remaining_target,
+            rank_fn=rank_fn,
+        ):
             selected_by_index[int(item["sample_index"])] = item
 
     final_items = list(selected_by_index.values())[:target_count]
     return sorted(final_items, key=lambda item: int(item["sample_index"]))
 
 
+def _prediction_tail_run_length(text: str, *, rounded_decimals: int = 4) -> int:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    values: list[str] = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            values.append(f"{float(parts[-1]):.{rounded_decimals}f}")
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return 0
+    tail_value = values[-1]
+    tail_run = 0
+    for value in reversed(values):
+        if value != tail_value:
+            break
+        tail_run += 1
+    return tail_run
+
+
+def _is_arima_validated_keep_plateau(item: dict[str, Any], *, min_tail_run: int) -> bool:
+    if str(item.get("selected_prediction_model") or "").strip().lower() != "arima":
+        return False
+    if str(item.get("turn3_target_type") or "").strip().lower() != "validated_keep":
+        return False
+    prediction_text = (
+        item.get("teacher_prediction_text")
+        or item.get("reference_teacher_prediction_text")
+        or ""
+    )
+    return _prediction_tail_run_length(str(prediction_text), rounded_decimals=4) >= int(min_tail_run)
+
+
 def select_curated_evaluations(
     evaluations: Sequence[dict[str, Any]],
     target_count: int,
     *,
-    balance_by_best_model: bool = True,
+    balance_key: str | None = "best_model",
     min_local_refine_ratio: float = 0.0,
+    min_arima_validated_keep_plateau_ratio: float = 0.0,
+    min_arima_validated_keep_plateau_tail_run: int = 24,
 ) -> list[dict[str, Any]]:
     if target_count <= 0 or len(evaluations) <= target_count:
         return sorted(evaluations, key=lambda item: int(item["sample_index"]))
 
+    selected_by_index: dict[int, dict[str, Any]] = {}
+
+    plateau_target = 0
+    if min_arima_validated_keep_plateau_ratio > 0:
+        plateau_pool = [
+            item
+            for item in evaluations
+            if _is_arima_validated_keep_plateau(
+                item,
+                min_tail_run=min_arima_validated_keep_plateau_tail_run,
+            )
+        ]
+        plateau_target = int(math.ceil(target_count * min_arima_validated_keep_plateau_ratio))
+        plateau_target = min(plateau_target, len(plateau_pool), target_count)
+        if plateau_target > 0:
+            for item in _select_curated_evaluations_by_model_balance(
+                plateau_pool,
+                plateau_target,
+                balance_key=None,
+            ):
+                selected_by_index[int(item["sample_index"])] = item
+
     if min_local_refine_ratio <= 0:
-        return _select_curated_evaluations_by_model_balance(
-            evaluations,
-            target_count,
-            balance_by_best_model=balance_by_best_model,
-        )
+        remaining_target = max(0, target_count - len(selected_by_index))
+        if remaining_target <= 0:
+            final_items = list(selected_by_index.values())[:target_count]
+            return sorted(final_items, key=lambda item: int(item["sample_index"]))
+        remaining_pool = [
+            item
+            for item in evaluations
+            if int(item["sample_index"]) not in selected_by_index
+        ]
+        for item in _select_curated_evaluations_by_model_balance(
+            remaining_pool,
+            remaining_target,
+            balance_key=balance_key,
+        ):
+            selected_by_index[int(item["sample_index"])] = item
+        final_items = list(selected_by_index.values())[:target_count]
+        return sorted(final_items, key=lambda item: int(item["sample_index"]))
 
     local_refine_pool = [
-        item for item in evaluations if str(item.get("turn3_target_type") or "") == "local_refine"
+        item
+        for item in evaluations
+        if str(item.get("turn3_target_type") or "") == "local_refine"
+        and int(item["sample_index"]) not in selected_by_index
     ]
     if not local_refine_pool:
         return _select_curated_evaluations_by_model_balance(
-            evaluations,
-            target_count,
-            balance_by_best_model=balance_by_best_model,
+            [
+                item
+                for item in evaluations
+                if int(item["sample_index"]) not in selected_by_index
+            ],
+            max(0, target_count - len(selected_by_index)),
+            balance_key=balance_key,
         )
 
     local_refine_target = int(math.ceil(target_count * min_local_refine_ratio))
-    local_refine_target = min(local_refine_target, len(local_refine_pool), target_count)
+    local_refine_target = min(local_refine_target, len(local_refine_pool), max(0, target_count - len(selected_by_index)))
     if local_refine_target <= 0:
-        return _select_curated_evaluations_by_model_balance(
-            evaluations,
-            target_count,
-            balance_by_best_model=balance_by_best_model,
-        )
+        remaining_target = max(0, target_count - len(selected_by_index))
+        if remaining_target > 0:
+            remaining_pool = [
+                item
+                for item in evaluations
+                if int(item["sample_index"]) not in selected_by_index
+            ]
+            for item in _select_curated_evaluations_by_model_balance(
+                remaining_pool,
+                remaining_target,
+                balance_key=balance_key,
+            ):
+                selected_by_index[int(item["sample_index"])] = item
+        final_items = list(selected_by_index.values())[:target_count]
+        return sorted(final_items, key=lambda item: int(item["sample_index"]))
 
-    selected_by_index: dict[int, dict[str, Any]] = {}
     for item in _select_curated_evaluations_by_model_balance(
         local_refine_pool,
         local_refine_target,
-        balance_by_best_model=balance_by_best_model,
+        balance_key=balance_key,
     ):
         selected_by_index[int(item["sample_index"])] = item
 
@@ -989,7 +1167,7 @@ def select_curated_evaluations(
         for item in _select_curated_evaluations_by_model_balance(
             remaining_pool,
             remaining_target,
-            balance_by_best_model=balance_by_best_model,
+            balance_key=balance_key,
         ):
             selected_by_index[int(item["sample_index"])] = item
 
@@ -1111,6 +1289,8 @@ def process_split(
     local_batch_size: int = 32,
     resume_eval: bool = True,
     train_min_local_refine_ratio: float = 0.0,
+    train_min_arima_validated_keep_plateau_ratio: float = 0.0,
+    train_min_arima_validated_keep_plateau_tail_run: int = 24,
     max_turn3_annotation_error_count: int = 0,
     max_turn3_annotation_error_ratio: float = 0.0,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -1247,8 +1427,12 @@ def process_split(
     selected_evaluations = select_curated_evaluations(
         annotated_candidate_evaluations,
         target_count,
-        balance_by_best_model=True,
+        balance_key="selected_prediction_model" if split_name == "train" else "best_model",
         min_local_refine_ratio=float(train_min_local_refine_ratio) if split_name == "train" else 0.0,
+        min_arima_validated_keep_plateau_ratio=float(train_min_arima_validated_keep_plateau_ratio)
+        if split_name == "train"
+        else 0.0,
+        min_arima_validated_keep_plateau_tail_run=int(train_min_arima_validated_keep_plateau_tail_run),
     )
     selected_indices = {int(item["sample_index"]) for item in selected_evaluations}
     selected_records = [
@@ -1316,8 +1500,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-min-local-refine-ratio",
         type=float,
-        default=0.30,
+        default=0.25,
         help="Minimum desired local_refine ratio in train parquet. Set <=0 to disable train rebalancing.",
+    )
+    parser.add_argument(
+        "--train-min-arima-validated-keep-plateau-ratio",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum desired ratio of train curated samples reserved for "
+            "validated_keep + arima + long rounded plateau-tail forecasts. "
+            "Set <=0 to disable this coverage quota."
+        ),
+    )
+    parser.add_argument(
+        "--train-min-arima-validated-keep-plateau-tail-run",
+        type=int,
+        default=24,
+        help="Minimum rounded tail run length used to identify plateau-tail arima validated_keep cases.",
     )
     parser.add_argument(
         "--max-turn3-annotation-error-count",
@@ -1478,6 +1678,12 @@ def main() -> None:
                 local_batch_size=args.local_batch_size,
                 resume_eval=bool(args.resume_teacher_eval),
                 train_min_local_refine_ratio=float(args.train_min_local_refine_ratio),
+                train_min_arima_validated_keep_plateau_ratio=float(
+                    args.train_min_arima_validated_keep_plateau_ratio
+                ),
+                train_min_arima_validated_keep_plateau_tail_run=int(
+                    args.train_min_arima_validated_keep_plateau_tail_run
+                ),
                 max_turn3_annotation_error_count=int(args.max_turn3_annotation_error_count),
                 max_turn3_annotation_error_ratio=float(args.max_turn3_annotation_error_ratio),
                 model_service_url=args.model_service_url,
@@ -1510,12 +1716,21 @@ def main() -> None:
             for record in curated_records:
                 teacher = str(record.get("reference_teacher_model") or "unknown")
                 teacher_distribution[teacher] = teacher_distribution.get(teacher, 0) + 1
+            selected_prediction_model_distribution: dict[str, int] = {}
+            for record in curated_records:
+                selected_model = str(record.get("selected_prediction_model") or "unknown")
+                selected_prediction_model_distribution[selected_model] = (
+                    selected_prediction_model_distribution.get(selected_model, 0) + 1
+                )
 
             metadata[f"{split_name}_samples"] = len(parquet_df)
             metadata[f"{split_name}_teacher_eval_records"] = len(full_evaluations)
             metadata[f"{split_name}_eval_samples"] = min(eval_count, len(records)) if eval_count > 0 else len(records)
             metadata[f"{split_name}_candidate_samples"] = min(candidate_count, len(records))
             metadata[f"{split_name}_teacher_distribution"] = teacher_distribution
+            metadata[f"{split_name}_selected_prediction_model_distribution"] = (
+                selected_prediction_model_distribution
+            )
             metadata[f"source_{split_name}_jsonl"] = str(path)
             metadata[f"{split_name}_turn3_annotation_error_count"] = annotation_summary["turn3_annotation_error_count"]
             metadata[f"{split_name}_turn3_annotation_error_ratio"] = annotation_summary["turn3_annotation_error_ratio"]
@@ -1525,6 +1740,12 @@ def main() -> None:
                 if split_name == "train":
                     metadata["train_samples_before_balance"] = len(parquet_df_raw)
                     metadata["train_min_local_refine_ratio"] = float(args.train_min_local_refine_ratio)
+                    metadata["train_min_arima_validated_keep_plateau_ratio"] = float(
+                        args.train_min_arima_validated_keep_plateau_ratio
+                    )
+                    metadata["train_min_arima_validated_keep_plateau_tail_run"] = int(
+                        args.train_min_arima_validated_keep_plateau_tail_run
+                    )
                     metadata["train_turn3_target_type_distribution_before_balance"] = distribution_from_series(
                         parquet_df_raw["turn3_target_type"]
                     )

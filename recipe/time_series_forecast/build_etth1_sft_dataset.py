@@ -26,10 +26,13 @@ from recipe.time_series_forecast.dataset_identity import (
     validate_sibling_metadata,
 )
 from recipe.time_series_forecast.dataset_file_utils import write_metadata_file
-from recipe.time_series_forecast.diagnostic_policy import plan_diagnostic_tool_batches, select_feature_tool_names
+from recipe.time_series_forecast.diagnostic_policy import (
+    build_diagnostic_plan,
+    plan_diagnostic_tool_batches,
+    select_feature_tool_names,
+)
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
 from recipe.time_series_forecast.utils import (
-    compact_prediction_tool_output_from_string,
     extract_basic_statistics,
     extract_data_quality,
     extract_event_summary,
@@ -63,6 +66,7 @@ DEFAULT_VAL_JSONL = DEFAULT_CURATED_INPUT_DIR / "val_curated.jsonl"
 DEFAULT_TEST_JSONL = DEFAULT_CURATED_INPUT_DIR / "test_curated.jsonl"
 DEFAULT_TRAIN_STAGE_REPEAT_FACTORS = {"diagnostic": 1, "routing": 1, "refinement": 1}
 DEFAULT_BALANCE_TRAIN_ROUTING_MODELS = True
+DEFAULT_TRAIN_PRIORITY_VALIDATED_KEEP_REPEAT_FACTOR = 1
 
 
 @dataclass(frozen=True)
@@ -403,6 +407,7 @@ async def _predict_with_runtime_tools(
         historical_data,
         series_id=data_source or "ETTh1",
         target_column=target_column,
+        include_covariates=True,
     )
     pred_df = await predict_time_series_async(
         context_df,
@@ -461,8 +466,53 @@ def _require_prediction_values(prediction_text: str, forecast_horizon: int, *, s
     return values
 
 
-def _prediction_text_from_values(values: list[float]) -> str:
-    return "\n".join(f"{float(v):.4f}" for v in values)
+def _canonical_prediction_text(
+    prediction_text: str,
+    forecast_horizon: int,
+    *,
+    history_text: str,
+) -> str:
+    timestamps, values = parse_time_series_string(prediction_text)
+    if len(values) < forecast_horizon:
+        raise ValueError(
+            f"prediction_text length must equal forecast_horizon={forecast_horizon}, got {len(values)}"
+        )
+
+    normalized_values = [float(value) for value in values[:forecast_horizon]]
+    normalized_timestamps = [str(ts).strip() for ts in timestamps[:forecast_horizon]]
+    if len(normalized_timestamps) == forecast_horizon and all(normalized_timestamps):
+        return "\n".join(
+            f"{normalized_timestamps[idx]} {normalized_values[idx]:.4f}"
+            for idx in range(forecast_horizon)
+        )
+
+    pred_df = pd.DataFrame({"target_0.5": normalized_values})
+    return format_predictions_to_string(
+        pred_df,
+        last_timestamp=get_last_timestamp(history_text),
+    )
+
+
+def _prediction_text_from_values(
+    values: list[float],
+    *,
+    reference_prediction_text: str,
+    history_text: str,
+) -> str:
+    forecast_horizon = len(values)
+    reference_timestamps, _reference_values = parse_time_series_string(reference_prediction_text)
+    normalized_timestamps = [str(ts).strip() for ts in reference_timestamps[:forecast_horizon]]
+    if len(normalized_timestamps) == forecast_horizon and all(normalized_timestamps):
+        return "\n".join(
+            f"{normalized_timestamps[idx]} {float(values[idx]):.4f}"
+            for idx in range(forecast_horizon)
+        )
+
+    pred_df = pd.DataFrame({"target_0.5": [float(value) for value in values]})
+    return format_predictions_to_string(
+        pred_df,
+        last_timestamp=get_last_timestamp(history_text),
+    )
 
 
 def _feature_tool_signature(selected_feature_tools: list[str]) -> str:
@@ -728,6 +778,7 @@ def _is_meaningful_local_refine(
 def _build_turn3_target(
     *,
     sample: dict[str, Any],
+    historical_data: str,
     history_values: list[float],
     base_prediction_text: str,
     forecast_horizon: int,
@@ -745,18 +796,6 @@ def _build_turn3_target(
         )
     ground_truth_values = ground_truth_values[:forecast_horizon]
     best_delta_summary = _summarize_refine_delta(base_values, base_values)
-    if turn3_target_mode == TURN3_TARGET_MODE_PAPER_STRICT:
-        return {
-            "turn3_target_type": "validated_keep",
-            "refine_ops": [],
-            "refine_ops_signature": "none",
-            "refine_gain_mse": 0.0,
-            "refine_gain_mae": 0.0,
-            "turn3_trigger_reason": "evidence_consistent",
-            "base_teacher_prediction_text": _prediction_text_from_values(base_values),
-            "refined_prediction_text": _prediction_text_from_values(base_values),
-            **best_delta_summary,
-        }
 
     score_margin = float(sample.get("teacher_eval_score_margin", 0.0) or 0.0)
     candidate_refinements = _generate_local_refinement_candidates(base_values, history_values)
@@ -810,8 +849,16 @@ def _build_turn3_target(
         "refine_gain_mse": refine_gain_mse,
         "refine_gain_mae": refine_gain_mae,
         "turn3_trigger_reason": trigger_reason,
-        "base_teacher_prediction_text": _prediction_text_from_values(base_values),
-        "refined_prediction_text": _prediction_text_from_values(best_values),
+        "base_teacher_prediction_text": _prediction_text_from_values(
+            base_values,
+            reference_prediction_text=base_prediction_text,
+            history_text=historical_data,
+        ),
+        "refined_prediction_text": _prediction_text_from_values(
+            best_values,
+            reference_prediction_text=base_prediction_text,
+            history_text=historical_data,
+        ),
         **best_delta_summary,
     }
 
@@ -833,6 +880,22 @@ def _format_refine_ops_for_reflection(refine_ops: list[str]) -> str:
     if len(phrases) == 2:
         return f"{phrases[0]} and {phrases[1]}"
     return ", ".join(phrases[:-1]) + f", and {phrases[-1]}"
+
+
+def _build_diagnostic_reflection(
+    *,
+    plan_reason: str,
+    batch_tool_names: Sequence[str],
+    completed_feature_tools: Sequence[str],
+) -> str:
+    tool_text = ", ".join(str(name) for name in batch_tool_names if str(name).strip()) or "extract_basic_statistics"
+    completed_text = ", ".join(str(name) for name in completed_feature_tools if str(name).strip())
+    if completed_text:
+        return (
+            f"{str(plan_reason or '').strip()} I already completed {completed_text}, so I now call {tool_text} "
+            "to finish the planned diagnostic evidence before routing."
+        ).strip()
+    return f"{str(plan_reason or '').strip()} I start by calling {tool_text}.".strip()
 
 
 def _format_phrase_list(phrases: Sequence[str]) -> str:
@@ -1085,7 +1148,7 @@ def _build_routing_comparison_text(*, model_name: str, runner_up_name: str) -> s
 
 
 def build_final_answer(
-    prediction_values: list[float],
+    prediction_text: str,
     *,
     turn3_target_type: str,
     model_name: str,
@@ -1105,7 +1168,7 @@ def build_final_answer(
 
     return (
         f"<think>\n{reflection}\n</think>\n"
-        f"<answer>\n{_prediction_text_from_values(prediction_values)}\n</answer>"
+        f"<answer>\n{prediction_text}\n</answer>"
     )
 
 
@@ -1190,7 +1253,8 @@ def build_sft_records(
     if not history_values:
         raise ValueError("No valid ETTh1 values found in raw_prompt")
 
-    selected_feature_tools = select_feature_tool_names(history_values)
+    diagnostic_plan = build_diagnostic_plan(history_values)
+    selected_feature_tools = list(diagnostic_plan.tool_names)
     feature_results = build_feature_tool_results(history_values, tool_names=selected_feature_tools)
     feature_result_by_name = {result.tool_name: result for result in feature_results}
     diagnostic_tool_batches = plan_diagnostic_tool_batches(selected_feature_tools, max_parallel_calls=5)
@@ -1240,6 +1304,7 @@ def build_sft_records(
 
     turn3_target = _build_turn3_target(
         sample=sample,
+        historical_data=historical_data,
         history_values=history_values,
         base_prediction_text=base_prediction_text,
         forecast_horizon=forecast_horizon,
@@ -1247,15 +1312,15 @@ def build_sft_records(
         selected_feature_tools=selected_feature_tools,
         turn3_target_mode=turn3_target_mode,
     )
-    final_prediction_values = _require_prediction_values(
+    _require_prediction_values(
         turn3_target["refined_prediction_text"],
         forecast_horizon,
         source_name="turn3_target",
     )
-
-    tool_prediction_text = compact_prediction_tool_output_from_string(
+    turn3_base_prediction_text = _canonical_prediction_text(
         base_prediction_text,
-        model_name=selected_prediction_model,
+        forecast_horizon,
+        history_text=historical_data,
     )
 
     system_prompt = build_timeseries_system_prompt(data_source=data_source, target_column=target_column)
@@ -1270,6 +1335,10 @@ def build_sft_records(
         "lookback_window": lookback_window,
         "reference_teacher_model": reference_teacher_model,
         "selected_prediction_model": selected_prediction_model,
+        "diagnostic_plan_reason": diagnostic_plan.rationale,
+        "diagnostic_primary_model": diagnostic_plan.primary_model,
+        "diagnostic_runner_up_model": diagnostic_plan.runner_up_model,
+        "diagnostic_plan_score_gap": diagnostic_plan.score_gap,
         "routing_policy_source": routing_policy_source,
         "routing_policy_reason": routing_policy_reason,
         "base_prediction_source": base_prediction_source,
@@ -1315,6 +1384,9 @@ def build_sft_records(
             prediction_results=None,
             required_feature_tools=batch_tool_names,
             completed_feature_tools=completed_feature_tools,
+            diagnostic_plan_reason=diagnostic_plan.rationale,
+            diagnostic_primary_model=diagnostic_plan.primary_model,
+            diagnostic_runner_up_model=diagnostic_plan.runner_up_model,
             turn_stage="diagnostic",
         )
         feature_tool_calls = [
@@ -1331,6 +1403,11 @@ def build_sft_records(
                     {
                         "role": "assistant",
                         "content": "",
+                        "reasoning_content": _build_diagnostic_reflection(
+                            plan_reason=diagnostic_plan.rationale,
+                            batch_tool_names=batch_tool_names,
+                            completed_feature_tools=completed_feature_tools,
+                        ),
                         "tool_calls": feature_tool_calls,
                     },
                 ],
@@ -1371,7 +1448,7 @@ def build_sft_records(
         forecast_horizon=forecast_horizon,
         time_series_data=historical_data,
         history_analysis=history_analysis,
-        prediction_results=tool_prediction_text,
+        prediction_results=turn3_base_prediction_text,
         prediction_model_used=selected_prediction_model,
         required_feature_tools=selected_feature_tools,
         completed_feature_tools=selected_feature_tools,
@@ -1422,7 +1499,7 @@ def build_sft_records(
                 {
                     "role": "assistant",
                     "content": build_final_answer(
-                        final_prediction_values,
+                        turn3_target["refined_prediction_text"],
                         turn3_target_type=turn3_target["turn3_target_type"],
                         model_name=selected_prediction_model,
                         refine_ops=turn3_target["refine_ops"],
@@ -1514,6 +1591,40 @@ def distribution_from_series(values: Iterable[Any]) -> dict[str, int]:
     return {str(k): int(v) for k, v in sorted(counter.items())}
 
 
+def _tail_repeat_run_length(values: Sequence[float], *, atol: float = 1e-8) -> int:
+    if not values:
+        return 0
+    run_length = 1
+    last_value = float(values[-1])
+    for value in reversed(values[:-1]):
+        if abs(float(value) - last_value) > atol:
+            break
+        run_length += 1
+    return int(run_length)
+
+
+def _row_prediction_values_for_turn3_priority(row: Any) -> list[float]:
+    for field_name in ("base_teacher_prediction_text", "refined_prediction_text"):
+        text = str((row.get(field_name) if hasattr(row, "get") else "") or "").strip()
+        if not text:
+            continue
+        _timestamps, values = parse_time_series_string(text)
+        if values:
+            return [float(value) for value in values]
+    return []
+
+
+def _is_priority_validated_keep_row(row: Any) -> bool:
+    if str((row.get("turn3_target_type") if hasattr(row, "get") else "") or "").strip().lower() != "validated_keep":
+        return False
+    if str((row.get("selected_prediction_model") if hasattr(row, "get") else "") or "").strip().lower() != "arima":
+        return False
+    values = _row_prediction_values_for_turn3_priority(row)
+    if len(values) < 8:
+        return False
+    return _tail_repeat_run_length(values) >= 8
+
+
 def rebalance_train_turn3_targets(
     dataframe: pd.DataFrame,
     *,
@@ -1549,8 +1660,24 @@ def rebalance_train_turn3_targets(
     if max_keep_count <= 0:
         rebalanced_keep_df = validated_keep_df.iloc[0:0].copy()
     else:
-        take_positions = np.linspace(0, keep_count - 1, num=max_keep_count, dtype=int)
-        rebalanced_keep_df = validated_keep_df.iloc[take_positions].copy()
+        priority_mask = validated_keep_df.apply(_is_priority_validated_keep_row, axis=1)
+        priority_keep_df = validated_keep_df.loc[priority_mask].copy()
+        regular_keep_df = validated_keep_df.loc[~priority_mask].copy()
+
+        if len(priority_keep_df) >= max_keep_count:
+            rebalanced_keep_df = priority_keep_df.iloc[:max_keep_count].copy()
+        else:
+            keep_frames: list[pd.DataFrame] = [priority_keep_df]
+            remaining_count = max_keep_count - len(priority_keep_df)
+            if remaining_count > 0 and not regular_keep_df.empty:
+                regular_count = len(regular_keep_df)
+                if regular_count <= remaining_count:
+                    sampled_regular_keep_df = regular_keep_df.copy()
+                else:
+                    take_positions = np.linspace(0, regular_count - 1, num=remaining_count, dtype=int)
+                    sampled_regular_keep_df = regular_keep_df.iloc[take_positions].copy()
+                keep_frames.append(sampled_regular_keep_df)
+            rebalanced_keep_df = pd.concat(keep_frames, ignore_index=True) if keep_frames else validated_keep_df.iloc[0:0].copy()
 
     kept_source_ids = set(local_refine_df[group_column].tolist())
     kept_source_ids.update(rebalanced_keep_df[group_column].tolist())
@@ -1588,6 +1715,37 @@ def rebalance_train_stage_records(
         row_frame = pd.DataFrame([row.to_dict()])
         repeated_frames.extend(row_frame.copy() for _ in range(max(1, repeat_factor)))
 
+    balanced = pd.concat(repeated_frames, ignore_index=True)
+    sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in balanced.columns]
+    if sort_columns:
+        balanced = balanced.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+    if "sample_index" in balanced.columns:
+        balanced["sample_index"] = list(range(len(balanced)))
+    return balanced
+
+
+def repeat_priority_validated_keep_refinement_rows(
+    dataframe: pd.DataFrame,
+    *,
+    repeat_factor: int,
+) -> pd.DataFrame:
+    if dataframe.empty or repeat_factor <= 1:
+        return dataframe
+    if "turn_stage" not in dataframe.columns:
+        return dataframe
+
+    refinement_mask = dataframe["turn_stage"].astype(str).str.lower() == "refinement"
+    refinement_df = dataframe.loc[refinement_mask].copy()
+    if refinement_df.empty:
+        return dataframe
+
+    priority_mask = refinement_df.apply(_is_priority_validated_keep_row, axis=1)
+    priority_df = refinement_df.loc[priority_mask].copy()
+    if priority_df.empty:
+        return dataframe
+
+    repeated_frames: list[pd.DataFrame] = [dataframe.copy()]
+    repeated_frames.extend(priority_df.copy() for _ in range(int(repeat_factor) - 1))
     balanced = pd.concat(repeated_frames, ignore_index=True)
     sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in balanced.columns]
     if sort_columns:
@@ -1667,12 +1825,12 @@ def parse_args() -> argparse.Namespace:
         "--turn3-target-mode",
         choices=sorted(SUPPORTED_TURN3_TARGET_MODES),
         default=DEFAULT_TURN3_TARGET_MODE,
-        help="Turn-3 target generation mode. Default keeps the selected forecast unchanged for paper-aligned SFT.",
+        help="Turn-3 target generation mode. `paper_strict` keeps the strict <think><answer> protocol but still allows local refinement supervision when evidence supports it.",
     )
     parser.add_argument(
         "--train-min-local-refine-ratio",
         type=float,
-        default=0.30,
+        default=0.25,
         help="Minimum desired local_refine ratio in train parquet. Set <=0 to disable train rebalancing.",
     )
     parser.add_argument(
@@ -1690,6 +1848,15 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_BALANCE_TRAIN_ROUTING_MODELS,
         help="Whether to rebalance train routing rows across selected_prediction_model classes.",
     )
+    parser.add_argument(
+        "--train-priority-validated-keep-repeat-factor",
+        type=int,
+        default=DEFAULT_TRAIN_PRIORITY_VALIDATED_KEEP_REPEAT_FACTOR,
+        help=(
+            "Repeat factor for train refinement rows that are validated_keep, selected_prediction_model=arima, "
+            "and show a flat repeated tail. Set <=1 to disable."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1698,11 +1865,7 @@ def main() -> None:
     turn3_target_mode = _normalize_turn3_target_mode(args.turn3_target_mode)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    effective_train_min_local_refine_ratio = (
-        0.0
-        if turn3_target_mode == TURN3_TARGET_MODE_PAPER_STRICT
-        else float(args.train_min_local_refine_ratio)
-    )
+    effective_train_min_local_refine_ratio = float(args.train_min_local_refine_ratio)
     raw_train_stage_repeat_factors = json.loads(str(args.train_stage_repeat_factors))
     train_stage_repeat_factors = {
         str(stage).strip().lower(): max(1, int(factor))
@@ -1748,6 +1911,17 @@ def main() -> None:
     train_df = rebalance_train_stage_records(
         train_df,
         stage_repeat_factors=train_stage_repeat_factors,
+    )
+    train_priority_validated_keep_repeat_factor = int(
+        getattr(
+            args,
+            "train_priority_validated_keep_repeat_factor",
+            DEFAULT_TRAIN_PRIORITY_VALIDATED_KEEP_REPEAT_FACTOR,
+        )
+    )
+    train_df = repeat_priority_validated_keep_refinement_rows(
+        train_df,
+        repeat_factor=train_priority_validated_keep_repeat_factor,
     )
     if len(train_df) != len(train_df_raw) or not train_df.equals(train_df_raw):
         _validate_paper_turn3_protocol(train_df, split_name="train", output_path=output_dir / "train.parquet")
@@ -1800,6 +1974,7 @@ def main() -> None:
         train_min_local_refine_ratio=effective_train_min_local_refine_ratio,
         train_stage_repeat_factors=train_stage_repeat_factors,
         balance_train_routing_models=bool(args.balance_train_routing_models),
+        train_priority_validated_keep_repeat_factor=train_priority_validated_keep_repeat_factor,
         source_train_jsonl=str(Path(args.train_jsonl)),
         source_val_jsonl=str(Path(args.val_jsonl)),
         source_test_jsonl=str(test_path),

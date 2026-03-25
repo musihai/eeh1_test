@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from recipe.time_series_forecast.config_utils import get_default_lengths
-from recipe.time_series_forecast.task_protocol import parse_time_series_records
+from recipe.time_series_forecast.task_protocol import parse_time_series_feature_records, parse_time_series_records
 
 
 DEFAULT_LOOKBACK_WINDOW, DEFAULT_FORECAST_HORIZON = get_default_lengths()
@@ -53,6 +53,7 @@ def parse_time_series_to_dataframe(
     series_id: str = "series_0",
     default_freq: str = "1h",
     target_column: Optional[str] = None,
+    include_covariates: bool = False,
 ) -> pd.DataFrame:
     """
     Parse time series string into a DataFrame suitable for prediction tools.
@@ -63,7 +64,9 @@ def parse_time_series_to_dataframe(
     3. Partial timestamps with inferred frequency
     4. Single timestamp with default frequency
     """
-    timestamps, values = parse_time_series_string(data_str, target_column=target_column)
+    parsed = parse_time_series_feature_records(data_str, target_column=target_column)
+    timestamps = parsed.timestamps
+    values = parsed.target_values
 
     if not values:
         raise ValueError("No valid data points found in the input string")
@@ -98,13 +101,35 @@ def parse_time_series_to_dataframe(
             offset = i - valid_idx
             datetime_list.append(anchor_ts + freq * offset)
 
-    return pd.DataFrame(
-        {
-            "id": [series_id] * len(values),
-            "timestamp": datetime_list,
-            "target": values,
-        }
-    )
+    data = {
+        "id": [series_id] * len(values),
+        "timestamp": datetime_list,
+        "target": values,
+    }
+
+    if include_covariates:
+        target_name = target_column or "target"
+        feature_columns = list(parsed.feature_columns or [target_name])
+        for column_name in feature_columns:
+            column_values: list[float] = []
+            for row_idx, row in enumerate(parsed.rows):
+                if column_name in row:
+                    column_values.append(float(row[column_name]))
+                    continue
+                if column_name == target_name:
+                    column_values.append(float(values[row_idx]))
+                    continue
+                raise ValueError(
+                    f"Missing feature '{column_name}' in historical row {row_idx}. "
+                    "Multivariate prompts must provide all declared feature columns on every row."
+                )
+            data[column_name] = column_values
+
+    frame = pd.DataFrame(data)
+    if include_covariates:
+        frame.attrs["feature_columns"] = list(parsed.feature_columns or [target_column or "target"])
+        frame.attrs["target_column"] = target_column or "target"
+    return frame
 
 
 def format_predictions_to_string(

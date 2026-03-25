@@ -14,6 +14,7 @@ from recipe.time_series_forecast.reward_metrics import (
     compute_length_score,
     compute_mse_score,
     compute_season_trend_score,
+    compute_structural_tie_break_gate,
     decompose,
     find_change_points,
     infer_format_failure_reason,
@@ -45,6 +46,9 @@ from recipe.time_series_forecast.reward_protocol import (
 from verl.utils.chain_debug import append_chain_debug, short_text
 
 
+# Structural auxiliaries are kept as weak MSE-gated tie-break bonuses. This
+# restores a closer match to the paper's multi-view reward without letting
+# structure dominate raw forecasting accuracy.
 ENABLE_CHANGE_POINT_SCORE = True
 ENABLE_SEASON_TREND_SCORE = True
 TURN3_SUCCESS_SAMPLE_RATE = max(int(os.getenv("TS_TURN3_SUCCESS_SAMPLE_RATE", "100") or 100), 1)
@@ -81,6 +85,7 @@ def append_turn3_generation_debug(
     has_answer_close: bool,
     pred_values: list[float],
     gt_values: list[float],
+    structural_tie_break_gate: float = 0.0,
 ) -> None:
     pred_len = len(pred_values)
     gt_len = len(gt_values)
@@ -133,6 +138,7 @@ def append_turn3_generation_debug(
         "mse_score": float(mse_score),
         "change_point_score": float(change_point_score),
         "season_trend_score": float(season_trend_score),
+        "structural_tie_break_gate": float(structural_tie_break_gate),
         "final_score": float(final_score),
         "orig_mse": orig_mse,
         "orig_mae": orig_mae,
@@ -275,6 +281,7 @@ def compute_score(
             mse_score=0.0,
             change_point_score=0.0,
             season_trend_score=0.0,
+            structural_tie_break_gate=0.0,
             final_score=-1.0,
             orig_mse=float("nan"),
             orig_mae=float("nan"),
@@ -307,6 +314,7 @@ def compute_score(
                 "mse_score": 0.0,
                 "change_point_score": 0.0,
                 "season_trend_score": 0.0,
+                "structural_tie_break_gate": 0.0,
                 "orig_mse": float("nan"),
                 "orig_mae": float("nan"),
                 "norm_mse": float("nan"),
@@ -342,6 +350,7 @@ def compute_score(
             "mse_score": 0.0,
             "change_point_score": 0.0,
             "season_trend_score": 0.0,
+            "structural_tie_break_gate": 0.0,
             "orig_mse": float("nan"),
             "orig_mae": float("nan"),
             "norm_mse": float("nan"),
@@ -392,6 +401,7 @@ def compute_score(
     length_hard_fail = False
     change_point_score = 0.0
     season_trend_score = 0.0
+    structural_tie_break_gate = 0.0
 
     format_score = 0.0 if canonical_answer is not None else -1.0
     length_score = 0.0
@@ -431,23 +441,21 @@ def compute_score(
         length_score = compute_length_score(scoring_solution, ground_truth)
         if not np.isnan(orig_mse) and not np.isnan(norm_mse):
             mse_score = (1.0 / (1.0 + np.log1p(norm_mse))) * PREDICTION_ERROR_SCORE_WEIGHT
+            structural_tie_break_gate = compute_structural_tie_break_gate(norm_mse)
+            if structural_tie_break_gate > 0.0:
+                if ENABLE_CHANGE_POINT_SCORE:
+                    change_point_score = float(
+                        compute_change_point_score(scoring_solution, ground_truth) * structural_tie_break_gate
+                    )
+                if ENABLE_SEASON_TREND_SCORE:
+                    season_trend_score = float(
+                        compute_season_trend_score(scoring_solution, ground_truth) * structural_tie_break_gate
+                    )
         score += length_score
         score += mse_score
+        score += change_point_score
+        score += season_trend_score
         score -= length_penalty
-
-    if ENABLE_CHANGE_POINT_SCORE and format_score >= 0:
-        try:
-            change_point_score = compute_change_point_score(scoring_solution, ground_truth)
-            score += change_point_score
-        except Exception as error:
-            print(f"[DEBUG] Error in compute_change_point_score: {error}")
-
-    if ENABLE_SEASON_TREND_SCORE and format_score >= 0:
-        try:
-            season_trend_score = compute_season_trend_score(scoring_solution, ground_truth)
-            score += season_trend_score
-        except Exception as error:
-            print(f"[DEBUG] Error in compute_season_trend_score: {error}")
 
     append_chain_debug(
         "reward_compute",
@@ -462,6 +470,7 @@ def compute_score(
             "mse_score": float(mse_score),
             "change_point_score": float(change_point_score),
             "season_trend_score": float(season_trend_score),
+            "structural_tie_break_gate": float(structural_tie_break_gate),
             "orig_mse": orig_mse,
             "orig_mae": orig_mae,
             "norm_mse": norm_mse,
@@ -507,6 +516,7 @@ def compute_score(
         mse_score=float(mse_score),
         change_point_score=float(change_point_score),
         season_trend_score=float(season_trend_score),
+        structural_tie_break_gate=float(structural_tie_break_gate),
         final_score=float(score),
         orig_mse=orig_mse,
         orig_mae=orig_mae,
@@ -536,6 +546,7 @@ def compute_score(
         "mse_score": float(mse_score),
         "change_point_score": float(change_point_score),
         "season_trend_score": float(season_trend_score),
+        "structural_tie_break_gate": float(structural_tie_break_gate),
         "orig_mse": orig_mse,
         "orig_mae": orig_mae,
         "norm_mse": norm_mse,
@@ -569,13 +580,11 @@ __all__ = [
     "ENABLE_SEASON_TREND_SCORE",
     "append_turn3_generation_debug",
     "canonicalize_forecast_values",
-    "compute_change_point_score",
     "compute_format_score",
     "compute_length_penalty",
     "compute_length_score",
     "compute_mse_score",
     "compute_score",
-    "compute_season_trend_score",
     "count_numeric_only_lines",
     "decompose",
     "detect_suffix_repetition",

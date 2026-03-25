@@ -66,6 +66,25 @@ class TestTimeSeriesUtils(unittest.TestCase):
             ],
         )
 
+    def test_build_prediction_request_preserves_multivariate_matrix_and_target_column(self):
+        context_df = pd.DataFrame(
+            {
+                "id": ["ETTh1"] * 3,
+                "timestamp": pd.date_range("2016-01-01 00:00:00", periods=3, freq="h"),
+                "target": [1.0, 2.0, 3.0],
+                "HUFL": [10.0, 11.0, 12.0],
+                "OT": [1.0, 2.0, 3.0],
+            }
+        )
+        context_df.attrs["feature_columns"] = ["HUFL", "OT"]
+        context_df.attrs["target_column"] = "OT"
+
+        request = ts_utils._build_prediction_request(context_df, prediction_length=2, model_name="patchtst")
+
+        self.assertEqual(request["feature_columns"], ["HUFL", "OT"])
+        self.assertEqual(request["target_column"], "OT")
+        self.assertEqual(request["values"], [[10.0, 1.0], [11.0, 2.0], [12.0, 3.0]])
+
 
 if __name__ == "__main__":
     unittest.main()

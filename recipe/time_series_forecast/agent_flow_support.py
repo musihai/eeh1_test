@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Callable
 
 import numpy as np
@@ -319,9 +320,15 @@ def build_turn_debug_payload(
     final_answer_parse_mode: str,
     required_step_budget: int,
 ) -> dict[str, Any]:
+    include_full_text = str(os.getenv("TS_CHAIN_DEBUG_INCLUDE_TEXT", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     required_names = normalize_required_feature_tool_names(required_feature_tools, executed_feature_tool_names)
     missing_required = [name for name in required_names if name not in set(executed_feature_tool_names)]
-    return {
+    payload = {
         "request_id": request_id,
         "sample_index": sample_index,
         "sample_uid": sample_uid_text(sample_uid or reward_extra_info.get("sample_uid")),
@@ -391,6 +398,10 @@ def build_turn_debug_payload(
         "refinement_degraded": bool(reward_extra_info.get("refinement_degraded", False)),
         "raw_response_tail": short_text("\n".join(response_text.splitlines()[-10:]), limit=400),
     }
+    if include_full_text:
+        payload["prompt_text"] = prompt_text
+        payload["response_text"] = response_text
+    return payload
 
 
 def build_prediction_tool_debug_payload(

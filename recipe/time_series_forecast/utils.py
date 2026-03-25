@@ -115,12 +115,31 @@ def _build_prediction_request(
         else:
             timestamps.append(str(ts))
 
+    feature_columns = list(context_df.attrs.get("feature_columns") or [])
+    target_column = context_df.attrs.get("target_column")
+    if feature_columns:
+        missing_columns = [column for column in feature_columns if column not in context_df.columns]
+        if missing_columns:
+            raise ValueError(
+                f"context_df is missing multivariate feature columns required for prediction: {missing_columns}"
+            )
+        if len(feature_columns) > 1:
+            values = context_df.loc[:, feature_columns].astype(float).values.tolist()
+        else:
+            values = context_df[feature_columns[0]].astype(float).tolist()
+    else:
+        values = context_df["target"].astype(float).tolist()
+
     request_data = {
         "timestamps": timestamps,
-        "values": context_df["target"].tolist(),
+        "values": values,
         "series_id": context_df["id"].iloc[0] if "id" in context_df.columns else "series_0",
         "prediction_length": prediction_length,
     }
+    if feature_columns:
+        request_data["feature_columns"] = feature_columns
+    if target_column:
+        request_data["target_column"] = str(target_column)
     if model_name:
         request_data["model_name"] = model_name
     return request_data

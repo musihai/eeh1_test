@@ -24,6 +24,14 @@ class TimeSeriesTaskSpec:
     forecast_horizon: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class ParsedTimeSeriesRecords:
+    timestamps: list[Optional[str]]
+    target_values: list[float]
+    rows: list[dict[str, float]]
+    feature_columns: list[str]
+
+
 def _extract_int_field(prompt_text: str, field_name: str) -> Optional[int]:
     pattern = rf"(?im)^{re.escape(field_name)}[ \t]*:[ \t]*(\d+)[ \t]*$"
     match = re.search(pattern, prompt_text)
@@ -63,7 +71,9 @@ def parse_task_prompt(prompt_text: str, data_source: Optional[str] = None) -> Ti
     task_type_match = re.search(r"(?im)^\[Task\]\s*(.+?)\s*$", raw_prompt)
     task_type = task_type_match.group(1).strip() if task_type_match else None
     if task_type is None:
-        if re.search(r"(?i)single-variable", raw_prompt):
+        if re.search(r"(?i)multivariate", raw_prompt):
+            task_type = "multivariate time-series forecasting"
+        elif re.search(r"(?i)single-variable", raw_prompt):
             task_type = "single-variable time-series forecasting"
         elif re.search(r"(?i)time-series forecasting", raw_prompt):
             task_type = "time-series forecasting"
@@ -79,10 +89,10 @@ def parse_task_prompt(prompt_text: str, data_source: Optional[str] = None) -> Ti
     )
 
 
-def _select_named_value(body: str, target_column: Optional[str]) -> Optional[float]:
+def _parse_named_values(body: str) -> dict[str, float]:
     matches = _NAMED_VALUE_RE.findall(body)
     if not matches:
-        return None
+        return {}
 
     named_values = {}
     for name, value in matches:
@@ -91,6 +101,11 @@ def _select_named_value(body: str, target_column: Optional[str]) -> Optional[flo
         except ValueError:
             continue
 
+    return named_values
+
+
+def _select_named_value(body: str, target_column: Optional[str]) -> Optional[float]:
+    named_values = _parse_named_values(body)
     if not named_values:
         return None
 
@@ -103,6 +118,74 @@ def _select_named_value(body: str, target_column: Optional[str]) -> Optional[flo
 
     first_key = next(iter(named_values))
     return named_values[first_key]
+
+
+def parse_time_series_feature_records(
+    text: str,
+    target_column: Optional[str] = None,
+) -> ParsedTimeSeriesRecords:
+    """Parse timestamps, target values, and per-row named features from historical data."""
+    historical_data = extract_historical_data_block(text)
+    timestamps: list[Optional[str]] = []
+    target_values: list[float] = []
+    rows: list[dict[str, float]] = []
+    feature_columns: list[str] = []
+    feature_seen: set[str] = set()
+
+    def _register_feature_names(ordered_names: list[str]) -> None:
+        for name in ordered_names:
+            if name not in feature_seen:
+                feature_columns.append(name)
+                feature_seen.add(name)
+
+    inferred_target_name = target_column or "target"
+
+    for raw_line in historical_data.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        timestamp: Optional[str] = None
+        body = line
+        ts_match = _TIMESTAMP_PREFIX_RE.match(line)
+        if ts_match:
+            timestamp = ts_match.group("timestamp")
+            body = ts_match.group("body").strip()
+
+        named_matches = _NAMED_VALUE_RE.findall(body)
+        named_values = _parse_named_values(body)
+        if named_values:
+            target_value = _select_named_value(body, target_column)
+            if target_value is None:
+                continue
+            timestamps.append(timestamp)
+            target_values.append(target_value)
+            rows.append(named_values)
+            _register_feature_names([name for name, _ in named_matches])
+            continue
+
+        if _PLAIN_VALUE_RE.match(body):
+            scalar = float(body)
+            timestamps.append(timestamp)
+            target_values.append(scalar)
+            rows.append({inferred_target_name: scalar})
+            _register_feature_names([inferred_target_name])
+            continue
+
+        trailing_match = _TRAILING_VALUE_RE.search(body)
+        if trailing_match:
+            scalar = float(trailing_match.group(1))
+            timestamps.append(timestamp)
+            target_values.append(scalar)
+            rows.append({inferred_target_name: scalar})
+            _register_feature_names([inferred_target_name])
+
+    return ParsedTimeSeriesRecords(
+        timestamps=timestamps,
+        target_values=target_values,
+        rows=rows,
+        feature_columns=feature_columns,
+    )
 
 
 def parse_time_series_records(
@@ -118,38 +201,5 @@ def parse_time_series_records(
     - 2016-08-29 11:00:00 HUFL=1.0 OT=25.8170
     - 25.8170
     """
-    historical_data = extract_historical_data_block(text)
-    timestamps: list[Optional[str]] = []
-    values: list[float] = []
-
-    for raw_line in historical_data.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-
-        ts_match = _TIMESTAMP_PREFIX_RE.match(line)
-        if ts_match:
-            timestamp = ts_match.group("timestamp")
-            body = ts_match.group("body").strip()
-            named_value = _select_named_value(body, target_column)
-            if named_value is not None:
-                timestamps.append(timestamp)
-                values.append(named_value)
-                continue
-
-            if _PLAIN_VALUE_RE.match(body):
-                timestamps.append(timestamp)
-                values.append(float(body))
-                continue
-
-            trailing_match = _TRAILING_VALUE_RE.search(body)
-            if trailing_match:
-                timestamps.append(timestamp)
-                values.append(float(trailing_match.group(1)))
-                continue
-
-        if _PLAIN_VALUE_RE.match(line):
-            timestamps.append(None)
-            values.append(float(line))
-
-    return timestamps, values
+    parsed = parse_time_series_feature_records(text, target_column=target_column)
+    return parsed.timestamps, parsed.target_values

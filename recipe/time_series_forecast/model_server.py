@@ -76,10 +76,12 @@ def resolve_runtime_device(requested_device: str) -> str:
 class PredictRequest(BaseModel):
     """Request model for prediction endpoint"""
     timestamps: List[str]  # List of timestamp strings
-    values: List[float]    # List of time series values
+    values: List[Any]      # List of time series values or multivariate rows
     series_id: str = "series_0"
     prediction_length: int = DEFAULT_FORECAST_HORIZON
     model_name: str = "chronos2"  # Model to use
+    feature_columns: Optional[List[str]] = None
+    target_column: Optional[str] = None
 
 
 class PredictResponse(BaseModel):
@@ -270,6 +272,55 @@ def load_all_models(device: str = "cuda"):
 # Prediction Functions
 # =============================================================================
 
+def _coerce_request_matrix(request: PredictRequest) -> tuple[np.ndarray, list[str], int]:
+    if not request.values:
+        raise HTTPException(status_code=400, detail="PredictRequest.values cannot be empty")
+
+    first_value = request.values[0]
+    if isinstance(first_value, list):
+        matrix = np.asarray(request.values, dtype=np.float32)
+        if matrix.ndim != 2:
+            raise HTTPException(status_code=400, detail="Multivariate PredictRequest.values must be a 2D matrix")
+        feature_columns = list(request.feature_columns or [])
+        if feature_columns and len(feature_columns) != int(matrix.shape[1]):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"feature_columns length {len(feature_columns)} does not match "
+                    f"request width {int(matrix.shape[1])}"
+                ),
+            )
+        if not feature_columns:
+            feature_columns = [f"feature_{idx}" for idx in range(int(matrix.shape[1]))]
+    else:
+        matrix = np.asarray(request.values, dtype=np.float32).reshape(-1, 1)
+        feature_columns = list(request.feature_columns or [request.target_column or "target"])
+
+    target_name = str(request.target_column or "")
+    if target_name and target_name in feature_columns:
+        target_idx = feature_columns.index(target_name)
+    elif "OT" in feature_columns:
+        target_idx = feature_columns.index("OT")
+    else:
+        target_idx = len(feature_columns) - 1
+
+    return matrix, feature_columns, int(target_idx)
+
+
+def _extract_target_prediction(prediction_array: np.ndarray, *, target_idx: int) -> np.ndarray:
+    array = np.asarray(prediction_array, dtype=np.float32)
+    if array.ndim == 1:
+        return array
+    if array.ndim == 2:
+        if target_idx >= array.shape[1]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"target index {target_idx} exceeds prediction width {array.shape[1]}",
+            )
+        return array[:, target_idx]
+    raise HTTPException(status_code=500, detail=f"Unexpected prediction shape: {list(array.shape)}")
+
+
 def predict_with_chronos2(request: PredictRequest) -> PredictResponse:
     """
     Generate predictions using Chronos2 with Non-stationary Transformer normalization.
@@ -280,10 +331,10 @@ def predict_with_chronos2(request: PredictRequest) -> PredictResponse:
         raise HTTPException(status_code=503, detail="Chronos2 model not loaded")
     
     datetime_list = [pd.to_datetime(ts) for ts in request.timestamps]
-    values = np.array(request.values, dtype=np.float32)
+    values, feature_columns, target_idx = _coerce_request_matrix(request)
     
-    # Convert to tensor: [batch=1, seq_len, n_vars=1]
-    x_enc = torch.FloatTensor(values).unsqueeze(0).unsqueeze(-1)
+    # Convert to tensor: [batch=1, seq_len, n_vars]
+    x_enc = torch.from_numpy(values).unsqueeze(0)
     
     # Non-stationary Transformer Normalization
     means = x_enc.mean(1, keepdim=True).detach()
@@ -301,16 +352,24 @@ def predict_with_chronos2(request: PredictRequest) -> PredictResponse:
         quantile_levels=[0.1, 0.5, 0.9]
     )
     
-    # quantiles[0] shape: [batch, pred_len, num_quantiles]
-    # Take median (index 1 in last dimension)
-    dec_out = quantiles[0][:, :, 1]  # [batch, pred_len]
-    dec_out = dec_out.unsqueeze(-1)  # [batch, pred_len, 1]
+    quantiles_array = np.asarray(quantiles, dtype=np.float32)
+    if quantiles_array.ndim == 4:
+        # [batch, n_vars, pred_len, n_quantiles]
+        dec_out = torch.from_numpy(quantiles_array[:, :, :, 1].transpose(0, 2, 1))
+    elif quantiles_array.ndim == 3:
+        # [batch, pred_len, n_quantiles]
+        dec_out = torch.from_numpy(quantiles_array[:, :, 1]).unsqueeze(-1)
+    else:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected Chronos2 quantile shape: {list(quantiles_array.shape)} for {feature_columns}",
+        )
     
     # De-Normalization
     dec_out = dec_out * stdev[:, 0, :].unsqueeze(1).repeat(1, request.prediction_length, 1)
     dec_out = dec_out + means[:, 0, :].unsqueeze(1).repeat(1, request.prediction_length, 1)
     
-    pred_values = dec_out.numpy().squeeze().tolist()
+    pred_values = _extract_target_prediction(dec_out.numpy()[0], target_idx=target_idx).tolist()
     
     # Generate timestamps
     freq = datetime_list[-1] - datetime_list[-2] if len(datetime_list) >= 2 else pd.Timedelta(hours=1)
@@ -361,11 +420,37 @@ def predict_with_pytorch_model_batch(
             f"Batched {model_name} inference requires uniform context lengths, got {sorted(seq_lens)}"
         )
 
-    values_batch = np.stack(
-        [np.asarray(request.values, dtype=np.float32) for request in requests],
-        axis=0,
-    )
-    input_tensor = torch.from_numpy(values_batch).unsqueeze(-1).to(device)
+    matrices: list[np.ndarray] = []
+    signatures: set[tuple[tuple[str, ...], int]] = set()
+    target_indices: list[int] = []
+    for request in requests:
+        matrix, feature_columns, target_idx = _coerce_request_matrix(request)
+        matrices.append(matrix)
+        signatures.add((tuple(feature_columns), int(target_idx)))
+        target_indices.append(int(target_idx))
+
+    if len(signatures) != 1:
+        raise ValueError(
+            f"Batched {model_name} inference requires uniform feature columns and target selection, got {sorted(signatures)}"
+        )
+
+    values_batch = np.stack(matrices, axis=0)
+    if values_batch.ndim != 3:
+        raise ValueError(f"Expected {model_name} batched input to be rank 3, got {list(values_batch.shape)}")
+
+    model_config = _configs.get(model_name) or {}
+    expected_enc_in = int(model_config.get("enc_in", values_batch.shape[-1]))
+    if expected_enc_in != int(values_batch.shape[-1]):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"{model_name} is loaded with enc_in={expected_enc_in}, but received "
+                f"{int(values_batch.shape[-1])}-variable input. Replace this checkpoint with "
+                "a multivariate ETTh1 expert before enabling paper-faithful routing."
+            ),
+        )
+
+    input_tensor = torch.from_numpy(values_batch).to(device)
 
     with torch.inference_mode():
         predictions = model(input_tensor)
@@ -376,7 +461,7 @@ def predict_with_pytorch_model_batch(
     for row_idx, request in enumerate(requests):
         datetime_list = [pd.to_datetime(ts) for ts in request.timestamps]
         freq = datetime_list[-1] - datetime_list[-2] if len(datetime_list) >= 2 else pd.Timedelta(hours=1)
-        pred_values = predictions_np[row_idx].squeeze()
+        pred_values = _extract_target_prediction(predictions_np[row_idx], target_idx=target_indices[row_idx])
         if pred_values.ndim == 0:
             pred_values = np.asarray([float(pred_values)], dtype=np.float32)
 

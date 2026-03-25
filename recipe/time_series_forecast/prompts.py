@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Optional, Sequence
 
+from recipe.time_series_forecast.time_series_io import get_last_timestamp
+
 
 def _build_dataset_description(
     data_source: Optional[str],
@@ -27,15 +29,16 @@ def _build_dataset_description(
     if dataset_name.lower() == "etth1":
         return (
             "This dataset is ETTh1, an hourly electricity transformer temperature benchmark. "
-            f"The forecasting target is the single variable `{target_name}`. The series usually "
-            "shows strong daily seasonality, medium-term trend drift, flat stretches, and occasional "
-            "abrupt level changes. This is a univariate forecasting task, so focus on temporal "
-            "patterns in the target itself rather than cross-channel reasoning."
+            f"The forecasting target is `{target_name}`, with six aligned load-related covariates "
+            "(`HUFL`, `HULL`, `MUFL`, `MULL`, `LUFL`, `LULL`) observed over the same horizon. "
+            "The target series usually shows strong daily seasonality, medium-term trend drift, "
+            "flat stretches, and occasional abrupt level changes. Use both target dynamics and "
+            "cross-channel evidence when judging which forecasting expert is appropriate."
         )
 
     return (
-        f"This is a time-series forecasting task for dataset `{dataset_name}` with single target "
-        f"`{target_name}`. Focus on seasonality, trend, local dynamics, and data quality of the target series."
+        f"This is a time-series forecasting task for dataset `{dataset_name}` with forecast target "
+        f"`{target_name}`. Use the target series together with any provided covariates when reasoning about model choice."
     )
 
 
@@ -55,7 +58,7 @@ def build_timeseries_system_prompt(
 ## Task Context
 - Dataset: {dataset_name}
 - Forecast target: {target_name}
-- Task type: single-variable forecasting
+- Task type: multivariate forecasting with a single target channel
 
 ## CRITICAL RULES
 - Follow the CURRENT user turn instructions only.
@@ -112,11 +115,10 @@ def get_runtime_turn_info(
     if stage == "routing":
         return "Routing", "Call predict_time_series exactly once with the model chosen from the current diagnostic memory state."
     return "Refinement", (
-        "Output your final answer in <think>...</think><answer>...</answer> format using the selected model prediction as the base forecast. "
-        "Use <think> to briefly explain whether you keep the base forecast unchanged or apply a small local refinement. "
-        "Keep the forecast unchanged if it is already consistent; if you refine it, keep the change small, local, and evidence-based. "
-        f"Do NOT output any text outside <think> and <answer>. <answer> must contain exactly {forecast_horizon} lines, one numeric value per line, no timestamps. "
-        f"Stop immediately after the {forecast_horizon}th value and close with </answer>. Do not generate any extra value or any text after </answer>."
+        "Convert the selected model forecast into the final protocol. Do NOT forecast again from scratch. "
+        "Choose exactly one of two actions: KEEP the base forecast unchanged, or apply one small local refinement on the same 96-row template. "
+        "KEEP means the final answer must copy the provided forecast rows exactly. "
+        "Reuse the provided timestamps exactly, stop at the last provided row, and output only <think>...</think><answer>...</answer>."
     )
 
 
@@ -132,6 +134,9 @@ def build_runtime_user_prompt(
     prediction_model_used: Optional[str] = None,
     required_feature_tools: Sequence[str] | None = None,
     completed_feature_tools: Sequence[str] | None = None,
+    diagnostic_plan_reason: Optional[str] = None,
+    diagnostic_primary_model: Optional[str] = None,
+    diagnostic_runner_up_model: Optional[str] = None,
     turn_stage: Optional[str] = None,
 ) -> str:
     history_records = list(history_analysis or [])
@@ -148,6 +153,15 @@ def build_runtime_user_prompt(
 
     if normalized_stage == "refinement":
         model_line = f"### Selected Forecast Model: {prediction_model_used}\n" if prediction_model_used else ""
+        terminal_timestamp = get_last_timestamp(prediction_results or "")
+        prediction_lines = [line.strip() for line in str(prediction_results or "").splitlines() if line.strip()]
+        terminal_row = prediction_lines[-1] if prediction_lines else ""
+        terminal_line = (
+            f"### Final Allowed Forecast Timestamp: {terminal_timestamp}\n" if terminal_timestamp else ""
+        )
+        terminal_row_line = (
+            f"### Final Required Forecast Row: {terminal_row}\n" if terminal_row else ""
+        )
         truncated_history = truncate_time_series_data(
             time_series_data,
             recent_rows=min(max(int(lookback_window or 96) // 2, 24), int(lookback_window or 96)),
@@ -161,24 +175,44 @@ def build_runtime_user_prompt(
 ### Recent Historical Window
 {truncated_history}
 
-### Prediction Tool Output
+{terminal_line}{terminal_row_line}### Prediction Tool Output
 {prediction_results}
 
 **Instructions**:
 1. Do NOT call more tools.
 2. No tool schema is available in this turn. Any <tool_call> output is invalid.
-3. Treat "Prediction Tool Output" as the base forecast produced by the selected model.
-4. If the base forecast is already consistent, keep it unchanged. If refinement is needed, keep it small, local, and evidence-based.
-5. Do NOT rewrite the forecast arbitrarily or ignore the selected-model forecast.
-6. Output ONLY one <think>...</think> block followed immediately by one <answer>...</answer> block.
-7. <think> must briefly state whether you keep the base forecast or apply a small local refinement, and why.
-8. <answer> must contain EXACTLY {forecast_horizon} lines.
-9. Each answer line must be a single float value only (no timestamp, no extra words, no markdown, no bullets).
-10. Stop immediately after the {forecast_horizon}th value, then output </answer>, with no extra text after it.
-11. Your reply must start with <think>. Do NOT copy placeholder text or template scaffolding into the final answer."""
+3. Treat "Prediction Tool Output" as the canonical base forecast produced by the selected model. It is the only legal row template for <answer>.
+4. You must choose exactly one action:
+   KEEP: copy the 96 forecast rows from "Prediction Tool Output" exactly once into <answer>, with identical timestamps and identical numeric values.
+   LOCAL_REFINE: keep the same 96 timestamps and row order, but change only a small contiguous set of numeric values. Most rows should remain identical to the base forecast.
+5. If unsure, choose KEEP. Flat or repeated tail values are allowed and do NOT by themselves justify adding rows or inventing new timestamps.
+6. Reuse the timestamps from "Prediction Tool Output" in the same order. If you refine, adjust values only. Do NOT alter, renumber, skip, or invent timestamps.
+7. If <think> says KEEP, then <answer> must be an exact row-for-row copy of "Prediction Tool Output". Do NOT reorder rows, restart from an earlier timestamp, or splice in rows from another part of the sequence.
+8. Output ONLY one <think>...</think> block followed immediately by one <answer>...</answer> block.
+9. <think> must be one short sentence that explicitly says either KEEP or LOCAL_REFINE and why.
+10. <answer> must contain EXACTLY {forecast_horizon} lines, one forecast item per line, and must use `YYYY-MM-DD HH:MM:SS value`.
+11. Do NOT emit any timestamp that does not already appear in "Prediction Tool Output". Never synthesize timestamps such as `24:00:00` or `25:00:00`.
+12. The final answer must end at the last timestamp shown in "Final Allowed Forecast Timestamp". Do NOT emit any later timestamp and do NOT add extra rows beyond that terminal row.
+13. The {forecast_horizon}th row must be exactly the line shown in "Final Required Forecast Row". After you write that exact row, immediately output </answer>.
+14. Do NOT restart from row 1, do NOT duplicate the sequence, and do NOT continue a flat last value past the terminal timestamp.
+15. Do not add extra words, markdown, bullets, or commentary on answer lines.
+16. Stop immediately after </answer>, with no extra text after it.
+17. Your reply must start with <think>. Do NOT copy placeholder text or template scaffolding into the final answer."""
 
     if normalized_stage == "diagnostic":
         available_tools_text = ", ".join(available_diagnostic_tools) if available_diagnostic_tools else "extract_basic_statistics"
+        plan_text = str(diagnostic_plan_reason or "").strip()
+        plan_lines: list[str] = []
+        if plan_text:
+            plan_lines.append(plan_text)
+        if diagnostic_primary_model and diagnostic_runner_up_model:
+            if diagnostic_primary_model == diagnostic_runner_up_model:
+                plan_lines.append(f"Current strongest routing hypothesis: `{diagnostic_primary_model}`.")
+            else:
+                plan_lines.append(
+                    f"Planned comparison focus: `{diagnostic_primary_model}` versus `{diagnostic_runner_up_model}`."
+                )
+        diagnostic_plan_block = "\n".join(plan_lines) if plan_lines else "Use the available feature tools to establish enough routing evidence."
         return f"""**[Stage: {stage_name}] Action: {action}**
 ### Lookback Window: {lookback_window} rows
 ### Forecast Horizon: {forecast_horizon} rows
@@ -188,11 +222,15 @@ def build_runtime_user_prompt(
 ### Analysis History
 {history_text}
 
+### Diagnostic Plan
+{diagnostic_plan_block}
+
 ### Diagnostic Tool Schemas Available This Turn
 {available_tools_text}
 
 **Instructions**:
 - Stay in the diagnostic stage and inspect the series through feature-extraction tools only.
+- Follow the diagnostic plan and call only the feature tools exposed in this turn.
 - You may call one or more feature tools in the same assistant turn.
 - Do NOT call predict_time_series in this turn.
 """

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import os
 import re
 from typing import List, Optional, Tuple
@@ -15,6 +16,44 @@ def extract_answer(text: str) -> str:
 
 def normalized_nonempty_lines(text: str) -> List[str]:
     return [line.strip() for line in str(text).splitlines() if line.strip()]
+
+
+def _is_numeric_only_line(line: str) -> bool:
+    return re.fullmatch(r"-?\d+(?:\.\d+)?", str(line).strip()) is not None
+
+
+def _is_valid_timestamp_text(timestamp_text: str) -> bool:
+    try:
+        datetime.strptime(str(timestamp_text).strip(), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
+    return True
+
+
+def _is_timestamp_value_line(line: str) -> bool:
+    line_text = str(line).strip()
+    match = re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+-?\d+(?:\.\d+)?",
+        line_text,
+    )
+    if match is None:
+        return False
+    timestamp_text, _value_text = line_text.rsplit(maxsplit=1)
+    return _is_valid_timestamp_text(timestamp_text)
+
+
+def _infer_answer_line_format(lines: List[str]) -> str:
+    if not lines:
+        return "empty"
+    has_numeric_only = any(_is_numeric_only_line(line) for line in lines)
+    has_timestamp_value = any(_is_timestamp_value_line(line) for line in lines)
+    if all(_is_numeric_only_line(line) for line in lines):
+        return "numeric_only"
+    if all(_is_timestamp_value_line(line) for line in lines):
+        return "timestamp_value"
+    if has_numeric_only and has_timestamp_value:
+        return "mixed"
+    return "invalid"
 
 
 def extract_forecast_block(text: Optional[str]) -> Optional[str]:
@@ -35,7 +74,7 @@ def extract_forecast_block(text: Optional[str]) -> Optional[str]:
         if not line:
             continue
 
-        is_timestamp_value = re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+-?\d+\.?\d*$", line) is not None
+        is_timestamp_value = _is_timestamp_value_line(line)
         is_numeric_value = re.match(r"^-?\d+\.?\d*$", line) is not None
         if not started:
             if is_timestamp_value or is_numeric_value:
@@ -64,10 +103,7 @@ def looks_like_forecast_answer(answer_text: Optional[str], expected_len: int) ->
     values = extract_values_from_time_series_string(answer_text)
     if len(lines) != expected_len or len(values) != expected_len:
         return False
-    for line in lines:
-        if re.fullmatch(r"-?\d+(?:\.\d+)?", line) is None:
-            return False
-    return True
+    return _infer_answer_line_format(lines) in {"numeric_only", "timestamp_value"}
 
 
 def infer_answer_shape_failure(answer_text: str, expected_len: int) -> str:
@@ -79,9 +115,11 @@ def infer_answer_shape_failure(answer_text: str, expected_len: int) -> str:
         return f"invalid_answer_shape:lines={len(lines)},expected={expected_len}"
     if len(values) != expected_len:
         return f"invalid_answer_shape:values={len(values)},expected={expected_len}"
-    for line in lines:
-        if re.fullmatch(r"-?\d+(?:\.\d+)?", line) is None:
-            return "invalid_answer_shape:non_numeric_line"
+    line_format = _infer_answer_line_format(lines)
+    if line_format == "mixed":
+        return "invalid_answer_shape:mixed_line_formats"
+    if line_format not in {"numeric_only", "timestamp_value"}:
+        return "invalid_answer_shape:invalid_forecast_line"
     return "invalid_answer_shape:unknown"
 
 
@@ -291,10 +329,19 @@ def extract_values_from_time_series_string(text: str) -> List[float]:
         if not line:
             continue
 
-        match = re.search(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(-?\d+\.?\d*)", line)
-        if match:
+        if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+", line) and not _is_timestamp_value_line(line):
+            continue
+
+        timestamp_value_match = re.fullmatch(
+            r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(-?\d+\.?\d*)",
+            line,
+        )
+        if timestamp_value_match:
             try:
-                values.append(float(match.group(1)))
+                timestamp_text = timestamp_value_match.group(1)
+                if not _is_valid_timestamp_text(timestamp_text):
+                    continue
+                values.append(float(timestamp_value_match.group(2)))
                 continue
             except ValueError:
                 pass

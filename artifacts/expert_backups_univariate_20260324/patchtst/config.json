@@ -1,0 +1,16 @@
+{
+  "model_name": "PatchTST",
+  "seq_len": 96,
+  "pred_len": 96,
+  "enc_in": 1,
+  "d_model": 16,
+  "n_heads": 4,
+  "e_layers": 3,
+  "d_ff": 128,
+  "dropout": 0.3,
+  "patch_len": 16,
+  "stride": 8,
+  "features": "S",
+  "target": "OT",
+  "description": "PatchTST retrained on ETTh1 TRAIN split only (rows [0,12251)) with strict provenance."
+}
