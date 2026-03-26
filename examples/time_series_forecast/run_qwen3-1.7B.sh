@@ -50,6 +50,16 @@ RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
 # shellcheck disable=SC1090
 source "$RESOLVED_PROFILE_PATH"
 
+require_env() {
+    local name="$1"
+    local hint="$2"
+    if [ -z "${!name:-}" ]; then
+        echo "Missing required config: $name" >&2
+        echo "$hint" >&2
+        exit 1
+    fi
+}
+
 resolve_transformers_model_dir() {
     python3 - "$1" <<'PY'
 import sys
@@ -60,93 +70,99 @@ print(resolve_transformers_model_dir(sys.argv[1]))
 PY
 }
 
-CONFIG_PATH="${CONFIG_PATH:-${RL_CONFIG_PATH:-$PROJECT_DIR/recipe/time_series_forecast/base.yaml}}"
-resolve_consistent_env_value() {
-    local label="$1"
-    shift
-    local resolved=""
-    local env_name
-    local candidate
-    for env_name in "$@"; do
-        candidate="${!env_name:-}"
-        if [ -z "$candidate" ]; then
-            continue
-        fi
-        if [ -n "$resolved" ] && [ "$candidate" != "$resolved" ]; then
-            echo "Conflicting ${label} values:" >&2
-            printf '  %s=%s\n' "$env_name" "$candidate" >&2
-            printf '  resolved=%s\n' "$resolved" >&2
-            exit 1
-        fi
-        resolved="$candidate"
-    done
-    printf '%s\n' "$resolved"
-}
+require_env RL_CONFIG_PATH "Set RL_CONFIG_PATH in PROFILE_PATH or override it in the launch command."
+require_env RL_CURRICULUM_DATASET_DIR "Set RL_CURRICULUM_DATASET_DIR in PROFILE_PATH or override it in the launch command."
+require_env RL_REWARD_FN_PATH "Set RL_REWARD_FN_PATH in PROFILE_PATH or override it in the launch command."
+require_env RL_REWARD_FN_NAME "Set RL_REWARD_FN_NAME in PROFILE_PATH or override it in the launch command."
+require_env RL_MODEL_PATH "Set RL_MODEL_PATH to a loadable HuggingFace/Transformers checkpoint before launch."
+require_env RL_PROJECT_NAME "Set RL_PROJECT_NAME in PROFILE_PATH or override it in the launch command."
+require_env RL_EXP_NAME "Set RL_EXP_NAME in PROFILE_PATH or override it in the launch command."
+require_env RL_TRAINER_LOCAL_DIR "Set RL_TRAINER_LOCAL_DIR in PROFILE_PATH or override it in the launch command."
+require_env RL_NNODES "Set RL_NNODES in PROFILE_PATH or override it in the launch command."
+require_env RL_NUM_GPUS "Set RL_NUM_GPUS in PROFILE_PATH or override it in the launch command."
+require_env RL_TRAIN_BATCH_SIZE "Set RL_TRAIN_BATCH_SIZE in PROFILE_PATH or override it in the launch command."
+require_env RL_PPO_MINI_BATCH_SIZE "Set RL_PPO_MINI_BATCH_SIZE in PROFILE_PATH or override it in the launch command."
+require_env RL_PPO_MICRO_BATCH_SIZE "Set RL_PPO_MICRO_BATCH_SIZE in PROFILE_PATH or override it in the launch command."
+require_env RL_LOGPROB_MICRO_BATCH_SIZE "Set RL_LOGPROB_MICRO_BATCH_SIZE in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_GPU_MEMORY_UTILIZATION "Set RL_ROLLOUT_GPU_MEMORY_UTILIZATION in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_LOAD_FORMAT "Set RL_ROLLOUT_LOAD_FORMAT in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_N "Set RL_ROLLOUT_N in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_TP "Set RL_ROLLOUT_TP in PROFILE_PATH or override it in the launch command."
+require_env RL_FSDP_MODEL_DTYPE "Set RL_FSDP_MODEL_DTYPE in PROFILE_PATH or override it in the launch command."
+require_env RL_FSDP_USE_TORCH_COMPILE "Set RL_FSDP_USE_TORCH_COMPILE in PROFILE_PATH or override it in the launch command."
+require_env RL_MAX_PROMPT_LENGTH "Set RL_MAX_PROMPT_LENGTH in PROFILE_PATH or override it in the launch command."
+require_env RL_MAX_RESPONSE_LENGTH "Set RL_MAX_RESPONSE_LENGTH in PROFILE_PATH or override it in the launch command."
+require_env RL_DATALOADER_NUM_WORKERS "Set RL_DATALOADER_NUM_WORKERS in PROFILE_PATH or override it in the launch command."
+require_env RL_ACTOR_MAX_TOKEN_LEN_PER_GPU "Set RL_ACTOR_MAX_TOKEN_LEN_PER_GPU in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_MAX_MODEL_LEN "Set RL_ROLLOUT_MAX_MODEL_LEN in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_MAX_BATCHED_TOKENS "Set RL_ROLLOUT_MAX_BATCHED_TOKENS in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_MAX_NUM_SEQS "Set RL_ROLLOUT_MAX_NUM_SEQS in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_ENFORCE_EAGER "Set RL_ROLLOUT_ENFORCE_EAGER in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_ENABLE_PREFIX_CACHING "Set RL_ROLLOUT_ENABLE_PREFIX_CACHING in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_ENABLE_CHUNKED_PREFILL "Set RL_ROLLOUT_ENABLE_CHUNKED_PREFILL in PROFILE_PATH or override it in the launch command."
+require_env RL_ROLLOUT_FREE_CACHE_ENGINE "Set RL_ROLLOUT_FREE_CACHE_ENGINE in PROFILE_PATH or override it in the launch command."
+require_env RL_SAVE_FREQ "Set RL_SAVE_FREQ in PROFILE_PATH or override it in the launch command."
+require_env RL_TEST_FREQ "Set RL_TEST_FREQ in PROFILE_PATH or override it in the launch command."
+require_env RL_TOTAL_EPOCHS "Set RL_TOTAL_EPOCHS in PROFILE_PATH or override it in the launch command."
+require_env RL_LOGGER "Set RL_LOGGER in PROFILE_PATH or override it in the launch command."
+require_env RL_LR "Set RL_LR in PROFILE_PATH or override it in the launch command."
+require_env RL_LR_SCHEDULER_TYPE "Set RL_LR_SCHEDULER_TYPE in PROFILE_PATH or override it in the launch command."
+require_env RL_KL_LOSS_COEF "Set RL_KL_LOSS_COEF in PROFILE_PATH or override it in the launch command."
+require_env RL_TEMPERATURE "Set RL_TEMPERATURE in PROFILE_PATH or override it in the launch command."
+require_env RL_VAL_TEMPERATURE "Set RL_VAL_TEMPERATURE in PROFILE_PATH or override it in the launch command."
 
-TRAIN_FILES="$(resolve_consistent_env_value 'RL train jsonl' TRAIN_FILES RL_TRAIN_FILES)"
-VAL_FILES="$(resolve_consistent_env_value 'RL val jsonl' VAL_FILES RL_VAL_FILES)"
-REWARD_FN_PATH="${REWARD_FN_PATH:-${RL_REWARD_FN_PATH:-$PROJECT_DIR/recipe/time_series_forecast/reward.py}}"
-REWARD_FN_NAME="${REWARD_FN_NAME:-${RL_REWARD_FN_NAME:-compute_score}}"
-MODEL_PATH="${RL_MODEL_PATH:-${MODEL_PATH:-}}"
-CURRICULUM_PHASE="${CURRICULUM_PHASE:-${RL_CURRICULUM_PHASE:-}}"
-ALLOW_NONCURRICULUM_TRAIN="${ALLOW_NONCURRICULUM_TRAIN:-${RL_ALLOW_NONCURRICULUM_TRAIN:-0}}"
-if [ -z "$MODEL_PATH" ]; then
-    echo "RL model path is required." >&2
-    echo "Export RL_MODEL_PATH (recommended) or MODEL_PATH before launch." >&2
-    exit 1
-fi
+CONFIG_PATH="$RL_CONFIG_PATH"
+RL_DATASET_DIR="$RL_CURRICULUM_DATASET_DIR"
+REWARD_FN_PATH="$RL_REWARD_FN_PATH"
+REWARD_FN_NAME="$RL_REWARD_FN_NAME"
+MODEL_PATH="$RL_MODEL_PATH"
+CURRICULUM_PHASE="${RL_CURRICULUM_PHASE:-}"
 if [ "${PRINT_CMD_ONLY:-0}" != "1" ] || [[ "$MODEL_PATH" != *"<latest>"* ]]; then
     MODEL_PATH="$(resolve_transformers_model_dir "$MODEL_PATH")" || {
         echo "RL model path is not loadable: $MODEL_PATH" >&2
         exit 1
     }
 fi
-if [ -z "$TRAIN_FILES" ] || [ -z "$VAL_FILES" ]; then
-    echo "RL dataset paths are required." >&2
-    echo "Set both TRAIN_FILES and VAL_FILES, or export RL_TRAIN_FILES and RL_VAL_FILES explicitly." >&2
+if [ ! -d "$RL_DATASET_DIR" ]; then
+    echo "RL dataset directory not found: $RL_DATASET_DIR" >&2
     exit 1
 fi
-if [ ! -f "$TRAIN_FILES" ]; then
-    echo "RL train jsonl not found: $TRAIN_FILES" >&2
-    exit 1
-fi
+TRAIN_FILES="$RL_DATASET_DIR/train.jsonl"
+VAL_FILES="$RL_DATASET_DIR/val.jsonl"
 if [ ! -f "$VAL_FILES" ]; then
     echo "RL val jsonl not found: $VAL_FILES" >&2
     exit 1
 fi
-TRAIN_DIR="$(cd "$(dirname "$TRAIN_FILES")" && pwd)"
-VAL_DIR="$(cd "$(dirname "$VAL_FILES")" && pwd)"
-if [ "$TRAIN_DIR" != "$VAL_DIR" ]; then
-    echo "RL train/val jsonl must come from the same dataset directory." >&2
-    echo "train dir: $TRAIN_DIR" >&2
-    echo "val dir:   $VAL_DIR" >&2
-    exit 1
-fi
-RL_METADATA_PATH="$TRAIN_DIR/metadata.json"
+RL_METADATA_PATH="$RL_DATASET_DIR/metadata.json"
 python3 - "$RL_METADATA_PATH" <<'PY'
 import sys
-from recipe.time_series_forecast.dataset_identity import DATASET_KIND_RL_JSONL, validate_metadata_file
+from recipe.time_series_forecast.dataset_identity import (
+    DATASET_KIND_RL_JSONL,
+    require_multivariate_etth1_metadata,
+    validate_metadata_file,
+)
 
 metadata_path = sys.argv[1]
 payload, _ = validate_metadata_file(metadata_path, expected_kind=DATASET_KIND_RL_JSONL)
+require_multivariate_etth1_metadata(payload, metadata_path=metadata_path)
 print(
     f"[RL DATASET] kind={payload.get('dataset_kind')} stage={payload.get('pipeline_stage', '')} "
     f"metadata={metadata_path}"
 )
 PY
-TRAIN_FILES="$(python3 - "$TRAIN_FILES" "$RL_METADATA_PATH" "$RUN_MODE" "$CURRICULUM_PHASE" "$ALLOW_NONCURRICULUM_TRAIN" <<'PY'
+TRAIN_FILES="$(python3 - "$TRAIN_FILES" "$RL_METADATA_PATH" "$RUN_MODE" "$CURRICULUM_PHASE" <<'PY'
 import sys
 from recipe.time_series_forecast.curriculum_utils import resolve_curriculum_train_file
 from recipe.time_series_forecast.dataset_identity import load_metadata
 
-train_file, metadata_path, run_mode, curriculum_phase, allow_noncurriculum = sys.argv[1:6]
+train_file, metadata_path, run_mode, curriculum_phase = sys.argv[1:5]
 payload = load_metadata(metadata_path)
 resolved = resolve_curriculum_train_file(
     train_file=train_file,
     metadata_payload=payload,
     run_mode=run_mode,
     curriculum_phase=curriculum_phase,
-    allow_noncurriculum_train=str(allow_noncurriculum).strip().lower() in {"1", "true", "yes"},
+    allow_noncurriculum_train=False,
 )
 print(str(resolved))
 PY
@@ -155,68 +171,45 @@ if [ ! -f "$TRAIN_FILES" ]; then
     echo "Resolved RL train jsonl not found: $TRAIN_FILES" >&2
     exit 1
 fi
-TRAIN_DIR="$(cd "$(dirname "$TRAIN_FILES")" && pwd)"
-VAL_DIR="$(cd "$(dirname "$VAL_FILES")" && pwd)"
-if [ "$TRAIN_DIR" != "$VAL_DIR" ]; then
-    echo "RL train/val jsonl must come from the same dataset directory." >&2
-    echo "train dir: $TRAIN_DIR" >&2
-    echo "val dir:   $VAL_DIR" >&2
-    exit 1
-fi
 if [ -n "$CURRICULUM_PHASE" ]; then
     echo "[RL CURRICULUM] phase=$CURRICULUM_PHASE train=$TRAIN_FILES"
 fi
 
-PROJECT_NAME="${PROJECT_NAME:-${RL_PROJECT_NAME:-TimeSeriesForecast}}"
-EXP_NAME="${EXP_NAME:-${RL_EXP_NAME:-etth1_ot_qwen3_1_7b}}"
-TRAINER_LOCAL_DIR="${TRAINER_LOCAL_DIR:-${RL_TRAINER_LOCAL_DIR:-$PROJECT_DIR/artifacts/checkpoints/rl/$EXP_NAME}}"
-NNODES="${NNODES:-${RL_NNODES:-1}}"
-if [ -z "${NUM_GPUS:-}" ] && [ -n "${RL_NUM_GPUS:-}" ]; then
-    NUM_GPUS="$RL_NUM_GPUS"
-fi
-if [ -z "${NUM_GPUS:-}" ] && [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
-    IFS=',' read -r -a _VISIBLE_GPUS <<< "$CUDA_VISIBLE_DEVICES"
-    NUM_GPUS="${#_VISIBLE_GPUS[@]}"
-fi
-NUM_GPUS="${NUM_GPUS:-4}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-${RL_TRAIN_BATCH_SIZE:-$NUM_GPUS}}"
-PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-${RL_PPO_MINI_BATCH_SIZE:-$TRAIN_BATCH_SIZE}}"
-PPO_MICRO_BATCH_SIZE="${PPO_MICRO_BATCH_SIZE:-${RL_PPO_MICRO_BATCH_SIZE:-1}}"
-LOGPROB_MICRO_BATCH_SIZE="${LOGPROB_MICRO_BATCH_SIZE:-${RL_LOGPROB_MICRO_BATCH_SIZE:-1}}"
-ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-${RL_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.15}}"
-ROLLOUT_LOAD_FORMAT="${ROLLOUT_LOAD_FORMAT:-${RL_ROLLOUT_LOAD_FORMAT:-safetensors}}"
-ROLLOUT_N="${ROLLOUT_N:-${RL_ROLLOUT_N:-1}}"
-ROLLOUT_TP="${ROLLOUT_TP:-${RL_ROLLOUT_TP:-1}}"
-FSDP_MODEL_DTYPE="${FSDP_MODEL_DTYPE:-${RL_FSDP_MODEL_DTYPE:-bfloat16}}"
-FSDP_USE_TORCH_COMPILE="${FSDP_USE_TORCH_COMPILE:-${RL_FSDP_USE_TORCH_COMPILE:-False}}"
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-${RL_MAX_PROMPT_LENGTH:-}}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-${RL_MAX_RESPONSE_LENGTH:-}}"
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-${RL_DATALOADER_NUM_WORKERS:-0}}"
-ACTOR_MAX_TOKEN_LEN_PER_GPU="${ACTOR_MAX_TOKEN_LEN_PER_GPU:-${RL_ACTOR_MAX_TOKEN_LEN_PER_GPU:-8192}}"
-ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-${RL_ROLLOUT_MAX_MODEL_LEN:-}}"
-ROLLOUT_MAX_BATCHED_TOKENS="${ROLLOUT_MAX_BATCHED_TOKENS:-${RL_ROLLOUT_MAX_BATCHED_TOKENS:-4096}}"
-ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-${RL_ROLLOUT_MAX_NUM_SEQS:-4}}"
-ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-${RL_ROLLOUT_ENFORCE_EAGER:-True}}"
-ROLLOUT_ENABLE_PREFIX_CACHING="${ROLLOUT_ENABLE_PREFIX_CACHING:-${RL_ROLLOUT_ENABLE_PREFIX_CACHING:-False}}"
-ROLLOUT_ENABLE_CHUNKED_PREFILL="${ROLLOUT_ENABLE_CHUNKED_PREFILL:-${RL_ROLLOUT_ENABLE_CHUNKED_PREFILL:-True}}"
-ROLLOUT_FREE_CACHE_ENGINE="${ROLLOUT_FREE_CACHE_ENGINE:-${RL_ROLLOUT_FREE_CACHE_ENGINE:-False}}"
-SAVE_FREQ="${SAVE_FREQ:-${RL_SAVE_FREQ:-10}}"
-TEST_FREQ="${TEST_FREQ:-${RL_TEST_FREQ:-5}}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-${RL_TOTAL_EPOCHS:-10}}"
-LOGGER="${LOGGER:-${RL_LOGGER:-[\"console\"]}}"
-LR="${LR:-${RL_LR:-1e-6}}"
-LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-${RL_LR_SCHEDULER_TYPE:-cosine}}"
-KL_LOSS_COEF="${KL_LOSS_COEF:-${RL_KL_LOSS_COEF:-0.01}}"
-TEMPERATURE="${TEMPERATURE:-${RL_TEMPERATURE:-}}"
-VAL_TEMPERATURE="${VAL_TEMPERATURE:-${RL_VAL_TEMPERATURE:-}}"
-
-for REQUIRED_KEY in MAX_PROMPT_LENGTH MAX_RESPONSE_LENGTH TEMPERATURE VAL_TEMPERATURE; do
-    if [ -z "${!REQUIRED_KEY:-}" ]; then
-        echo "Missing required config: $REQUIRED_KEY"
-        echo "Set it in PROFILE_PATH (recommended) or export $REQUIRED_KEY / RL_${REQUIRED_KEY} before launch."
-        exit 1
-    fi
-done
+PROJECT_NAME="$RL_PROJECT_NAME"
+EXP_NAME="$RL_EXP_NAME"
+TRAINER_LOCAL_DIR="$RL_TRAINER_LOCAL_DIR"
+NNODES="$RL_NNODES"
+NUM_GPUS="$RL_NUM_GPUS"
+TRAIN_BATCH_SIZE="$RL_TRAIN_BATCH_SIZE"
+PPO_MINI_BATCH_SIZE="$RL_PPO_MINI_BATCH_SIZE"
+PPO_MICRO_BATCH_SIZE="$RL_PPO_MICRO_BATCH_SIZE"
+LOGPROB_MICRO_BATCH_SIZE="$RL_LOGPROB_MICRO_BATCH_SIZE"
+ROLLOUT_GPU_MEMORY_UTILIZATION="$RL_ROLLOUT_GPU_MEMORY_UTILIZATION"
+ROLLOUT_LOAD_FORMAT="$RL_ROLLOUT_LOAD_FORMAT"
+ROLLOUT_N="$RL_ROLLOUT_N"
+ROLLOUT_TP="$RL_ROLLOUT_TP"
+FSDP_MODEL_DTYPE="$RL_FSDP_MODEL_DTYPE"
+FSDP_USE_TORCH_COMPILE="$RL_FSDP_USE_TORCH_COMPILE"
+MAX_PROMPT_LENGTH="$RL_MAX_PROMPT_LENGTH"
+MAX_RESPONSE_LENGTH="$RL_MAX_RESPONSE_LENGTH"
+DATALOADER_NUM_WORKERS="$RL_DATALOADER_NUM_WORKERS"
+ACTOR_MAX_TOKEN_LEN_PER_GPU="$RL_ACTOR_MAX_TOKEN_LEN_PER_GPU"
+ROLLOUT_MAX_MODEL_LEN="$RL_ROLLOUT_MAX_MODEL_LEN"
+ROLLOUT_MAX_BATCHED_TOKENS="$RL_ROLLOUT_MAX_BATCHED_TOKENS"
+ROLLOUT_MAX_NUM_SEQS="$RL_ROLLOUT_MAX_NUM_SEQS"
+ROLLOUT_ENFORCE_EAGER="$RL_ROLLOUT_ENFORCE_EAGER"
+ROLLOUT_ENABLE_PREFIX_CACHING="$RL_ROLLOUT_ENABLE_PREFIX_CACHING"
+ROLLOUT_ENABLE_CHUNKED_PREFILL="$RL_ROLLOUT_ENABLE_CHUNKED_PREFILL"
+ROLLOUT_FREE_CACHE_ENGINE="$RL_ROLLOUT_FREE_CACHE_ENGINE"
+SAVE_FREQ="$RL_SAVE_FREQ"
+TEST_FREQ="$RL_TEST_FREQ"
+TOTAL_EPOCHS="$RL_TOTAL_EPOCHS"
+LOGGER="$RL_LOGGER"
+LR="$RL_LR"
+LR_SCHEDULER_TYPE="$RL_LR_SCHEDULER_TYPE"
+KL_LOSS_COEF="$RL_KL_LOSS_COEF"
+TEMPERATURE="$RL_TEMPERATURE"
+VAL_TEMPERATURE="$RL_VAL_TEMPERATURE"
 
 if [ "${ROLLOUT_ENABLE_CHUNKED_PREFILL}" != "True" ] && [ -n "${ROLLOUT_MAX_MODEL_LEN:-}" ]; then
     if [ "${ROLLOUT_MAX_BATCHED_TOKENS}" -lt "${ROLLOUT_MAX_MODEL_LEN}" ]; then
@@ -237,7 +230,7 @@ CMD=(
     "data.max_prompt_length=$MAX_PROMPT_LENGTH"
     "data.max_response_length=$MAX_RESPONSE_LENGTH"
     "data.dataloader_num_workers=$DATALOADER_NUM_WORKERS"
-    "data.filter_overlong_prompts=True"
+    "data.filter_overlong_prompts=False"
     "data.truncation=error"
     "data.return_raw_chat=True"
     "reward.custom_reward_function.path=$REWARD_FN_PATH"
@@ -282,7 +275,7 @@ CMD=(
     "actor_rollout_ref.ref.fsdp_config.use_torch_compile=$FSDP_USE_TORCH_COMPILE"
     "actor_rollout_ref.ref.fsdp_config.param_offload=True"
     "algorithm.use_kl_in_reward=False"
-    "algorithm.norm_adv_by_std_in_grpo=False"
+    "algorithm.norm_adv_by_std_in_grpo=True"
     "trainer.logger=$LOGGER"
     "trainer.default_local_dir=$TRAINER_LOCAL_DIR"
     "trainer.project_name=$PROJECT_NAME"

@@ -47,22 +47,13 @@ def record_requires_paper_turn3_protocol(record: dict[str, Any]) -> bool:
 
 
 def extract_candidate_answer_text(record: dict[str, Any]) -> tuple[str, str]:
-    # 1) SFT-style messages
     assistant_content = get_last_assistant_content(record)
     if assistant_content:
         return assistant_content, "messages.last_assistant"
 
-    # 2) Teacher curated jsonl often has prediction text without XML tags
     teacher_prediction = str(record.get("teacher_prediction_text", "") or "").strip()
     if teacher_prediction:
-        # Wrap to reuse the same parser/checker path.
         return f"<answer>\n{teacher_prediction}\n</answer>", "teacher_prediction_text"
-
-    # 3) Other fallback fields
-    for key in ("response", "answer", "target", "final_answer"):
-        value = str(record.get(key, "") or "").strip()
-        if value:
-            return value, key
 
     return "", "none"
 

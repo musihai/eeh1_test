@@ -6,7 +6,12 @@ from typing import Optional
 
 import pandas as pd
 
-from recipe.time_series_forecast.config_utils import get_default_lengths
+from recipe.time_series_forecast.config_utils import (
+    ETTH1_FEATURE_COLUMNS,
+    expected_model_input_width,
+    expected_model_seq_len,
+    get_default_lengths,
+)
 from recipe.time_series_forecast.diagnostic_features import (
     extract_basic_statistics,
     extract_data_quality,
@@ -68,6 +73,32 @@ def _format_httpx_error(error: Exception) -> str:
     if detail:
         return f"{type(error).__name__}: {detail}"
     return type(error).__name__
+
+
+def _prediction_feature_columns(context_df: pd.DataFrame) -> list[str]:
+    feature_columns = list(context_df.attrs.get("feature_columns") or [])
+    if feature_columns:
+        return feature_columns
+    target_column = str(context_df.attrs.get("target_column") or "target")
+    return [target_column]
+
+
+def _validate_neural_forecast_contract(context_df: pd.DataFrame, *, model_name: str) -> None:
+    feature_columns = _prediction_feature_columns(context_df)
+    expected_width = expected_model_input_width(model_name)
+    if expected_width is not None and len(feature_columns) != expected_width:
+        raise ValueError(
+            f"{model_name} expects {expected_width}-variable ETTh1 multivariate input "
+            f"{list(ETTH1_FEATURE_COLUMNS)}, but the current prompt provides "
+            f"{len(feature_columns)} variable(s): {feature_columns}"
+        )
+
+    expected_seq_len = expected_model_seq_len(model_name)
+    if expected_seq_len is not None and len(context_df) != expected_seq_len:
+        raise ValueError(
+            f"{model_name} expects lookback_window={expected_seq_len}, but received "
+            f"{len(context_df)} historical rows"
+        )
 
 
 async def predict_time_series_async(
@@ -155,6 +186,9 @@ async def _predict_via_model_service(
 ) -> pd.DataFrame:
     import httpx
 
+    if model_name in {"patchtst", "itransformer"}:
+        _validate_neural_forecast_contract(context_df, model_name=str(model_name))
+
     client = await _get_httpx_client()
     service_url = _resolve_model_service_url(model_service_url)
     request_data = _build_prediction_request(
@@ -173,9 +207,18 @@ async def _predict_via_model_service(
             }
         )
     except httpx.HTTPError as error:
+        detail_suffix = ""
+        response = getattr(error, "response", None)
+        if response is not None:
+            try:
+                response_body = response.text.strip()
+            except Exception:
+                response_body = ""
+            if response_body:
+                detail_suffix = f" detail={response_body}"
         raise RuntimeError(
             f"{error_label} service error: {_format_httpx_error(error)}. "
-            f"Make sure the model service is running at {service_url}"
+            f"Make sure the model service is running at {service_url}.{detail_suffix}"
         )
 
 

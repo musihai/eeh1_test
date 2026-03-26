@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from recipe.time_series_forecast.build_etth1_rl_dataset import (
+    _resolve_difficulty_stage,
     build_ground_truth,
     build_prompt,
     build_train_stage_slices,
@@ -93,6 +94,14 @@ class TestETTh1RLDatasetBuilder(unittest.TestCase):
         self.assertIn(first["normalized_permutation_entropy_band"], {"low", "medium", "high"})
         self.assertIn(first["reference_teacher_error_band"], {"unknown", "low", "medium", "high"})
         self.assertIn(first["difficulty_stage"], {"easy", "medium", "hard", "unknown"})
+
+    def test_resolve_difficulty_stage_uses_two_axis_curriculum(self) -> None:
+        self.assertEqual(_resolve_difficulty_stage("low", "low"), "easy")
+        self.assertEqual(_resolve_difficulty_stage("medium", "low"), "medium")
+        self.assertEqual(_resolve_difficulty_stage("high", "medium"), "medium")
+        self.assertEqual(_resolve_difficulty_stage("low", "high"), "hard")
+        self.assertEqual(_resolve_difficulty_stage("high", "high"), "hard")
+        self.assertEqual(_resolve_difficulty_stage("unknown", "unknown"), "unknown")
 
     def test_teacher_metadata_coverage_reports_fraction(self) -> None:
         coverage = compute_teacher_metadata_coverage(

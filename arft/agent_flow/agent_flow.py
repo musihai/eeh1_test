@@ -32,11 +32,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
-try:
-    from verl.experimental.reward_loop import RewardLoopWorker, RewardModelManager
-except ImportError:
-    # Backward compatibility with older verl layouts.
-    from verl.experimental.reward import RewardLoopWorker, RewardModelManager
+from verl.experimental.reward_loop import RewardLoopWorker, RewardModelManager
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import hf_processor, hf_tokenizer
@@ -48,25 +44,22 @@ from verl.utils.rollout_trace import (
     rollout_trace_attr,
     rollout_trace_op,
 )
-try:
-    from verl.utils.transferqueue_utils import (
-        create_transferqueue_client as _create_transferqueue_client,
-        tqbridge,
-    )
-except ImportError:
-    def tqbridge(*args, **kwargs):
-        def _decorator(func):
-            return func
-
-        return _decorator
-
-    def _create_transferqueue_client(*args, **kwargs):
-        raise RuntimeError("TransferQueue utilities are unavailable in this verl build.")
 from verl.workers.rollout.replica import RolloutMode, TokenOutput, get_rollout_replica_class
 from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def tqbridge(*args, **kwargs):
+    def _decorator(func):
+        return func
+
+    return _decorator
+
+
+def _create_transferqueue_client(*args, **kwargs):
+    raise RuntimeError("TransferQueue is not available in this deployment.")
 
 
 class AgentFlowMetrics(BaseModel):
@@ -256,8 +249,7 @@ class AgentFlowBase(ABC):
     async def _postprocess(self, step: AgentFlowStep, **kwargs) -> _InternalAgentFlowStep:
         step.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
-        # NOTE: consistent with the legacy batch version of generate_sequences that existed in the
-        # deprecated vLLM SPMD rollout implementation.
+        # Token packing follows the current rollout tensor contract:
         # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
         # response_ids: right padded with zeros (e.g., [5,6,7,8,0,0,0,0])
         # input_ids: concatenation of prompt + response
@@ -442,8 +434,6 @@ class AgentFlowBase(ABC):
         #     result = await self.reward_manager_worker.compute_score.remote(data)
         #     step.reward_score = result["reward_score"]
         #     step.extra_fields["reward_extra_info"] = result["reward_extra_info"]
-
-        assert step.reward_score is not None, "Reward score is required for agent flow"
 
         return _InternalAgentFlowStep(
             prompt_ids=prompt_output["input_ids"],
@@ -669,12 +659,14 @@ class AgentFlowWorkerBase:
         reward_tensors = []
         response_logprobs_list = []
         routed_experts_list = []
+        terminal_reward_scores = []
         for input in inputs:
             num_step = len(input.steps)
             num_steps.append(num_step)
-            trajectory_uids.extend([uuid4().hex] * num_step)
+            trajectory_uid = uuid4().hex
+            trajectory_uids.extend([trajectory_uid] * num_step)
             step_indices.extend(range(num_step))
-            for step in input.steps:
+            for step_idx, step in enumerate(input.steps):
                 prompt_ids.append(step.prompt_ids)
                 response_ids.append(step.response_ids)
                 response_mask.append(step.response_mask)
@@ -686,32 +678,24 @@ class AgentFlowWorkerBase:
                 num_turns.append(step.num_turns)
                 response_logprobs_list.append(step.response_logprobs)
                 routed_experts_list.append(step.routed_experts)
+                reward_tensor = torch.zeros_like(step.response_mask, dtype=torch.float32)
                 if step.reward_score is not None:
-                    # For each step, create a reward tensor of same shape as response_mask, fill last valid position with reward
-                    reward_tensor = torch.zeros_like(step.response_mask, dtype=torch.float32)
                     valid_length = step.response_mask.sum().item()
                     reward_tensor[0, valid_length - 1] = float(step.reward_score)
-                    reward_tensors.append(reward_tensor)
-                else:
-                    reward_tensors.append(None)
+                reward_tensors.append(reward_tensor)
+                if step_idx == num_step - 1 and step.reward_score is not None:
+                    terminal_reward_scores.append(float(step.reward_score))
 
-        raw_reward_scores = [
-            float(step.reward_score)
-            for input_item in inputs
-            for step in input_item.steps
-            if step.reward_score is not None
-        ]
-        if raw_reward_scores:
+        if terminal_reward_scores:
             append_chain_debug(
                 "trainer_reward_input",
                 {
-                    "num_samples": len(raw_reward_scores),
-                    "reward_scores_head": raw_reward_scores[:20],
-                    "reward_min": float(min(raw_reward_scores)),
-                    "reward_max": float(max(raw_reward_scores)),
-                    "reward_mean": float(sum(raw_reward_scores) / len(raw_reward_scores)),
-                    "has_negative": any(score < 0 for score in raw_reward_scores),
-                    "clamp_applied": False,
+                    "num_trajectories": len(terminal_reward_scores),
+                    "terminal_reward_scores_head": terminal_reward_scores[:20],
+                    "terminal_reward_min": float(min(terminal_reward_scores)),
+                    "terminal_reward_max": float(max(terminal_reward_scores)),
+                    "terminal_reward_mean": float(sum(terminal_reward_scores) / len(terminal_reward_scores)),
+                    "has_negative_terminal_reward": any(score < 0 for score in terminal_reward_scores),
                 },
             )
         
@@ -743,9 +727,8 @@ class AgentFlowWorkerBase:
             batch_size=prompt_ids.size(0),
         )
 
-        if all(reward_tensor is not None for reward_tensor in reward_tensors):
-            reward_tensor = torch.cat(reward_tensors, dim=0)
-            batch["rm_scores"] = reward_tensor
+        reward_tensor = torch.cat(reward_tensors, dim=0)
+        batch["rm_scores"] = reward_tensor
 
         non_tensor_batch = {
             "trajectory_uids": np.array(trajectory_uids, dtype=object),
@@ -865,8 +848,7 @@ class AgentFlowManager:
         self.reward_model_manager = None
         self.reward_router_address = None
         if self.config.reward_model.enable and self.config.reward_model.enable_resource_pool:
-            # TODO (dyy): current rm is colocated with the legacy fsdp/megatron rm
-            # future pr will depericate fsdp/megatron rm and init RewardModelManager in standalone mode
+            # RewardModelManager is initialized through its dedicated resource pool.
             self.reward_model_manager = RewardModelManager(config.reward_model, rm_resource_pool)
             self.reward_router_address = self.reward_model_manager.get_router_address()
 

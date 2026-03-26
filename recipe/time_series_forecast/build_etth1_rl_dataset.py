@@ -5,13 +5,21 @@ import math
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 
+from recipe.time_series_forecast.config_utils import (
+    ETTH1_COVARIATE_COLUMNS,
+    ETTH1_FEATURE_COLUMNS,
+    ETTH1_TARGET_COLUMN,
+)
 from recipe.time_series_forecast.dataset_file_utils import load_jsonl_records, write_jsonl_records, write_metadata_file
-from recipe.time_series_forecast.dataset_identity import DATASET_KIND_RL_JSONL
+from recipe.time_series_forecast.dataset_identity import (
+    DATASET_KIND_RL_JSONL,
+    HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS,
+)
 from recipe.time_series_forecast.utils import extract_data_quality
 
 
@@ -26,7 +34,11 @@ DEFAULT_OUTPUT_DIR = Path("dataset/ett_rl_etth1_paper_same2")
 DEFAULT_TRAIN_ROWS = 12251
 DEFAULT_VAL_ROWS = 1913
 DEFAULT_TEST_ROWS = 3256
-DEFAULT_ETTH1_FEATURE_COLUMNS = ("HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT")
+CURRICULUM_STAGE_DEFINITIONS = {
+    "easy": "low teacher error and low entropy",
+    "medium": "higher teacher error while entropy stays low to medium",
+    "hard": "high-entropy or stochastic windows",
+}
 
 
 @dataclass(frozen=True)
@@ -41,38 +53,36 @@ class SplitConfig:
 
 
 def build_prompt(
-    historical_context: Iterable[float] | pd.DataFrame,
+    historical_context: pd.DataFrame,
     *,
     lookback_window: int,
     forecast_horizon: int,
     target_column: str,
 ) -> str:
-    if isinstance(historical_context, pd.DataFrame):
-        feature_columns = [column for column in DEFAULT_ETTH1_FEATURE_COLUMNS if column in historical_context.columns]
-        if target_column not in feature_columns and target_column in historical_context.columns:
-            feature_columns.append(target_column)
-        if not feature_columns:
-            raise ValueError("Historical ETTh1 prompt context must contain at least the target column")
+    if not isinstance(historical_context, pd.DataFrame):
+        raise TypeError("ETTh1 paper-aligned RL prompts require a multivariate DataFrame history window.")
 
-        value_lines = "\n".join(
-            f"{row.date} "
-            + " ".join(f"{column}={float(getattr(row, column)):.4f}" for column in feature_columns)
-            for row in historical_context.itertuples(index=False)
+    required_columns = ["date", *ETTH1_FEATURE_COLUMNS]
+    missing_columns = [column for column in required_columns if column not in historical_context.columns]
+    if missing_columns:
+        raise ValueError(
+            f"Historical ETTh1 prompt context is missing required multivariate columns: {missing_columns}"
         )
-        task_header = "[Task] Multivariate time-series forecasting."
-        covariate_columns = [column for column in feature_columns if column != target_column]
-        covariate_line = (
-            f"Observed Covariates: {', '.join(covariate_columns)}\n" if covariate_columns else ""
+    if target_column != ETTH1_TARGET_COLUMN:
+        raise ValueError(
+            f"ETTh1 paper-aligned RL prompts require target_column=`{ETTH1_TARGET_COLUMN}`, got `{target_column}`"
         )
-    else:
-        value_lines = "\n".join(f"{float(value):.4f}" for value in historical_context)
-        task_header = "[Task] Single-variable time-series forecasting."
-        covariate_line = ""
+
+    value_lines = "\n".join(
+        f"{row.date} "
+        + " ".join(f"{column}={float(getattr(row, column)):.4f}" for column in ETTH1_FEATURE_COLUMNS)
+        for row in historical_context.itertuples(index=False)
+    )
 
     return (
-        f"{task_header}\n"
+        "[Task] Multivariate time-series forecasting.\n"
         f"Target Column: {target_column}\n"
-        f"{covariate_line}"
+        f"Observed Covariates: {', '.join(ETTH1_COVARIATE_COLUMNS)}\n"
         f"Lookback Window: {lookback_window}\n"
         f"Forecast Horizon: {forecast_horizon}\n"
         "Requirements:\n"
@@ -173,11 +183,17 @@ def _band_value(value: Optional[float], thresholds: tuple[Optional[float], Optio
 
 
 def _resolve_difficulty_stage(error_band: str, entropy_band: str) -> str:
-    rank_map = {"low": 0, "medium": 1, "high": 2}
-    available_ranks = [rank_map[band] for band in (error_band, entropy_band) if band in rank_map]
-    if not available_ranks:
+    known_error_band = error_band in {"low", "medium", "high"}
+    known_entropy_band = entropy_band in {"low", "medium", "high"}
+    if not known_error_band and not known_entropy_band:
         return "unknown"
-    return ("easy", "medium", "hard")[max(available_ranks)]
+    if entropy_band == "high":
+        return "hard"
+    if error_band == "low" and entropy_band == "low":
+        return "easy"
+    if known_error_band and known_entropy_band:
+        return "medium"
+    return "unknown"
 
 
 def _resolve_reference_teacher_error(metadata: dict[str, Any]) -> Optional[float]:
@@ -385,6 +401,13 @@ def main() -> None:
     metadata: dict[str, object] = {
         "dataset_kind": DATASET_KIND_RL_JSONL,
         "pipeline_stage": "curriculum_rl" if any(teacher_metadata_paths.values()) else "base_rl",
+        "curriculum_policy": "teacher_error_entropy_two_axis",
+        "curriculum_stage_definitions": CURRICULUM_STAGE_DEFINITIONS,
+        "task_type": "multivariate time-series forecasting",
+        "historical_data_protocol": HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS,
+        "observed_feature_columns": list(ETTH1_FEATURE_COLUMNS),
+        "observed_covariates": list(ETTH1_COVARIATE_COLUMNS),
+        "model_input_width": len(ETTH1_FEATURE_COLUMNS),
         "source_csv": str(csv_path),
         "target_column": args.target_column,
         "lookback_window": args.lookback_window,
@@ -443,6 +466,9 @@ def main() -> None:
         metadata[f"{split.name}_teacher_metadata_coverage_count"] = coverage_count
         metadata[f"{split.name}_entropy_thresholds"] = _quantile_thresholds(entropy_values)
         metadata[f"{split.name}_reference_teacher_error_thresholds"] = _quantile_thresholds(reference_teacher_errors)
+        metadata[f"{split.name}_curriculum_stage_distribution"] = dict(
+            sorted(Counter(str(record.get("curriculum_stage", "unknown")) for record in records).items())
+        )
         print(
             f"[RL-DATA] split={split.name} rows={split.num_rows} samples={count} -> {output_path}"
         )

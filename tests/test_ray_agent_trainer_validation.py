@@ -4,16 +4,19 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from tensordict import TensorDict
 
 from arft.ray_agent_trainer import RayAgentTrainer, evaluate_validation_reward_manager
 from recipe.time_series_forecast.reward import append_turn3_generation_debug
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager.naive import NaiveRewardManager
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.utils import tensordict_utils as tu
 
 
 class _AsyncRewardManager:
@@ -119,13 +122,42 @@ class TestValidationRewardManager(unittest.TestCase):
 
         self.assertEqual(trainer._resolve_current_epoch(), 0)
 
+    def test_ray_ppo_trainer_old_log_prob_skips_entropy_when_entropy_coeff_is_zero(self) -> None:
+        trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+        trainer.use_legacy_worker_impl = "disable"
+        trainer.config = OmegaConf.create({"actor_rollout_ref": {"actor": {"entropy_coeff": 0.0}}})
+
+        captured = {}
+
+        class _WorkerGroup:
+            def compute_log_prob(self, batch_td):
+                captured["calculate_entropy"] = tu.get(batch_td, "calculate_entropy")
+                return tu.get_tensordict(
+                    {"log_probs": torch.ones((1, 2), dtype=torch.float32)},
+                    non_tensor_dict={"metrics": {"mfu": 0.5}},
+                )
+
+        trainer.actor_rollout_wg = _WorkerGroup()
+        batch = DataProto(
+            batch=TensorDict({"dummy": torch.ones((1, 1), dtype=torch.float32)}, batch_size=[1]),
+            meta_info={},
+        )
+
+        with (
+            patch("verl.trainer.ppo.ray_trainer.left_right_2_no_padding", lambda batch_td: batch_td),
+            patch("verl.trainer.ppo.ray_trainer.no_padding_2_padding", lambda value, batch_td: value),
+        ):
+            old_log_prob, old_log_prob_mfu = trainer._compute_old_log_prob(batch)
+
+        self.assertFalse(captured["calculate_entropy"])
+        self.assertEqual(old_log_prob_mfu, 0.5)
+        self.assertIn("old_log_probs", old_log_prob.batch.keys())
+        self.assertNotIn("entropys", old_log_prob.batch.keys())
+
     def test_rl_launcher_supports_val_only_mode(self) -> None:
         project_dir = os.path.dirname(os.path.dirname(__file__))
         script_path = os.path.join(project_dir, "examples/time_series_forecast/run_qwen3-1.7B.sh")
-        checkpoint_path = os.path.join(
-            project_dir,
-            "artifacts/checkpoints/sft/time_series_forecast_sft_paper_strict_heuristicroute_balanced_3gpu_20260323/global_step_33/huggingface",
-        )
+        checkpoint_path = "/data/linyujie/models/Qwen3-1.7B"
         result = subprocess.run(
             [
                 "bash",
@@ -146,9 +178,33 @@ class TestValidationRewardManager(unittest.TestCase):
         self.assertIn("trainer.val_only=True", result.stdout)
         self.assertIn("trainer.val_before_train=True", result.stdout)
         self.assertIn("data.train_batch_size=3", result.stdout)
+        self.assertIn("data.filter_overlong_prompts=False", result.stdout)
         self.assertIn("actor_rollout_ref.actor.ppo_mini_batch_size=3", result.stdout)
         self.assertIn("data.train_max_samples=32", result.stdout)
         self.assertIn("data.val_max_samples=256", result.stdout)
+
+    def test_sft_launcher_supports_print_only_with_sft_model_path(self) -> None:
+        project_dir = os.path.dirname(os.path.dirname(__file__))
+        script_path = os.path.join(project_dir, "examples/time_series_forecast/run_qwen3-1.7B_sft.sh")
+        result = subprocess.run(
+            [
+                "bash",
+                script_path,
+            ],
+            cwd=project_dir,
+            env={
+                **os.environ,
+                "PRINT_CMD_ONLY": "1",
+                "SFT_MODEL_PATH": "/data/linyujie/models/Qwen3-1.7B",
+            },
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        self.assertIn("model.path=/data/linyujie/models/Qwen3-1.7B", result.stdout)
+        self.assertIn("trainer.default_local_dir=", result.stdout)
+        self.assertIn("data.train_files=", result.stdout)
 
     def test_reward_manager_merges_reward_extra_keys_into_extra_info(self) -> None:
         captured = {}
@@ -189,14 +245,11 @@ class TestValidationRewardManager(unittest.TestCase):
     def test_turn3_generation_debug_uses_unified_chain_debug_file_only(self) -> None:
         previous_chain_debug = os.environ.get("TS_CHAIN_DEBUG")
         previous_chain_file = os.environ.get("TS_CHAIN_DEBUG_FILE")
-        previous_legacy_file = os.environ.get("TS_TURN3_DEBUG_FILE")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             chain_file = os.path.join(tmp_dir, "ts_chain_debug_smoke.jsonl")
-            legacy_file = os.path.join(tmp_dir, "turn3_generation_debug_legacy.jsonl")
             os.environ["TS_CHAIN_DEBUG"] = "1"
             os.environ["TS_CHAIN_DEBUG_FILE"] = chain_file
-            os.environ["TS_TURN3_DEBUG_FILE"] = legacy_file
             try:
                 append_turn3_generation_debug(
                     data_source="ETTh1",
@@ -238,13 +291,8 @@ class TestValidationRewardManager(unittest.TestCase):
                     os.environ.pop("TS_CHAIN_DEBUG_FILE", None)
                 else:
                     os.environ["TS_CHAIN_DEBUG_FILE"] = previous_chain_file
-                if previous_legacy_file is None:
-                    os.environ.pop("TS_TURN3_DEBUG_FILE", None)
-                else:
-                    os.environ["TS_TURN3_DEBUG_FILE"] = previous_legacy_file
 
             self.assertTrue(os.path.exists(chain_file))
-            self.assertFalse(os.path.exists(legacy_file))
 
             with open(chain_file, "r", encoding="utf-8") as handle:
                 rows = [json.loads(line) for line in handle if line.strip()]
@@ -338,7 +386,7 @@ class TestValidationRewardManager(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             os.environ["TS_MIN_DEBUG_DIR"] = tmp_dir
             try:
-                trainer._write_min_eval_debug_files(
+                returned_agg_row, returned_sample_rows = trainer._write_min_eval_debug_files(
                     sample_uids=["sample-0", "sample-1", "sample-2"],
                     sample_outputs=[success_output, failure_output, near_miss_output],
                     sample_gts=[gt_text, gt_text, gt_text],
@@ -353,6 +401,8 @@ class TestValidationRewardManager(unittest.TestCase):
 
             with open(os.path.join(tmp_dir, "eval_step_aggregate.jsonl"), "r", encoding="utf-8") as handle:
                 agg_row = json.loads(handle.readline())
+
+            self.assertEqual(returned_agg_row["validation_reward_mean"], agg_row["validation_reward_mean"])
 
             self.assertAlmostEqual(agg_row["exact_96_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["final_answer_accept_ratio"], 1.0 / 3.0, places=6)
@@ -411,6 +461,8 @@ class TestValidationRewardManager(unittest.TestCase):
             with open(os.path.join(tmp_dir, "eval_step_samples.jsonl"), "r", encoding="utf-8") as handle:
                 sample_rows = [json.loads(line) for line in handle if line.strip()]
 
+            self.assertEqual(len(returned_sample_rows), len(sample_rows))
+
             near_miss_row = next(
                 row for row in sample_rows if row["category"] == "near_miss_94_95" and row["sample_id"] == "sample-2"
             )
@@ -443,6 +495,29 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertIn("filled_orig_mse", near_miss_row)
             self.assertIn("filled_norm_mse", near_miss_row)
             self.assertAlmostEqual(near_miss_row["filled_raw_mse"], near_miss_row["filled_orig_mse"], places=6)
+
+    def test_flatten_validation_aggregate_metrics_emits_scalar_val_agg_metrics(self) -> None:
+        agg_row = {
+            "step": 12,
+            "validation_reward_mean": 0.42,
+            "orig_mse_mean": 5.1,
+            "final_answer_accept_ratio": 0.875,
+            "refinement_improved_ratio": 0.125,
+            "patchtst_share": 0.5,
+            "selected_model_distribution": {"patchtst": 4, "arima": 4},
+            "format_failure_reason_distribution": {"missing_answer_close_tag": 1},
+        }
+
+        metrics = RayAgentTrainer._flatten_validation_aggregate_metrics(agg_row)
+
+        self.assertEqual(metrics["val-agg/validation_reward_mean"], 0.42)
+        self.assertEqual(metrics["val-agg/orig_mse_mean"], 5.1)
+        self.assertEqual(metrics["val-agg/final_answer_accept_ratio"], 0.875)
+        self.assertEqual(metrics["val-agg/refinement_improved_ratio"], 0.125)
+        self.assertEqual(metrics["val-agg/patchtst_share"], 0.5)
+        self.assertNotIn("val-agg/step", metrics)
+        self.assertNotIn("val-agg/selected_model_distribution", metrics)
+        self.assertNotIn("val-agg/format_failure_reason_distribution", metrics)
 
 
 if __name__ == "__main__":

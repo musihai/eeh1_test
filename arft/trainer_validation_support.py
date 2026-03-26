@@ -19,12 +19,9 @@ def evaluate_validation_reward_manager(
     *,
     auto_await_fn: Callable,
 ) -> dict[str, torch.Tensor | dict[str, list]]:
-    """Run validation reward for both legacy callable and new reward-loop managers."""
+    """Run validation reward through the unified reward-loop manager interface."""
     if val_reward_fn is None:
         raise ValueError("val_reward_fn must be provided for validation.")
-
-    if callable(val_reward_fn):
-        return val_reward_fn(batch, return_dict=True)
 
     run_single = getattr(val_reward_fn, "run_single", None)
     if run_single is None:
@@ -187,7 +184,7 @@ def write_min_eval_debug_files(
     sample_scores: list[float],
     reward_extra_infos_dict: dict[str, list],
     debug_dir: str | None = None,
-) -> None:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     n = len(sample_scores)
     if n <= 0:
         return
@@ -795,6 +792,8 @@ def write_min_eval_debug_files(
     with open(sample_file, "a", encoding="utf-8") as handle:
         for row in sample_rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    return agg_row, sample_rows
 
 
 __all__ = [

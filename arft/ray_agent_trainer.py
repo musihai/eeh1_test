@@ -124,7 +124,7 @@ def compute_advantage(
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
-    # Back-compatible with trainers that do not compute response mask in fit
+    # Some callers may provide batches before response_mask is materialized.
     if "response_mask" not in data.batch.keys():
         data.batch["response_mask"] = compute_response_mask(data)
     advantages = torch.zeros_like(data.batch["token_level_rewards"])
@@ -158,6 +158,7 @@ def compute_advantage(
             response_mask=valid_data.batch["response_mask"],
             index=valid_data.non_tensor_batch["uid"],
             trajectory_uids=valid_data.non_tensor_batch["trajectory_uids"],
+            step_indices=valid_data.non_tensor_batch["step_indices"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
         advantages[valid_mask] = valid_advantages
@@ -221,8 +222,8 @@ class RayAgentTrainer(RayPPOTrainer):
         sample_gts: list,
         sample_scores: list[float],
         reward_extra_infos_dict: dict[str, list],
-    ) -> None:
-        _write_min_eval_debug_files(
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        return _write_min_eval_debug_files(
             global_steps=int(self.global_steps),
             sample_uids=sample_uids,
             sample_outputs=sample_outputs,
@@ -230,6 +231,21 @@ class RayAgentTrainer(RayPPOTrainer):
             sample_scores=sample_scores,
             reward_extra_infos_dict=reward_extra_infos_dict,
         )
+
+    @staticmethod
+    def _flatten_validation_aggregate_metrics(agg_row: dict[str, object]) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+        for key, value in agg_row.items():
+            if key == "step":
+                continue
+            if isinstance(value, bool):
+                metrics[f"val-agg/{key}"] = float(value)
+                continue
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                numeric = float(value)
+                if math.isfinite(numeric):
+                    metrics[f"val-agg/{key}"] = numeric
+        return metrics
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -494,13 +510,14 @@ class RayAgentTrainer(RayPPOTrainer):
         append_chain_debug("validation_metrics", validation_debug_info)
 
         try:
-            self._write_min_eval_debug_files(
+            agg_row, _ = self._write_min_eval_debug_files(
                 sample_uids=sample_uids,
                 sample_outputs=sample_outputs,
                 sample_gts=sample_gts,
                 sample_scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
             )
+            metric_dict.update(self._flatten_validation_aggregate_metrics(agg_row))
         except Exception as exc:
             append_chain_debug(
                 "validation_min_debug_error",

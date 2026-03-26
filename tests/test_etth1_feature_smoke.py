@@ -49,10 +49,13 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
         )
 
     def _run_dataset_case(self, dataset_path: str, protocol_kind: str) -> None:
-        if protocol_kind == "timestamped":
+        if protocol_kind == "timestamped_csv":
             prompt_text = self._build_timestamped_prompt_from_csv()
             spec = parse_task_prompt(prompt_text, data_source="ETTh1")
         else:
+            df = pd.read_csv("dataset/ETT-small/ETTh1.csv").iloc[:96]
+            self.timestamped_expected_first = str(df.iloc[0]["date"])
+            self.timestamped_expected_last = str(df.iloc[-1]["date"])
             sample = json.loads(Path(dataset_path).read_text(encoding="utf-8").splitlines()[0])
             prompt_text = sample["raw_prompt"][0]["content"]
             spec = parse_task_prompt(prompt_text, data_source=sample.get("data_source"))
@@ -65,30 +68,20 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
         timestamps, values = parse_time_series_string(spec.historical_data, target_column=spec.target_column)
         self.assertEqual(len(values), 96)
         self.assertEqual(len(timestamps), 96)
-
-        if protocol_kind == "value_only":
-            self.assertTrue(all(ts is None for ts in timestamps))
-        else:
-            self.assertEqual(timestamps[0], self.timestamped_expected_first)
-            self.assertEqual(timestamps[-1], self.timestamped_expected_last)
+        self.assertEqual(timestamps[0], self.timestamped_expected_first)
+        self.assertEqual(timestamps[-1], self.timestamped_expected_last)
 
         df = parse_time_series_to_dataframe(
             spec.historical_data,
             series_id="ETTh1",
             target_column=spec.target_column,
-            include_covariates=(protocol_kind == "timestamped"),
+            include_covariates=True,
         )
         self.assertEqual(len(df), 96)
-        if protocol_kind == "value_only":
-            self.assertEqual(list(df.columns), ["id", "timestamp", "target"])
-        else:
-            self.assertEqual(
-                list(df.columns),
-                ["id", "timestamp", "target", "HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"],
-            )
-        if protocol_kind == "value_only":
-            self.assertEqual(str(df.iloc[0]["timestamp"]), "2000-01-01 00:00:00")
-            self.assertEqual(str(df.iloc[1]["timestamp"]), "2000-01-01 01:00:00")
+        self.assertEqual(
+            list(df.columns),
+            ["id", "timestamp", "target", "HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", "OT"],
+        )
 
         feature_sets = [
             extract_basic_statistics(values),
@@ -105,16 +98,16 @@ class ETTh1FeatureSmokeTest(unittest.TestCase):
         self.assertIn("ETTh1", prompt)
         self.assertIn("OT", prompt)
 
-    def test_paper_aligned_value_only_protocol(self) -> None:
+    def test_paper_aligned_dataset_uses_multivariate_protocol(self) -> None:
         self._run_dataset_case(
             "dataset/ett_rl_etth1_paper_same2/train.jsonl",
-            protocol_kind="value_only",
+            protocol_kind="paper_multivariate_dataset",
         )
 
-    def test_singlevar_timestamped_protocol(self) -> None:
+    def test_csv_timestamped_protocol(self) -> None:
         self._run_dataset_case(
             "",
-            protocol_kind="timestamped",
+            protocol_kind="timestamped_csv",
         )
 
     def test_model_configs_and_agent_import(self) -> None:

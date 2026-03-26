@@ -230,6 +230,9 @@ class TaskRunner:
 
     def add_critic_worker(self, config):
         """Add critic worker to role mapping."""
+        if not need_critic(config):
+            return
+
         from verl.trainer.ppo.ray_trainer import Role
 
         critic_spec = build_critic_worker_spec(config)

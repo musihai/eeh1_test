@@ -20,10 +20,12 @@ from recipe.time_series_forecast.build_etth1_high_quality_sft import (
     select_curated_evaluations,
     split_predictor_device_groups,
 )
+from recipe.time_series_forecast.config_utils import ETTH1_COVARIATE_COLUMNS, ETTH1_FEATURE_COLUMNS, ETTH1_TARGET_COLUMN
 from recipe.time_series_forecast.dataset_identity import (
     DATASET_KIND_RL_JSONL,
     DATASET_KIND_RUNTIME_SFT_PARQUET,
     DATASET_KIND_TEACHER_CURATED_SFT,
+    HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS,
 )
 
 
@@ -687,6 +689,12 @@ class TestHighQualitySFTBuilder(unittest.TestCase):
                     {
                         "dataset_kind": DATASET_KIND_RL_JSONL,
                         "pipeline_stage": "curriculum_rl",
+                        "task_type": "multivariate time-series forecasting",
+                        "historical_data_protocol": HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS,
+                        "target_column": ETTH1_TARGET_COLUMN,
+                        "observed_feature_columns": list(ETTH1_FEATURE_COLUMNS),
+                        "observed_covariates": list(ETTH1_COVARIATE_COLUMNS),
+                        "model_input_width": len(ETTH1_FEATURE_COLUMNS),
                     },
                     ensure_ascii=False,
                 )

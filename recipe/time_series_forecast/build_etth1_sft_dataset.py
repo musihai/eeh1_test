@@ -13,16 +13,24 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 import pandas as pd
 
+from recipe.time_series_forecast.config_utils import (
+    ETTH1_COVARIATE_COLUMNS,
+    ETTH1_FEATURE_COLUMNS,
+    ETTH1_TARGET_COLUMN,
+)
 from recipe.time_series_forecast.prompts import (
     FEATURE_TOOL_SCHEMAS,
     PREDICT_TIMESERIES_TOOL_SCHEMA,
     build_runtime_user_prompt,
     build_timeseries_system_prompt,
 )
+from recipe.time_series_forecast.time_series_io import DEFAULT_FORECAST_HORIZON, DEFAULT_LOOKBACK_WINDOW
 from recipe.time_series_forecast.dataset_identity import (
     DATASET_KIND_RL_JSONL,
     DATASET_KIND_RUNTIME_SFT_PARQUET,
     DATASET_KIND_TEACHER_CURATED_SFT,
+    HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS,
+    require_multivariate_etth1_metadata,
     validate_sibling_metadata,
 )
 from recipe.time_series_forecast.dataset_file_utils import write_metadata_file
@@ -82,7 +90,7 @@ DEFAULT_TURN3_TARGET_MODE = TURN3_TARGET_MODE_PAPER_STRICT
 DEFAULT_ROUTING_LABEL_SOURCE = ROUTING_LABEL_SOURCE_HEURISTIC
 DEFAULT_SFT_STAGE_MODE = SFT_STAGE_MODE_FULL
 DEFAULT_TRAIN_TURN3_REBALANCE_MODE = TRAIN_TURN3_REBALANCE_MODE_DOWNSAMPLE_KEEP
-DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise_heuristicroute")
+DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise")
 DEFAULT_CURATED_INPUT_DIR = Path("dataset/ett_sft_etth1_runtime_teacher200_paper_same2")
 DEFAULT_TRAIN_JSONL = DEFAULT_CURATED_INPUT_DIR / "train_curated.jsonl"
 DEFAULT_VAL_JSONL = DEFAULT_CURATED_INPUT_DIR / "val_curated.jsonl"
@@ -1492,11 +1500,8 @@ def build_sft_records(
             time_series_data=historical_data,
             history_analysis=history_analysis,
             prediction_results=None,
-            required_feature_tools=batch_tool_names,
+            available_feature_tools=batch_tool_names,
             completed_feature_tools=completed_feature_tools,
-            diagnostic_plan_reason=diagnostic_plan.rationale,
-            diagnostic_primary_model=diagnostic_plan.primary_model,
-            diagnostic_runner_up_model=diagnostic_plan.runner_up_model,
             turn_stage="diagnostic",
         )
         feature_tool_calls = [
@@ -1547,7 +1552,7 @@ def build_sft_records(
         time_series_data=historical_data,
         history_analysis=history_analysis,
         prediction_results=None,
-        required_feature_tools=selected_feature_tools,
+        available_feature_tools=selected_feature_tools,
         completed_feature_tools=selected_feature_tools,
         turn_stage="routing",
     )
@@ -1560,7 +1565,7 @@ def build_sft_records(
         history_analysis=history_analysis,
         prediction_results=turn3_base_prediction_text,
         prediction_model_used=selected_prediction_model,
-        required_feature_tools=selected_feature_tools,
+        available_feature_tools=selected_feature_tools,
         completed_feature_tools=selected_feature_tools,
         turn_stage="refinement",
     )
@@ -1646,17 +1651,17 @@ def build_sft_record(
         raise ValueError("build_sft_records returned no records")
     for record in records:
         if str(record.get("turn_stage") or "").strip().lower() == "refinement":
-            compatible = dict(record)
-            compatible["sample_index"] = int(sample.get("index", -1))
-            return compatible
+            selected_record = dict(record)
+            selected_record["sample_index"] = int(sample.get("index", -1))
+            return selected_record
     for record in records:
         if str(record.get("turn_stage") or "").strip().lower() == "routing":
-            compatible = dict(record)
-            compatible["sample_index"] = int(sample.get("index", -1))
-            return compatible
-    compatible = dict(records[-1])
-    compatible["sample_index"] = int(sample.get("index", -1))
-    return compatible
+            selected_record = dict(record)
+            selected_record["sample_index"] = int(sample.get("index", -1))
+            return selected_record
+    selected_record = dict(records[-1])
+    selected_record["sample_index"] = int(sample.get("index", -1))
+    return selected_record
 
 
 def convert_jsonl_to_sft_parquet(
@@ -2250,7 +2255,7 @@ def main() -> None:
     for split_path in (Path(args.train_jsonl), Path(args.val_jsonl), Path(args.test_jsonl)):
         if not split_path.exists():
             continue
-        _, source_metadata_path = validate_sibling_metadata(
+        source_metadata, source_metadata_path = validate_sibling_metadata(
             split_path,
             expected_kind=(
                 DATASET_KIND_TEACHER_CURATED_SFT,
@@ -2258,6 +2263,7 @@ def main() -> None:
                 DATASET_KIND_RL_JSONL,
             ),
         )
+        require_multivariate_etth1_metadata(source_metadata, metadata_path=source_metadata_path)
         source_metadata_paths.append(source_metadata_path)
     if source_metadata_paths:
         unique_source_metadata_paths = {str(path) for path in source_metadata_paths}
@@ -2366,6 +2372,14 @@ def main() -> None:
     metadata_kwargs = dict(
         dataset_kind=DATASET_KIND_RUNTIME_SFT_PARQUET,
         pipeline_stage="runtime_stepwise_sft",
+        task_type="multivariate time-series forecasting",
+        historical_data_protocol=HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS,
+        target_column=ETTH1_TARGET_COLUMN,
+        observed_feature_columns=list(ETTH1_FEATURE_COLUMNS),
+        observed_covariates=list(ETTH1_COVARIATE_COLUMNS),
+        model_input_width=len(ETTH1_FEATURE_COLUMNS),
+        lookback_window=DEFAULT_LOOKBACK_WINDOW,
+        forecast_horizon=DEFAULT_FORECAST_HORIZON,
         sft_stage_mode=sft_stage_mode,
         turn3_protocol="paper_think_answer_xml",
         turn3_target_mode=turn3_target_mode,

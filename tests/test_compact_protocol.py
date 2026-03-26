@@ -1,5 +1,4 @@
 import unittest
-from unittest.mock import patch
 
 import pandas as pd
 
@@ -13,11 +12,9 @@ from recipe.time_series_forecast.reward_metrics import (
     CHANGE_POINT_COMPONENT_SCORE_WEIGHT,
     PREDICTION_ERROR_SCORE_WEIGHT,
     SEASON_COMPONENT_SCORE_WEIGHT,
-    STRUCTURAL_TIE_BREAK_MAX_NORM_MSE,
-    STRUCTURAL_TIE_BREAK_SCALE,
     TREND_COMPONENT_SCORE_WEIGHT,
-    compute_structural_tie_break_gate,
 )
+from recipe.time_series_forecast.time_series_io import compact_historical_data_for_prompt
 from recipe.time_series_forecast.utils import compact_prediction_tool_output_from_string, format_prediction_tool_output
 
 
@@ -31,7 +28,7 @@ class CompactProtocolTests(unittest.TestCase):
             time_series_data="1.0000\n2.0000\n3.0000",
             history_analysis=["Basic Statistics:\n  Median: 2.0000"],
             prediction_results=None,
-            required_feature_tools=["extract_basic_statistics"],
+            available_feature_tools=["extract_basic_statistics"],
             completed_feature_tools=["extract_basic_statistics"],
             turn_stage="routing",
         )
@@ -40,7 +37,7 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertIn("Median: 2.0000", prompt)
         self.assertNotIn("already present earlier in this conversation", prompt)
 
-    def test_turn_two_prompt_uses_neutral_routing_instruction(self) -> None:
+    def test_turn_two_prompt_uses_paper_routing_instruction(self) -> None:
         prompt = build_runtime_user_prompt(
             data_source="ETTh1",
             target_column="OT",
@@ -49,16 +46,15 @@ class CompactProtocolTests(unittest.TestCase):
             time_series_data="1.0000\n2.0000\n3.0000",
             history_analysis=["Basic Statistics:\n  Median: 2.0000"],
             prediction_results=None,
-            required_feature_tools=["extract_basic_statistics"],
+            available_feature_tools=["extract_basic_statistics"],
             completed_feature_tools=["extract_basic_statistics"],
             turn_stage="routing",
         )
-        self.assertIn("inductive bias best matches the observed evidence", prompt)
-        self.assertIn("not on a fixed model-to-pattern template", prompt)
-        self.assertNotIn("patchtst` for local motifs", prompt)
-        self.assertNotIn("arima` for stable autocorrelation structure", prompt)
-        self.assertNotIn("chronos2` for irregular or quality-stressed windows", prompt)
-        self.assertNotIn("itransformer` for broader structural drift", prompt)
+        self.assertIn("Forecasting expert guidance", prompt)
+        self.assertIn("local temporal patterns with long-range dependencies", prompt)
+        self.assertIn("cross-channel dependencies or broader structural interactions", prompt)
+        self.assertIn("linear trends and stable seasonality", prompt)
+        self.assertIn("irregular, noisy, or zero-shot scenarios", prompt)
 
     def test_turn_three_prompt_omits_duplicate_predictions(self) -> None:
         prompt = build_runtime_user_prompt(
@@ -70,7 +66,7 @@ class CompactProtocolTests(unittest.TestCase):
             history_analysis=["Basic Statistics:\n  Median: 2.0000"],
             prediction_results="2017-05-02 00:00:00 4.0000",
             prediction_model_used="patchtst",
-            required_feature_tools=["extract_basic_statistics"],
+            available_feature_tools=["extract_basic_statistics"],
             completed_feature_tools=["extract_basic_statistics"],
             turn_stage="refinement",
         )
@@ -93,27 +89,6 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertNotIn("[Brief reflection", prompt)
         self.assertNotIn("[Final prediction", prompt)
 
-    def test_turn_three_prompt_relaxed_keep_bias_is_opt_in(self) -> None:
-        with patch.dict("os.environ", {"TS_RELAX_TURN3_KEEP_BIAS": "1"}):
-            prompt = build_runtime_user_prompt(
-                data_source="ETTh1",
-                target_column="OT",
-                lookback_window=96,
-                forecast_horizon=96,
-                time_series_data="1.0000\n2.0000\n3.0000",
-                history_analysis=["Basic Statistics:\n  Median: 2.0000"],
-                prediction_results="2017-05-02 00:00:00 4.0000",
-                prediction_model_used="patchtst",
-                required_feature_tools=["extract_basic_statistics"],
-                completed_feature_tools=["extract_basic_statistics"],
-                turn_stage="refinement",
-            )
-        self.assertIn("apply a limited local refinement", prompt)
-        self.assertIn("multiple short separated spans", prompt)
-        self.assertIn("constrained rewrite of more rows", prompt)
-        self.assertIn("Choose KEEP only when the base forecast already looks internally consistent", prompt)
-        self.assertNotIn("If unsure, choose KEEP", prompt)
-
     def test_turn_one_prompt_lists_available_diagnostic_tools(self) -> None:
         prompt = build_runtime_user_prompt(
             data_source="ETTh1",
@@ -123,41 +98,42 @@ class CompactProtocolTests(unittest.TestCase):
             time_series_data="1.0000\n2.0000\n3.0000",
             history_analysis=["Basic Statistics:\n  Median: 2.0000"],
             prediction_results=None,
-            required_feature_tools=["extract_basic_statistics", "extract_event_summary"],
+            available_feature_tools=["extract_basic_statistics", "extract_event_summary"],
             completed_feature_tools=["extract_basic_statistics"],
-            diagnostic_plan_reason="The window shows local oscillation, so I need a focused diagnostic pass.",
-            diagnostic_primary_model="patchtst",
-            diagnostic_runner_up_model="itransformer",
             turn_stage="diagnostic",
         )
-        self.assertIn("### Diagnostic Plan", prompt)
-        self.assertNotIn("patchtst", prompt)
-        self.assertNotIn("itransformer", prompt)
         self.assertIn("### Diagnostic Tool Schemas Available This Turn", prompt)
         self.assertIn("extract_event_summary", prompt)
         self.assertIn("call one or more feature tools", prompt)
-        self.assertIn("Follow the diagnostic plan", prompt)
+        self.assertIn("This is the planning and diagnostic stage", prompt)
+        self.assertIn("First decide what evidence you need", prompt)
         self.assertIn("Do NOT call predict_time_series", prompt)
 
-    def test_turn_one_prompt_can_opt_in_diagnostic_model_hints(self) -> None:
-        with patch.dict("os.environ", {"TS_INCLUDE_DIAGNOSTIC_MODEL_HINTS": "1"}):
-            prompt = build_runtime_user_prompt(
-                data_source="ETTh1",
-                target_column="OT",
-                lookback_window=96,
-                forecast_horizon=96,
-                time_series_data="1.0000\n2.0000\n3.0000",
-                history_analysis=["Basic Statistics:\n  Median: 2.0000"],
-                prediction_results=None,
-                required_feature_tools=["extract_basic_statistics", "extract_event_summary"],
-                completed_feature_tools=["extract_basic_statistics"],
-                diagnostic_plan_reason="The window shows local oscillation, so I need a focused diagnostic pass.",
-                diagnostic_primary_model="patchtst",
-                diagnostic_runner_up_model="itransformer",
-                turn_stage="diagnostic",
-            )
-        self.assertIn("patchtst", prompt)
-        self.assertIn("itransformer", prompt)
+    def test_turn_one_prompt_compacts_multivariate_historical_window(self) -> None:
+        historical_data = "\n".join(
+            f"2016-08-29 {hour:02d}:00:00 HUFL={15.0 + hour:.4f} OT={25.8170 + hour:.4f}"
+            for hour in range(16)
+        )
+        prompt = build_runtime_user_prompt(
+            data_source="ETTh1",
+            target_column="OT",
+            lookback_window=96,
+            forecast_horizon=96,
+            time_series_data=historical_data,
+            history_analysis=[],
+            prediction_results=None,
+            available_feature_tools=["extract_basic_statistics"],
+            completed_feature_tools=[],
+            turn_stage="diagnostic",
+        )
+        self.assertIn("timestamp,HUFL,OT", prompt)
+        self.assertIn("2016-08-29 00:00:00,15.0000,25.8170", prompt)
+        self.assertNotIn("HUFL=15.0000 OT=25.8170", prompt)
+
+    def test_compact_historical_data_keeps_short_value_only_series_verbatim(self) -> None:
+        historical_data = "1.0000\n2.0000\n3.0000"
+        compact = compact_historical_data_for_prompt(historical_data, target_column="OT")
+        self.assertEqual(compact, historical_data)
 
     def test_compact_prediction_tool_output_keeps_single_timestamp_anchor(self) -> None:
         prediction_text = (
@@ -225,16 +201,13 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertEqual(result["format_failure_reason"], "invalid_answer_shape:mixed_line_formats")
         self.assertAlmostEqual(result["score"], -1.0, places=6)
 
-    def test_composite_reward_uses_mse_first_structural_tie_break(self) -> None:
+    def test_composite_reward_uses_fixed_weight_multi_view_aggregation(self) -> None:
         self.assertTrue(ENABLE_CHANGE_POINT_SCORE)
         self.assertTrue(ENABLE_SEASON_TREND_SCORE)
         self.assertGreater(
             PREDICTION_ERROR_SCORE_WEIGHT,
             2 * CHANGE_POINT_COMPONENT_SCORE_WEIGHT + SEASON_COMPONENT_SCORE_WEIGHT + TREND_COMPONENT_SCORE_WEIGHT,
         )
-        self.assertGreater(STRUCTURAL_TIE_BREAK_MAX_NORM_MSE, 0.0)
-        self.assertGreater(STRUCTURAL_TIE_BREAK_SCALE, 0.0)
-        self.assertLess(STRUCTURAL_TIE_BREAK_SCALE, 1.0)
 
         ground_truth = (
             "2017-05-02 00:00:00 10.0000\n"
@@ -256,19 +229,14 @@ class CompactProtocolTests(unittest.TestCase):
             places=6,
         )
         self.assertTrue(result["strict_length_match"])
-        self.assertAlmostEqual(result["structural_tie_break_gate"], STRUCTURAL_TIE_BREAK_SCALE, places=6)
         self.assertAlmostEqual(result["change_point_score"], 0.0, places=6)
         self.assertAlmostEqual(result["season_trend_score"], 0.0, places=6)
         self.assertAlmostEqual(result["orig_mse"], 0.0, places=6)
         self.assertAlmostEqual(result["norm_mse"], 0.0, places=6)
 
-    def test_structural_tie_break_gate_turns_off_for_large_norm_mse(self) -> None:
-        self.assertAlmostEqual(compute_structural_tie_break_gate(STRUCTURAL_TIE_BREAK_MAX_NORM_MSE), 0.0, places=6)
-        self.assertAlmostEqual(compute_structural_tie_break_gate(STRUCTURAL_TIE_BREAK_MAX_NORM_MSE * 2), 0.0, places=6)
-
-    def test_composite_reward_adds_only_small_structural_bonus_when_prediction_is_close(self) -> None:
+    def test_composite_reward_keeps_structural_components_active_beyond_low_mse_region(self) -> None:
         ground_truth_values = [10.0, 12.0, 15.0, 18.0, 16.0, 13.0, 11.0, 14.0]
-        prediction_values = [10.1, 12.1, 15.1, 18.1, 16.1, 13.1, 11.1, 14.1]
+        prediction_values = [15.0, 17.0, 20.0, 23.0, 21.0, 18.0, 16.0, 19.0]
         ground_truth = "\n".join(
             f"2017-05-02 {idx:02d}:00:00 {value:.4f}" for idx, value in enumerate(ground_truth_values)
         )
@@ -277,13 +245,22 @@ class CompactProtocolTests(unittest.TestCase):
         result = compute_score(data_source="time_series", solution_str=solution, ground_truth=ground_truth)
 
         self.assertGreater(result["mse_score"], 0.0)
-        self.assertGreater(result["structural_tie_break_gate"], 0.0)
-        self.assertGreaterEqual(result["change_point_score"] + result["season_trend_score"], 0.0)
+        self.assertGreater(result["norm_mse"], 0.5)
+        self.assertGreater(result["change_point_score"] + result["season_trend_score"], 0.0)
         self.assertLessEqual(
             result["change_point_score"] + result["season_trend_score"],
             (2 * CHANGE_POINT_COMPONENT_SCORE_WEIGHT + SEASON_COMPONENT_SCORE_WEIGHT + TREND_COMPONENT_SCORE_WEIGHT)
-            * STRUCTURAL_TIE_BREAK_SCALE
             + 1e-6,
+        )
+        self.assertAlmostEqual(
+            result["score"],
+            result["format_score"]
+            + result["length_score"]
+            + result["mse_score"]
+            + result["change_point_score"]
+            + result["season_trend_score"]
+            - result["length_penalty"],
+            places=6,
         )
 
     def test_reward_rejects_under_generation_against_ground_truth_length(self) -> None:

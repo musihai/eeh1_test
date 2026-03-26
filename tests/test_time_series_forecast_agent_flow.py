@@ -23,8 +23,6 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         flow.forecast_horizon = 96
         flow.response_length = 4096
         flow.steps = []
-        flow.diagnostic_tool_batches = []
-        flow.diagnostic_plan_reason = ""
         flow.feature_tool_sequence = []
         flow.history_analysis = []
         flow.required_feature_tools = []
@@ -167,28 +165,24 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         refinement_names = [tool["function"]["name"] for tool in flow._tool_schemas_for_turn("refinement")]
 
         self.assertIn("extract_basic_statistics", diagnostic_names)
+        self.assertIn("extract_event_summary", diagnostic_names)
         self.assertNotIn("predict_time_series", diagnostic_names)
         self.assertEqual(routing_names, ["predict_time_series"])
         self.assertEqual(refinement_names, [])
 
-    def test_build_user_prompt_includes_diagnostic_plan(self) -> None:
+    def test_build_user_prompt_uses_policy_owned_diagnostic_stage(self) -> None:
         flow = self._make_flow()
         flow.data_source = "ETTh1"
         flow.target_column = "OT"
         flow.lookback_window = 96
         flow.time_series_data = "1.0000\n2.0000\n3.0000"
-        flow.required_feature_tools = ["extract_basic_statistics", "extract_event_summary"]
-        flow.diagnostic_tool_batches = [["extract_basic_statistics", "extract_event_summary"]]
-        flow.diagnostic_plan_reason = (
-            "The window mixes oscillation and drift, so I will inspect baseline autocorrelation and segment-level events."
-        )
 
         prompt = flow._build_user_prompt()
 
-        self.assertIn("### Diagnostic Plan", prompt)
-        self.assertNotIn("patchtst", prompt)
-        self.assertNotIn("itransformer", prompt)
-        self.assertIn("Follow the diagnostic plan", prompt)
+        self.assertNotIn("### Diagnostic Plan", prompt)
+        self.assertIn("planning and diagnostic stage", prompt)
+        self.assertIn("extract_event_summary", prompt)
+        self.assertIn("First decide what evidence you need", prompt)
 
     def test_build_user_prompt_uses_canonical_timestamped_prediction_values_in_refinement(self) -> None:
         flow = self._make_flow()
@@ -213,35 +207,21 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("must use `YYYY-MM-DD HH:MM:SS value`", prompt)
         self.assertIn("Do NOT emit any later timestamp", prompt)
 
-    def test_current_turn_stage_waits_for_required_feature_coverage(self) -> None:
+    def test_current_turn_stage_moves_to_routing_after_any_diagnostic_analysis(self) -> None:
         flow = self._make_flow()
-        flow.required_feature_tools = ["extract_basic_statistics", "extract_event_summary"]
-        flow.diagnostic_tool_batches = [["extract_basic_statistics", "extract_event_summary"]]
-        flow.basic_statistics = {"median": 1.0}
-
         self.assertEqual(flow._current_turn_stage(), "diagnostic")
-
-        flow.event_summary = {"event_segment_count": 1.0}
+        flow.basic_statistics = {"median": 1.0}
         self.assertEqual(flow._current_turn_stage(), "routing")
 
-    def test_tool_schemas_only_expose_current_diagnostic_batch(self) -> None:
+    def test_refinement_sampling_params_keep_training_temperature(self) -> None:
         flow = self._make_flow()
-        flow.required_feature_tools = [
-            "extract_basic_statistics",
-            "extract_event_summary",
-            "extract_forecast_residuals",
-        ]
-        flow.diagnostic_tool_batches = [
-            ["extract_basic_statistics", "extract_event_summary"],
-            ["extract_forecast_residuals"],
-        ]
-
-        first_batch_names = [tool["function"]["name"] for tool in flow._tool_schemas_for_turn("diagnostic")]
-        self.assertEqual(first_batch_names, ["extract_basic_statistics", "extract_event_summary"])
-
-        flow.basic_statistics = {"median": 1.0}
-        second_names = [tool["function"]["name"] for tool in flow._tool_schemas_for_turn("diagnostic")]
-        self.assertEqual(second_names, ["extract_event_summary"])
+        params = flow._prepare_sampling_params(
+            {"temperature": 1.0, "top_p": 0.95, "max_tokens": 4096},
+            turn_stage="refinement",
+        )
+        self.assertEqual(params["temperature"], 1.0)
+        self.assertEqual(params["top_p"], 0.95)
+        self.assertIn("</answer>", params["stop"])
 
     def test_append_turn_debug_records_sample_uid(self) -> None:
         flow = self._make_flow()
@@ -269,8 +249,8 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
 
         payload = mock_append.call_args.args[1]
         self.assertEqual(payload["sample_uid"], "etth1-val-00077")
-        self.assertEqual(payload["required_feature_tool_count"], 1)
-        self.assertEqual(payload["required_feature_tool_signature"], "extract_basic_statistics")
+        self.assertEqual(payload["required_feature_tool_count"], 0)
+        self.assertEqual(payload["required_feature_tool_signature"], "none")
         self.assertEqual(payload["final_answer_step_index"], 3)
 
 

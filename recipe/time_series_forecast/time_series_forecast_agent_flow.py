@@ -28,7 +28,6 @@ from verl.utils.rollout_trace import rollout_trace_op
 
 from recipe.time_series_forecast.agent_flow_feature_tools import FEATURE_TOOL_SPECS
 from recipe.time_series_forecast.agent_flow_support import (
-    analysis_coverage_ratio,
     analysis_state_signature,
     build_prediction_tool_debug_payload,
     build_turn_debug_payload,
@@ -37,7 +36,6 @@ from recipe.time_series_forecast.agent_flow_support import (
     current_turn_stage,
     expected_prediction_count,
     feature_tool_signature,
-    normalize_required_feature_tool_names,
     required_step_budget,
     sample_uid_text,
     shared_reward_tracking_fields,
@@ -68,9 +66,6 @@ from recipe.time_series_forecast.reward import (
 from recipe.time_series_forecast.reward_protocol import extract_forecast_block, normalized_nonempty_lines
 from recipe.time_series_forecast.diagnostic_policy import (
     FEATURE_TOOL_ORDER,
-    build_diagnostic_plan,
-    plan_diagnostic_tool_batches,
-    select_feature_tool_names,
 )
 
 logger = logging.getLogger(__file__)
@@ -117,10 +112,6 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
     def _reset_episode_state(self) -> None:
         self.history_analysis = []
         self.steps = []
-        self.required_feature_tools = []
-        self.diagnostic_tool_batches = []
-        self.diagnostic_plan_reason = ""
-        self.absolute_step_budget = None
         self.final_answer = None
         self.final_answer_reject_reason = None
         self.final_answer_parse_mode = None
@@ -184,23 +175,6 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 self.parse_error_message,
             )
             self.timestamps, self.values = [], []
-
-        if self.values:
-            diagnostic_plan = build_diagnostic_plan([float(value) for value in self.values])
-            self.required_feature_tools = list(diagnostic_plan.tool_names)
-            self.diagnostic_plan_reason = diagnostic_plan.rationale
-        else:
-            self.required_feature_tools = ["extract_basic_statistics"]
-            self.diagnostic_plan_reason = (
-                "The series could not be parsed cleanly, so I start with baseline statistics before attempting routing."
-            )
-        self.diagnostic_tool_batches = plan_diagnostic_tool_batches(
-            list(self.required_feature_tools),
-            max_parallel_calls=int(self.max_parallel_calls or 1),
-        )
-        configured_max_steps = int(getattr(self, "max_steps", 0) or 0)
-        required_turns = len(self.diagnostic_tool_batches) + self._max_prediction_attempts() + 1
-        self.absolute_step_budget = max(configured_max_steps, required_turns)
 
         metrics = {}
         request_id = uuid4().hex[:8]
@@ -490,15 +464,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         Returns:
             Tuple of (is_valid, penalty_score, message)
         """
-        # Check 1: The agent must complete the required diagnostic analysis before routing.
-        missing_required_tools = self._missing_required_feature_tools()
-        if missing_required_tools:
-            return (
-                False,
-                -0.5,
-                "Complete the required diagnostic feature tools before routing. "
-                f"Missing: {', '.join(missing_required_tools)}.",
-            )
+        # Check 1: The agent must complete some diagnostic analysis before routing.
         if not self._has_diagnostic_analysis():
             return False, -0.5, "At least one diagnostic feature tool must be executed before routing."
         
@@ -564,7 +530,6 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         return current_turn_stage(
             prediction_results=self.prediction_results,
             executed_feature_tool_names=self._executed_feature_tool_names(),
-            required_feature_tool_names=self._required_feature_tool_names(),
         )
 
     def _max_prediction_attempts(self) -> int:
@@ -581,42 +546,11 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             max_prediction_attempts=self._max_prediction_attempts(),
         )
 
-    def _current_prompt_required_feature_tools(self) -> list[str]:
-        if self._current_turn_stage() == "diagnostic":
-            return self._current_diagnostic_tool_batch()
-        return self._required_feature_tool_names()
-
-    def _current_diagnostic_tool_batch(self) -> list[str]:
-        executed = set(self._executed_feature_tool_names())
-        for batch in list(getattr(self, "diagnostic_tool_batches", []) or []):
-            remaining = [name for name in batch if name not in executed]
-            if remaining:
-                return remaining
-        remaining_required = [name for name in self._required_feature_tool_names() if name not in executed]
-        if remaining_required:
-            return remaining_required
-        if not executed:
-            return ["extract_basic_statistics"]
-        return []
+    def _available_diagnostic_tool_names(self) -> list[str]:
+        return list(FEATURE_TOOL_ORDER)
 
     def _analysis_state_signature(self) -> str:
         return analysis_state_signature(self._executed_feature_tool_names())
-
-    def _analysis_coverage_ratio(self) -> float:
-        return analysis_coverage_ratio(
-            self._executed_feature_tool_names(),
-            self._required_feature_tool_names(),
-        )
-
-    def _required_feature_tool_names(self) -> list[str]:
-        return normalize_required_feature_tool_names(
-            list(getattr(self, "required_feature_tools", []) or []),
-            self._executed_feature_tool_names(),
-        )
-
-    def _required_feature_tool_signature(self) -> str:
-        required = self._required_feature_tool_names()
-        return "->".join(required) if required else "none"
 
     @staticmethod
     def _sample_uid_text(sample_uid: Any) -> str:
@@ -628,16 +562,6 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             for name, spec in FEATURE_TOOL_SPECS.items()
         }
         return [name for name in FEATURE_TOOL_ORDER if feature_state.get(name)]
-
-    def _missing_required_feature_tools(self) -> list[str]:
-        executed = set(self._executed_feature_tool_names())
-        return [name for name in self._required_feature_tool_names() if name not in executed]
-
-    def _has_required_feature_coverage(self) -> bool:
-        required = self._required_feature_tool_names()
-        if not required:
-            return self._has_diagnostic_analysis()
-        return len(self._missing_required_feature_tools()) == 0
 
     def _has_diagnostic_analysis(self) -> bool:
         return bool(self._executed_feature_tool_names())
@@ -658,7 +582,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             prediction_turn_stage=self.prediction_turn_stage or "",
             final_answer_step_index=self.final_answer_step_index,
             feature_tool_sequence=list(self.feature_tool_sequence),
-            required_feature_tools=list(getattr(self, "required_feature_tools", []) or []),
+            required_feature_tools=[],
             executed_feature_tool_names=self._executed_feature_tool_names(),
             history_analysis=list(self.history_analysis),
             required_step_budget=int(self._required_step_budget()),
@@ -698,7 +622,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 workflow_message=workflow_message,
                 reward_extra_info=reward_extra_info,
                 feature_tool_sequence=list(self.feature_tool_sequence),
-                required_feature_tools=list(getattr(self, "required_feature_tools", []) or []),
+                required_feature_tools=[],
                 executed_feature_tool_names=self._executed_feature_tool_names(),
                 history_analysis=list(self.history_analysis),
                 prediction_requested_model=self.prediction_requested_model or "",
@@ -721,10 +645,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         expected = self._expected_prediction_count()
         response_cap = int(self.response_length or 0) or 2048
         # Paper-style timestamp-value answers are much longer than the old
-        # numeric-only format. On the rebuilt mv1 tsfix SFT set, 96-step
-        # refinement responses cluster around ~2.7k tokens with Qwen3
-        # tokenization, so the old `expected * 12 + 256` cap truncates every
-        # valid answer before `</answer>`.
+        # numeric-only format. On the rebuilt paper-aligned ETTh1 SFT set,
+        # 96-step refinement responses cluster around ~2.7k tokens with Qwen3
+        # tokenization, so the old `expected * 12 + 256` cap truncates valid
+        # answers before `</answer>`.
         return min(response_cap, max(768, expected * 28 + 256))
 
     def _tool_turn_max_tokens(self) -> int:
@@ -757,9 +681,6 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         if stage == "refinement":
             params["stop"] = self._merge_stop_strings(params.get("stop"), ["</answer>"])
             params["include_stop_str_in_output"] = True
-            params["temperature"] = 0.0
-            params["top_p"] = 1.0
-            params["repetition_penalty"] = max(float(params.get("repetition_penalty", 1.0)), 1.05)
             final_turn_max_tokens = self._final_answer_max_tokens()
             if existing_max_tokens is None:
                 params["max_tokens"] = final_turn_max_tokens
@@ -780,12 +701,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
     def _tool_schemas_for_turn(self, turn_stage: str) -> list[dict[str, Any]]:
         if turn_stage == "diagnostic":
-            current_batch = set(self._current_diagnostic_tool_batch())
-            return [
-                schema
-                for schema in FEATURE_TOOL_SCHEMAS
-                if str(schema["function"]["name"]) in current_batch
-            ]
+            return list(FEATURE_TOOL_SCHEMAS)
         if turn_stage == "routing":
             return [PREDICT_TIMESERIES_TOOL_SCHEMA]
         return []
@@ -980,9 +896,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             history_analysis=self.history_analysis,
             prediction_results=prediction_payload,
             prediction_model_used=getattr(self, "prediction_model_used", None),
-            required_feature_tools=self._current_prompt_required_feature_tools(),
+            available_feature_tools=self._available_diagnostic_tool_names(),
             completed_feature_tools=self._executed_feature_tool_names(),
-            diagnostic_plan_reason=str(getattr(self, "diagnostic_plan_reason", "") or ""),
             turn_stage=turn_stage,
         )
 
@@ -1010,9 +925,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 logger.warning("predict_time_series called during diagnostic turn, rejected until next turn")
                 return None
 
-            if not self._has_required_feature_coverage():
+            if not self._has_diagnostic_analysis():
                 logger.warning(
-                    "predict_time_series called before required diagnostic feature coverage was completed",
+                    "predict_time_series called before any diagnostic feature tool was completed",
                 )
                 return None
 
@@ -1070,16 +985,6 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         if self._feature_tool_already_executed(tool_call.name):
             logger.warning("Feature tool %s attempted after it was already executed; rejected.", tool_call.name)
             return None
-
-        if turn_stage == "diagnostic":
-            current_batch = set(self._current_diagnostic_tool_batch())
-            if current_batch and tool_call.name not in current_batch:
-                logger.warning(
-                    "Feature tool %s attempted outside the current diagnostic batch %s; rejected.",
-                    tool_call.name,
-                    sorted(current_batch),
-                )
-                return None
 
         if tool_call.name in FEATURE_TOOL_SPECS:
             return self._run_feature_tool(tool_call.name)

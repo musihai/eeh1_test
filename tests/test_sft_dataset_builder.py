@@ -33,6 +33,8 @@ from recipe.time_series_forecast.build_etth1_sft_dataset import (
     repeat_local_refine_refinement_rows,
     repeat_priority_validated_keep_refinement_rows,
 )
+from recipe.time_series_forecast.config_utils import ETTH1_COVARIATE_COLUMNS, ETTH1_FEATURE_COLUMNS, ETTH1_TARGET_COLUMN
+from recipe.time_series_forecast.dataset_identity import HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS
 from recipe.time_series_forecast.diagnostic_policy import (
     FEATURE_TOOL_ORDER,
     plan_diagnostic_tool_batches,
@@ -663,6 +665,16 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             )
 
             captured_ratios: list[float] = []
+            source_metadata = {
+                "dataset_kind": "etth1_teacher_curated_sft",
+                "pipeline_stage": "teacher200_curated",
+                "task_type": "multivariate time-series forecasting",
+                "historical_data_protocol": HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS,
+                "target_column": ETTH1_TARGET_COLUMN,
+                "observed_feature_columns": list(ETTH1_FEATURE_COLUMNS),
+                "observed_covariates": list(ETTH1_COVARIATE_COLUMNS),
+                "model_input_width": len(ETTH1_FEATURE_COLUMNS),
+            }
 
             def _fake_convert_jsonl_to_sft_parquet(
                 *,
@@ -685,7 +697,7 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             with mock.patch("recipe.time_series_forecast.build_etth1_sft_dataset.parse_args", return_value=args):
                 with mock.patch(
                     "recipe.time_series_forecast.build_etth1_sft_dataset.validate_sibling_metadata",
-                    return_value=(None, tmp_path / "metadata.json"),
+                    return_value=(source_metadata, tmp_path / "metadata.json"),
                 ):
                     with mock.patch(
                         "recipe.time_series_forecast.build_etth1_sft_dataset.convert_jsonl_to_sft_parquet",
@@ -717,6 +729,7 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             self.assertEqual(captured_ratios, [0.35])
             metadata_kwargs = mock_write_metadata.call_args.args[1]
             self.assertEqual(metadata_kwargs["turn3_target_mode"], TURN3_TARGET_MODE_PAPER_STRICT)
+            self.assertEqual(metadata_kwargs["target_column"], ETTH1_TARGET_COLUMN)
             self.assertAlmostEqual(metadata_kwargs["train_min_local_refine_ratio"], 0.35, places=6)
             self.assertAlmostEqual(metadata_kwargs["requested_train_min_local_refine_ratio"], 0.35, places=6)
 

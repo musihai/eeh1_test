@@ -18,7 +18,9 @@ class _FakeForecastModel(torch.nn.Module):
 class TestModelServerBatch(unittest.TestCase):
     def test_predict_with_pytorch_model_batch_returns_one_response_per_request(self):
         original_model = model_server._models.get("patchtst")
+        original_config = model_server._configs.get("patchtst")
         model_server._models["patchtst"] = _FakeForecastModel()
+        model_server._configs["patchtst"] = {"enc_in": 1, "seq_len": 3}
         try:
             requests = [
                 model_server.PredictRequest(
@@ -45,6 +47,10 @@ class TestModelServerBatch(unittest.TestCase):
             responses = model_server.predict_with_pytorch_model_batch(requests, "patchtst")
         finally:
             model_server._models["patchtst"] = original_model
+            if original_config is None:
+                model_server._configs.pop("patchtst", None)
+            else:
+                model_server._configs["patchtst"] = original_config
 
         self.assertEqual(len(responses), 2)
         self.assertEqual(responses[0].values, [1.0, 2.0])
@@ -110,7 +116,63 @@ class TestModelServerBatch(unittest.TestCase):
             else:
                 model_server._configs["patchtst"] = original_config
 
-        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_predict_with_pytorch_model_batch_rejects_singlevar_request_for_multivariate_expert(self):
+        original_model = model_server._models.get("patchtst")
+        original_config = model_server._configs.get("patchtst")
+        model_server._models["patchtst"] = _FakeForecastModel()
+        model_server._configs["patchtst"] = {"enc_in": 7, "seq_len": 96}
+        try:
+            request = model_server.PredictRequest(
+                timestamps=[f"2016-01-01 {hour:02d}:00:00" for hour in range(96)],
+                values=[float(hour) for hour in range(96)],
+                feature_columns=["OT"],
+                target_column="OT",
+                prediction_length=96,
+                model_name="patchtst",
+            )
+            with self.assertRaises(HTTPException) as ctx:
+                model_server.predict_with_pytorch_model_batch([request], "patchtst")
+        finally:
+            model_server._models["patchtst"] = original_model
+            if original_config is None:
+                model_server._configs.pop("patchtst", None)
+            else:
+                model_server._configs["patchtst"] = original_config
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("expects 7 variables", str(ctx.exception.detail))
+
+    def test_predict_with_pytorch_model_batch_rejects_wrong_lookback_window(self):
+        original_model = model_server._models.get("patchtst")
+        original_config = model_server._configs.get("patchtst")
+        model_server._models["patchtst"] = _FakeForecastModel()
+        model_server._configs["patchtst"] = {"enc_in": 2, "seq_len": 96}
+        try:
+            request = model_server.PredictRequest(
+                timestamps=[
+                    "2016-01-01 00:00:00",
+                    "2016-01-01 01:00:00",
+                    "2016-01-01 02:00:00",
+                ],
+                values=[[10.0, 1.0], [20.0, 2.0], [30.0, 3.0]],
+                feature_columns=["HUFL", "OT"],
+                target_column="OT",
+                prediction_length=2,
+                model_name="patchtst",
+            )
+            with self.assertRaises(HTTPException) as ctx:
+                model_server.predict_with_pytorch_model_batch([request], "patchtst")
+        finally:
+            model_server._models["patchtst"] = original_model
+            if original_config is None:
+                model_server._configs.pop("patchtst", None)
+            else:
+                model_server._configs["patchtst"] = original_config
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("lookback_window=96", str(ctx.exception.detail))
 
 
 if __name__ == "__main__":

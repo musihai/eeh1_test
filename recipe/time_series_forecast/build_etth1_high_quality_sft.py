@@ -24,10 +24,18 @@ from recipe.time_series_forecast.build_etth1_sft_dataset import (
     distribution_from_series,
     rebalance_train_turn3_targets,
 )
+from recipe.time_series_forecast.config_utils import (
+    ETTH1_COVARIATE_COLUMNS,
+    ETTH1_FEATURE_COLUMNS,
+    ETTH1_TARGET_COLUMN,
+    get_default_lengths,
+)
 from recipe.time_series_forecast.dataset_identity import (
     DATASET_KIND_RL_JSONL,
     DATASET_KIND_RUNTIME_SFT_PARQUET,
     DATASET_KIND_TEACHER_CURATED_SFT,
+    HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS,
+    require_multivariate_etth1_metadata,
     validate_sibling_metadata,
 )
 from recipe.time_series_forecast.dataset_file_utils import (
@@ -52,6 +60,7 @@ DEFAULT_VAL_JSONL = Path("dataset/ett_rl_etth1_paper_same2/val.jsonl")
 DEFAULT_TEST_JSONL = Path("dataset/ett_rl_etth1_paper_same2/test.jsonl")
 DEFAULT_MODEL_SERVICE_URL = os.environ.get("MODEL_SERVICE_URL", "http://localhost:8994")
 PYTORCH_TEACHER_MODELS = {"patchtst", "itransformer"}
+DEFAULT_LOOKBACK_WINDOW, DEFAULT_FORECAST_HORIZON = get_default_lengths()
 
 def evenly_spaced_records(records: Sequence[dict[str, Any]], count: int) -> list[dict[str, Any]]:
     if count <= 0 or len(records) <= count:
@@ -1584,6 +1593,14 @@ def main() -> None:
         "dataset_kind": DATASET_KIND_RUNTIME_SFT_PARQUET,
         "pipeline_stage": "teacher200_runtime_sft",
         "curated_jsonl_dataset_kind": DATASET_KIND_TEACHER_CURATED_SFT,
+        "task_type": "multivariate time-series forecasting",
+        "historical_data_protocol": HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS,
+        "observed_feature_columns": list(ETTH1_FEATURE_COLUMNS),
+        "observed_covariates": list(ETTH1_COVARIATE_COLUMNS),
+        "model_input_width": len(ETTH1_FEATURE_COLUMNS),
+        "target_column": ETTH1_TARGET_COLUMN,
+        "lookback_window": DEFAULT_LOOKBACK_WINDOW,
+        "forecast_horizon": DEFAULT_FORECAST_HORIZON,
         "selection_method": "teacher_reward_scoring_with_bucketed_time_coverage_and_teacher_error_logging",
         "teacher_models": models,
         "max_concurrency": args.max_concurrency,
@@ -1611,6 +1628,7 @@ def main() -> None:
             path,
             expected_kind=DATASET_KIND_RL_JSONL,
         )
+        require_multivariate_etth1_metadata(source_metadata, metadata_path=source_metadata_path)
         metadata[f"source_{split_name}_metadata_path"] = str(source_metadata_path)
         metadata[f"source_{split_name}_pipeline_stage"] = str(source_metadata.get("pipeline_stage") or "")
         source_metadata_paths.append(source_metadata_path)

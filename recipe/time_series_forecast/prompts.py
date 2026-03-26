@@ -14,49 +14,9 @@
 
 from __future__ import annotations
 
-import os
-import re
 from typing import Optional, Sequence
 
-from recipe.time_series_forecast.time_series_io import get_last_timestamp
-
-
-def _env_flag(name: str, *, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "y", "on"}:
-        return True
-    if text in {"0", "false", "no", "n", "off"}:
-        return False
-    return default
-
-
-def _sanitize_diagnostic_plan_text(plan_text: str) -> str:
-    text = str(plan_text or "").strip()
-    if not text:
-        return ""
-
-    sanitized = re.sub(
-        r"\s*`[^`]+`\s+looks strongest, so I will gather the minimum evidence needed to confirm it before routing\.\s*",
-        " ",
-        text,
-        flags=re.IGNORECASE,
-    )
-    sanitized = re.sub(
-        r"\s*I need enough evidence to distinguish\s+`[^`]+`\s+from\s+`[^`]+`\.\s*",
-        " ",
-        sanitized,
-        flags=re.IGNORECASE,
-    )
-    sanitized = re.sub(r"\s+", " ", sanitized).strip()
-    return sanitized
-
-
-def _use_relaxed_turn3_keep_bias() -> bool:
-    return _env_flag("TS_RELAX_TURN3_KEEP_BIAS", default=False)
-
+from recipe.time_series_forecast.time_series_io import compact_historical_data_for_prompt, get_last_timestamp
 
 def _build_dataset_description(
     data_source: Optional[str],
@@ -147,20 +107,12 @@ def get_runtime_turn_info(
 
     if stage == "diagnostic":
         return "Diagnostic", (
-            "Inspect the historical series with feature-extraction tools only. "
+            "Plan what evidence to collect from the historical series, then use feature-extraction tools only. "
             "You may emit multiple feature-tool calls in parallel in this turn. "
             "Do NOT call predict_time_series yet."
         )
     if stage == "routing":
-        return "Routing", "Call predict_time_series exactly once with the model chosen from the current diagnostic memory state."
-    if _use_relaxed_turn3_keep_bias():
-        return "Refinement", (
-            "Convert the selected model forecast into the final protocol. Do NOT forecast again from scratch. "
-            f"Choose exactly one of two actions: KEEP the base forecast unchanged, or apply a limited local refinement on the same {forecast_horizon}-row template. "
-            "LOCAL_REFINE may adjust multiple short spans of numeric values, or a constrained rewrite that still preserves the provided timestamps, row order, and terminal row. "
-            "KEEP means the final answer must copy the provided forecast rows exactly. "
-            "Reuse the provided timestamps exactly, stop at the last provided row, and output only <think>...</think><answer>...</answer>."
-        )
+        return "Routing", "Choose one forecasting expert from the current analysis state and call predict_time_series exactly once."
     return "Refinement", (
         "Convert the selected model forecast into the final protocol. Do NOT forecast again from scratch. "
         "Choose exactly one of two actions: KEEP the base forecast unchanged, or apply one small local refinement on the same 96-row template. "
@@ -179,17 +131,18 @@ def build_runtime_user_prompt(
     history_analysis: Sequence[str] | None = None,
     prediction_results: Optional[str] = None,
     prediction_model_used: Optional[str] = None,
-    required_feature_tools: Sequence[str] | None = None,
+    available_feature_tools: Sequence[str] | None = None,
     completed_feature_tools: Sequence[str] | None = None,
-    diagnostic_plan_reason: Optional[str] = None,
-    diagnostic_primary_model: Optional[str] = None,
-    diagnostic_runner_up_model: Optional[str] = None,
     turn_stage: Optional[str] = None,
 ) -> str:
     history_records = list(history_analysis or [])
-    available_diagnostic_tools = [str(name) for name in (required_feature_tools or []) if str(name).strip()]
+    available_diagnostic_tools = [str(name) for name in (available_feature_tools or []) if str(name).strip()]
     completed_tools = [str(name) for name in (completed_feature_tools or []) if str(name).strip()]
     history_text = "\n".join(history_records) if history_records else "No previous analysis performed."
+    compact_history = compact_historical_data_for_prompt(
+        time_series_data,
+        target_column=target_column,
+    )
     stage_name, action = get_runtime_turn_info(
         history_records,
         prediction_results,
@@ -199,7 +152,6 @@ def build_runtime_user_prompt(
     normalized_stage = _normalize_turn_stage(turn_stage) or stage_name.lower()
 
     if normalized_stage == "refinement":
-        relaxed_turn3_keep_bias = _use_relaxed_turn3_keep_bias()
         model_line = f"### Selected Forecast Model: {prediction_model_used}\n" if prediction_model_used else ""
         terminal_timestamp = get_last_timestamp(prediction_results or "")
         prediction_lines = [line.strip() for line in str(prediction_results or "").splitlines() if line.strip()]
@@ -211,7 +163,7 @@ def build_runtime_user_prompt(
             f"### Final Required Forecast Row: {terminal_row}\n" if terminal_row else ""
         )
         truncated_history = truncate_time_series_data(
-            time_series_data,
+            compact_history,
             recent_rows=min(max(int(lookback_window or 96) // 2, 24), int(lookback_window or 96)),
         )
         return f"""**[Stage: {stage_name}] Action: {action}**
@@ -232,8 +184,8 @@ def build_runtime_user_prompt(
 3. Treat "Prediction Tool Output" as the canonical base forecast produced by the selected model. It is the only legal row template for <answer>.
 4. You must choose exactly one action:
    KEEP: copy the 96 forecast rows from "Prediction Tool Output" exactly once into <answer>, with identical timestamps and identical numeric values.
-   LOCAL_REFINE: {"keep the same 96 timestamps and row order, but change only a small contiguous set of numeric values. Most rows should remain identical to the base forecast." if not relaxed_turn3_keep_bias else "keep the same 96 timestamps and row order, but change only numeric values. You may edit multiple short separated spans when needed, or do a constrained rewrite of more rows while still preserving the provided timestamps, row order, and terminal row."}
-5. {"If unsure, choose KEEP." if not relaxed_turn3_keep_bias else "Choose KEEP only when the base forecast already looks internally consistent and you do not have a concrete reason to revise values."} Flat or repeated tail values are allowed and do NOT by themselves justify adding rows or inventing new timestamps.
+   LOCAL_REFINE: keep the same 96 timestamps and row order, but change only a small contiguous set of numeric values. Most rows should remain identical to the base forecast.
+5. If unsure, choose KEEP. Flat or repeated tail values are allowed and do NOT by themselves justify adding rows or inventing new timestamps.
 6. Reuse the timestamps from "Prediction Tool Output" in the same order. If you refine, adjust values only. Do NOT alter, renumber, skip, or invent timestamps.
 7. If <think> says KEEP, then <answer> must be an exact row-for-row copy of "Prediction Tool Output". Do NOT reorder rows, restart from an earlier timestamp, or splice in rows from another part of the sequence.
 8. Output ONLY one <think>...</think> block followed immediately by one <answer>...</answer> block.
@@ -244,47 +196,29 @@ def build_runtime_user_prompt(
 13. The {forecast_horizon}th row must be exactly the line shown in "Final Required Forecast Row". After you write that exact row, immediately output </answer>.
 14. Do NOT restart from row 1, do NOT duplicate the sequence, and do NOT continue a flat last value past the terminal timestamp.
 15. Do not add extra words, markdown, bullets, or commentary on answer lines.
-16. Stop immediately after </answer>, with no extra text after it.
-17. Your reply must start with <think>. Do NOT copy placeholder text or template scaffolding into the final answer."""
+        16. Stop immediately after </answer>, with no extra text after it.
+        17. Your reply must start with <think>. Do NOT copy placeholder text or template scaffolding into the final answer."""
 
     if normalized_stage == "diagnostic":
-        include_diagnostic_model_hints = _env_flag(
-            "TS_INCLUDE_DIAGNOSTIC_MODEL_HINTS",
-            default=False,
-        )
         available_tools_text = ", ".join(available_diagnostic_tools) if available_diagnostic_tools else "extract_basic_statistics"
-        raw_plan_text = str(diagnostic_plan_reason or "").strip()
-        plan_text = raw_plan_text if include_diagnostic_model_hints else _sanitize_diagnostic_plan_text(raw_plan_text)
-        plan_lines: list[str] = []
-        if plan_text:
-            plan_lines.append(plan_text)
-        if include_diagnostic_model_hints and diagnostic_primary_model and diagnostic_runner_up_model:
-            if diagnostic_primary_model == diagnostic_runner_up_model:
-                plan_lines.append(f"Current strongest routing hypothesis: `{diagnostic_primary_model}`.")
-            else:
-                plan_lines.append(
-                    f"Planned comparison focus: `{diagnostic_primary_model}` versus `{diagnostic_runner_up_model}`."
-                )
-        diagnostic_plan_block = "\n".join(plan_lines) if plan_lines else "Use the available feature tools to establish enough routing evidence."
         return f"""**[Stage: {stage_name}] Action: {action}**
 ### Lookback Window: {lookback_window} rows
 ### Forecast Horizon: {forecast_horizon} rows
 ### Historical Data
-{time_series_data}
+{compact_history}
 
 ### Analysis History
 {history_text}
-
-### Diagnostic Plan
-{diagnostic_plan_block}
 
 ### Diagnostic Tool Schemas Available This Turn
 {available_tools_text}
 
 **Instructions**:
-- Stay in the diagnostic stage and inspect the series through feature-extraction tools only.
-- Follow the diagnostic plan and call only the feature tools exposed in this turn.
+- This is the planning and diagnostic stage.
+- First decide what evidence you need from the current state before routing.
+- Stay in the diagnostic stage and call only the feature-extraction tools exposed in this turn.
 - You may call one or more feature tools in the same assistant turn.
+- Use the tool outputs to characterize statistical properties, temporal patterns, and possible non-stationarity.
 - Do NOT call predict_time_series in this turn.
 """
 
@@ -293,7 +227,7 @@ def build_runtime_user_prompt(
 ### Lookback Window: {lookback_window} rows
 ### Forecast Horizon: {forecast_horizon} rows
 ### Historical Data
-{time_series_data}
+{compact_history}
 
 ### Analysis Summary
 {history_text}
@@ -303,10 +237,12 @@ def build_runtime_user_prompt(
 
 **Instructions**:
 - Do NOT call feature extraction tools again.
-- Choose the model from the completed diagnostics and maintained memory state, not from a fixed default.
-- Compare the selected model against at least one plausible alternative in your reasoning before you call the tool.
-- Use the analysis history to choose the expert whose inductive bias best matches the observed evidence in the current window.
-- Base the decision on the maintained analysis state, not on a fixed model-to-pattern template.
+- Use the accumulated analysis history to choose the forecasting expert whose inductive bias best matches the observed evidence.
+- Forecasting expert guidance:
+  - `patchtst`: local temporal patterns with long-range dependencies.
+  - `itransformer`: cross-channel dependencies or broader structural interactions.
+  - `arima`: linear trends and stable seasonality.
+  - `chronos2`: irregular, noisy, or zero-shot scenarios.
 - Call predict_time_series exactly once with your chosen model_name.
 """
 
@@ -319,19 +255,17 @@ PREDICT_TIMESERIES_TOOL_SCHEMA = {
         "name": "predict_time_series",
         "description": (
             "Call this only in the routing turn after completing your diagnostic analysis turn. "
-            "Models: 'patchtst' (smooth windows with local periodicity), "
-            "'arima' (stable trend/seasonality), 'chronos2' (irregular or noisy windows), "
-            "'itransformer' (regime changes or longer-range dependencies). "
-            "Choose from the maintained diagnostic state rather than a fixed preference."
+            "Models: 'patchtst' (local temporal patterns with long-range dependencies), "
+            "'itransformer' (cross-channel dependencies or broader structural interactions), "
+            "'arima' (linear trends and stable seasonality), "
+            "'chronos2' (irregular, noisy, or zero-shot scenarios)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "model_name": {
                     "type": "string",
-                    "description": (
-                        "Model to use. Choose from the diagnostic evidence and maintained state rather than a fixed preference."
-                    ),
+                    "description": "Forecasting expert to invoke in the routing stage.",
                     "enum": ["patchtst", "itransformer", "arima", "chronos2"]
                 }
             },

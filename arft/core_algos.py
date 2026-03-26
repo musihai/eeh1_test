@@ -102,6 +102,7 @@ def compute_grpo_outcome_advantage(
     response_mask: torch.Tensor,
     index: np.ndarray,
     trajectory_uids: np.ndarray,
+    step_indices: np.ndarray,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -132,34 +133,44 @@ def compute_grpo_outcome_advantage(
             shape is (bs, response_length)
     """
     scores = token_level_rewards.sum(dim=-1)
-
-    request2score = {}
-    id2score = defaultdict(list)
-    id2mean = {}
-    id2std = {}
+    group_scores = defaultdict(list)
+    group_means = {}
+    group_stds = {}
+    terminal_score_by_trajectory = {}
+    terminal_row_by_trajectory = {}
 
     with torch.no_grad():
         bsz = scores.shape[0]
 
         for i in range(bsz):
-            if trajectory_uids[i] not in request2score:
-                request2score[trajectory_uids[i]] = scores[i]
-                id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                scores_tensor = torch.stack(id2score[idx])
-                id2mean[idx] = torch.mean(scores_tensor)
-                id2std[idx] = torch.std(scores_tensor)
+            trajectory_uid = trajectory_uids[i]
+            step_index = int(step_indices[i])
+            previous_terminal = terminal_row_by_trajectory.get(trajectory_uid)
+            if previous_terminal is None or step_index > previous_terminal[0]:
+                terminal_row_by_trajectory[trajectory_uid] = (step_index, i)
+
+        for trajectory_uid, (_, row_index) in terminal_row_by_trajectory.items():
+            terminal_score = scores[row_index]
+            terminal_score_by_trajectory[trajectory_uid] = terminal_score
+            group_scores[index[row_index]].append(terminal_score)
+
+        for group_id, group_score_list in group_scores.items():
+            if len(group_score_list) == 1:
+                group_means[group_id] = group_score_list[0]
+                group_stds[group_id] = torch.tensor(1.0, device=group_score_list[0].device)
+            elif len(group_score_list) > 1:
+                scores_tensor = torch.stack(group_score_list)
+                group_means[group_id] = torch.mean(scores_tensor)
+                group_stds[group_id] = torch.std(scores_tensor)
             else:
-                raise ValueError(f"no score in prompt index: {idx}")
+                raise ValueError(f"no terminal trajectory score in prompt index: {group_id}")
+
         for i in range(bsz):
+            terminal_score = terminal_score_by_trajectory[trajectory_uids[i]]
             if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                scores[i] = (terminal_score - group_means[index[i]]) / (group_stds[index[i]] + epsilon)
             else:
-                scores[i] = scores[i] - id2mean[index[i]]
+                scores[i] = terminal_score - group_means[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores

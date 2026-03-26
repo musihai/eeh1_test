@@ -174,9 +174,9 @@ class FinalAnswerParsingTest(unittest.TestCase):
         self.assertEqual(params["stop"], ["</answer>"])
         self.assertTrue(params["include_stop_str_in_output"])
         self.assertEqual(params["max_tokens"], 2944)
-        self.assertAlmostEqual(params["temperature"], 0.0, places=6)
-        self.assertAlmostEqual(params["top_p"], 1.0, places=6)
-        self.assertAlmostEqual(params["repetition_penalty"], 1.05, places=6)
+        self.assertAlmostEqual(params["temperature"], 0.3, places=6)
+        self.assertAlmostEqual(params["top_p"], 0.95, places=6)
+        self.assertNotIn("repetition_penalty", params)
 
     def test_non_final_turn_sampling_params_add_stop_and_cap_tokens(self) -> None:
         agent = self._make_agent()
@@ -226,7 +226,7 @@ class FinalAnswerParsingTest(unittest.TestCase):
         valid, penalty, message = agent._validate_workflow_completion(self._numeric_answer_lines(96))
         self.assertFalse(valid)
         self.assertLess(penalty, 0.0)
-        self.assertIn("Complete the required diagnostic feature tools", message)
+        self.assertIn("At least one diagnostic feature tool", message)
 
     def test_execute_tool_call_blocks_prediction_during_diagnostic_turn(self) -> None:
         agent = self._make_agent()
@@ -278,16 +278,13 @@ class FinalAnswerParsingTest(unittest.TestCase):
         result = asyncio.run(agent._execute_tool_call(tool_call, turn_stage="diagnostic"))
         self.assertIsNone(result)
 
-    def test_current_turn_stage_waits_until_required_diagnostics_finish(self) -> None:
+    def test_current_turn_stage_moves_to_routing_after_any_completed_diagnostic(self) -> None:
         agent = self._make_agent()
         agent.prediction_results = None
         agent.basic_statistics = None
         agent.event_summary = None
-        agent.required_feature_tools = ["extract_basic_statistics", "extract_event_summary"]
         self.assertEqual(agent._current_turn_stage(), "diagnostic")
         agent.event_summary = {"event_segment_count": 4.0}
-        self.assertEqual(agent._current_turn_stage(), "diagnostic")
-        agent.basic_statistics = {"median": 1.0}
         self.assertEqual(agent._current_turn_stage(), "routing")
 
 

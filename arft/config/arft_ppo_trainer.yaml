@@ -7,8 +7,10 @@ defaults:
   - /overrides/rollout@actor_rollout_ref.rollout
 
   - _self_
+
+trainer:
+  use_legacy_worker_impl: disable
 # actor_rollout_ref:
 #   rollout:
 #     agent:
 #       num_workers: 16
-

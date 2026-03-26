@@ -33,71 +33,44 @@ RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
 # shellcheck disable=SC1090
 source "$RESOLVED_PROFILE_PATH"
 
+require_env() {
+    local name="$1"
+    local hint="$2"
+    if [ -z "${!name:-}" ]; then
+        echo "Missing required config: $name" >&2
+        echo "$hint" >&2
+        exit 1
+    fi
+}
+
 if [ -n "${SFT_CUDA_VISIBLE_DEVICES:-}" ]; then
     export CUDA_VISIBLE_DEVICES="$SFT_CUDA_VISIBLE_DEVICES"
 elif [ -n "${SFT_GPU_IDS:-}" ]; then
     export CUDA_VISIBLE_DEVICES="$SFT_GPU_IDS"
 fi
 
-MODEL_PATH="${MODEL_PATH:-}"
-if [ -z "${MODEL_PATH}" ]; then
-    echo "MODEL_PATH must point to the base chat model or tokenizer-compatible checkpoint"
-    exit 1
-fi
+require_env SFT_MODEL_PATH "Set SFT_MODEL_PATH in PROFILE_PATH or override it in the launch command."
+require_env SFT_DATASET_DIR "Set SFT_DATASET_DIR in PROFILE_PATH or override it in the launch command."
+require_env SFT_SAVE_DIR "Set SFT_SAVE_DIR in PROFILE_PATH or override it in the launch command."
+require_env SFT_PROJECT_NAME "Set SFT_PROJECT_NAME in PROFILE_PATH or override it in the launch command."
+require_env SFT_EXPERIMENT_NAME "Set SFT_EXPERIMENT_NAME in PROFILE_PATH or override it in the launch command."
+require_env SFT_NUM_GPUS "Set SFT_NUM_GPUS in PROFILE_PATH or override it in the launch command."
+require_env SFT_TRAIN_BATCH_SIZE "Set SFT_TRAIN_BATCH_SIZE in PROFILE_PATH or override it in the launch command."
+require_env SFT_MICRO_BATCH_SIZE "Set SFT_MICRO_BATCH_SIZE in PROFILE_PATH or override it in the launch command."
+require_env SFT_MAX_TOKEN_LEN_PER_GPU "Set SFT_MAX_TOKEN_LEN_PER_GPU in PROFILE_PATH or override it in the launch command."
+require_env SFT_MAX_LENGTH "Set SFT_MAX_LENGTH in PROFILE_PATH or override it in the launch command."
+require_env SFT_TOTAL_EPOCHS "Set SFT_TOTAL_EPOCHS in PROFILE_PATH or override it in the launch command."
+require_env SFT_SAVE_FREQ "Set SFT_SAVE_FREQ in PROFILE_PATH or override it in the launch command."
+require_env SFT_TEST_FREQ "Set SFT_TEST_FREQ in PROFILE_PATH or override it in the launch command."
+require_env SFT_LR "Set SFT_LR in PROFILE_PATH or override it in the launch command."
+require_env SFT_LR_SCHEDULER_TYPE "Set SFT_LR_SCHEDULER_TYPE in PROFILE_PATH or override it in the launch command."
+require_env SFT_LOGGER "Set SFT_LOGGER in PROFILE_PATH or override it in the launch command."
 
-resolve_consistent_env_value() {
-    local label="$1"
-    shift
-    local resolved=""
-    local env_name
-    local candidate
-    for env_name in "$@"; do
-        candidate="${!env_name:-}"
-        if [ -z "$candidate" ]; then
-            continue
-        fi
-        if [ -n "$resolved" ] && [ "$candidate" != "$resolved" ]; then
-            echo "Conflicting ${label} values:" >&2
-            printf '  %s=%s\n' "$env_name" "$candidate" >&2
-            printf '  resolved=%s\n' "$resolved" >&2
-            exit 1
-        fi
-        resolved="$candidate"
-    done
-    printf '%s\n' "$resolved"
-}
+SFT_MODEL_PATH="$SFT_MODEL_PATH"
+SFT_DATASET_DIR="$SFT_DATASET_DIR"
 
-SFT_DATASET_DIR="${SFT_DATASET_DIR:-}"
-TRAIN_FILES_EXPLICIT="$(resolve_consistent_env_value 'SFT train parquet' TRAIN_FILES SFT_TRAIN_FILES)"
-VAL_FILES_EXPLICIT="$(resolve_consistent_env_value 'SFT val parquet' VAL_FILES SFT_VAL_FILES)"
-
-if [ -n "$SFT_DATASET_DIR" ]; then
-    DERIVED_TRAIN_FILES="$SFT_DATASET_DIR/train.parquet"
-    DERIVED_VAL_FILES="$SFT_DATASET_DIR/val.parquet"
-    if [ -n "$TRAIN_FILES_EXPLICIT" ] && [ "$TRAIN_FILES_EXPLICIT" != "$DERIVED_TRAIN_FILES" ]; then
-        echo "Conflicting SFT dataset specification for train split." >&2
-        echo "SFT_DATASET_DIR implies: $DERIVED_TRAIN_FILES" >&2
-        echo "Explicit train file: $TRAIN_FILES_EXPLICIT" >&2
-        exit 1
-    fi
-    if [ -n "$VAL_FILES_EXPLICIT" ] && [ "$VAL_FILES_EXPLICIT" != "$DERIVED_VAL_FILES" ]; then
-        echo "Conflicting SFT dataset specification for val split." >&2
-        echo "SFT_DATASET_DIR implies: $DERIVED_VAL_FILES" >&2
-        echo "Explicit val file: $VAL_FILES_EXPLICIT" >&2
-        exit 1
-    fi
-    TRAIN_FILES="${TRAIN_FILES_EXPLICIT:-$DERIVED_TRAIN_FILES}"
-    VAL_FILES="${VAL_FILES_EXPLICIT:-$DERIVED_VAL_FILES}"
-else
-    TRAIN_FILES="$TRAIN_FILES_EXPLICIT"
-    VAL_FILES="$VAL_FILES_EXPLICIT"
-fi
-
-if [ -z "${TRAIN_FILES}" ] || [ -z "${VAL_FILES}" ]; then
-    echo "SFT dataset path is required." >&2
-    echo "Set SFT_DATASET_DIR to a single dataset directory, or set both TRAIN_FILES and VAL_FILES explicitly." >&2
-    exit 1
-fi
+TRAIN_FILES="$SFT_DATASET_DIR/train.parquet"
+VAL_FILES="$SFT_DATASET_DIR/val.parquet"
 
 TRAIN_DIR="$(cd "$(dirname "$TRAIN_FILES")" && pwd)"
 VAL_DIR="$(cd "$(dirname "$VAL_FILES")" && pwd)"
@@ -119,6 +92,7 @@ import sys
 from recipe.time_series_forecast.dataset_identity import (
     DATASET_KIND_RUNTIME_SFT_PARQUET,
     DATASET_KIND_TEACHER_CURATED_SFT,
+    require_multivariate_etth1_metadata,
     validate_metadata_file,
 )
 
@@ -127,6 +101,7 @@ payload, _ = validate_metadata_file(
     metadata_path,
     expected_kind=(DATASET_KIND_RUNTIME_SFT_PARQUET, DATASET_KIND_TEACHER_CURATED_SFT),
 )
+require_multivariate_etth1_metadata(payload, metadata_path=metadata_path)
 print(
     f"[SFT DATASET] kind={payload.get('dataset_kind')} stage={payload.get('pipeline_stage', '')} "
     f"metadata={metadata_path}"
@@ -187,20 +162,20 @@ def inspect(path: str) -> None:
 inspect(sys.argv[1])
 inspect(sys.argv[2])
 PY
-SAVE_DIR="${SAVE_DIR:-${SFT_SAVE_DIR:-$PROJECT_DIR/artifacts/checkpoints/sft/time_series_forecast_sft}}"
-PROJECT_NAME="${PROJECT_NAME:-${SFT_PROJECT_NAME:-TimeSeriesForecast-SFT}}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-${SFT_EXPERIMENT_NAME:-qwen3-1.7b-etth1-ot-sft}}"
-NUM_GPUS="${NUM_GPUS:-${SFT_NUM_GPUS:-1}}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-${SFT_TRAIN_BATCH_SIZE:-32}}"
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-${SFT_MICRO_BATCH_SIZE:-2}}"
-MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-${SFT_MAX_TOKEN_LEN_PER_GPU:-8192}}"
-MAX_LENGTH="${MAX_LENGTH:-${SFT_MAX_LENGTH:-8192}}"
-TOTAL_EPOCHS="${TOTAL_EPOCHS:-${SFT_TOTAL_EPOCHS:-1}}"
-SAVE_FREQ="${SAVE_FREQ:-${SFT_SAVE_FREQ:-after_each_epoch}}"
-TEST_FREQ="${TEST_FREQ:-${SFT_TEST_FREQ:-after_each_epoch}}"
-LR="${LR:-${SFT_LR:-1e-5}}"
-LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-${SFT_LR_SCHEDULER_TYPE:-cosine}}"
-LOGGER="${LOGGER:-${SFT_LOGGER:-console}}"
+SAVE_DIR="$SFT_SAVE_DIR"
+PROJECT_NAME="$SFT_PROJECT_NAME"
+EXPERIMENT_NAME="$SFT_EXPERIMENT_NAME"
+NUM_GPUS="$SFT_NUM_GPUS"
+TRAIN_BATCH_SIZE="$SFT_TRAIN_BATCH_SIZE"
+MICRO_BATCH_SIZE="$SFT_MICRO_BATCH_SIZE"
+MAX_TOKEN_LEN_PER_GPU="$SFT_MAX_TOKEN_LEN_PER_GPU"
+MAX_LENGTH="$SFT_MAX_LENGTH"
+TOTAL_EPOCHS="$SFT_TOTAL_EPOCHS"
+SAVE_FREQ="$SFT_SAVE_FREQ"
+TEST_FREQ="$SFT_TEST_FREQ"
+LR="$SFT_LR"
+LR_SCHEDULER_TYPE="$SFT_LR_SCHEDULER_TYPE"
+LOGGER="$SFT_LOGGER"
 
 if command -v torchrun >/dev/null 2>&1; then
     LAUNCHER=(torchrun --standalone --nnodes=1 --nproc_per_node="${NUM_GPUS}")
@@ -221,7 +196,7 @@ CMD=(
     "data.train_batch_size=${TRAIN_BATCH_SIZE}"
     "data.micro_batch_size_per_gpu=${MICRO_BATCH_SIZE}"
     "data.truncation=error"
-    "model.path=${MODEL_PATH}"
+    "model.path=${SFT_MODEL_PATH}"
     "optim.lr=${LR}"
     "optim.lr_scheduler_type=${LR_SCHEDULER_TYPE}"
     "checkpoint.save_contents=['model','optimizer','extra','hf_model']"

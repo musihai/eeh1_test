@@ -23,6 +23,5 @@ class TestMainAgentPPOConfig(unittest.TestCase):
         self.assertTrue(str(config.reward.custom_reward_function.path).endswith("recipe/time_series_forecast/reward.py"))
         self.assertEqual(config.reward.custom_reward_function.name, "compute_score")
 
-
 if __name__ == "__main__":
     unittest.main()

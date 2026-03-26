@@ -85,6 +85,30 @@ class TestTimeSeriesUtils(unittest.TestCase):
         self.assertEqual(request["target_column"], "OT")
         self.assertEqual(request["values"], [[10.0, 1.0], [11.0, 2.0], [12.0, 3.0]])
 
+    def test_predict_with_patchtst_rejects_singlevar_prompt_before_service_call(self):
+        context_df = pd.DataFrame(
+            {
+                "id": ["ETTh1"] * 96,
+                "timestamp": pd.date_range("2016-01-01 00:00:00", periods=96, freq="h"),
+                "target": [float(idx) for idx in range(96)],
+                "OT": [float(idx) for idx in range(96)],
+            }
+        )
+        context_df.attrs["feature_columns"] = ["OT"]
+        context_df.attrs["target_column"] = "OT"
+
+        with mock.patch.object(ts_utils, "_get_httpx_client", side_effect=AssertionError("service should not be called")):
+            with self.assertRaises(ValueError) as ctx:
+                asyncio.run(
+                    ts_utils.predict_with_patchtst_async(
+                        context_df,
+                        prediction_length=96,
+                        model_service_url="http://127.0.0.1:8994",
+                    )
+                )
+
+        self.assertIn("expects 7-variable ETTh1 multivariate input", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

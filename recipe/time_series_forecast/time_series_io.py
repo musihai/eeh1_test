@@ -203,6 +203,41 @@ def compact_prediction_tool_output_from_string(
     return "\n".join(lines)
 
 
+def compact_historical_data_for_prompt(
+    historical_text: str,
+    *,
+    target_column: Optional[str] = None,
+    default_freq: str = "1h",
+) -> str:
+    """Render historical context in a compact row-matrix format when beneficial."""
+    raw_text = str(historical_text or "").strip()
+    if not raw_text:
+        return raw_text
+
+    try:
+        frame = parse_time_series_to_dataframe(
+            raw_text,
+            target_column=target_column,
+            default_freq=default_freq,
+            include_covariates=True,
+        )
+    except Exception:
+        return raw_text
+
+    feature_columns = list(frame.attrs.get("feature_columns") or [target_column or "target"])
+    header = ",".join(["timestamp", *feature_columns])
+    rows: list[str] = [header]
+    for _, row in frame.iterrows():
+        timestamp = pd.to_datetime(row["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+        values = [f"{float(row[column_name]):.4f}" for column_name in feature_columns]
+        rows.append(",".join([timestamp, *values]))
+
+    compact_text = "\n".join(rows)
+    if len(compact_text) >= len(raw_text):
+        return raw_text
+    return compact_text
+
+
 def format_prediction_tool_output(
     pred_df: pd.DataFrame,
     last_timestamp: str = None,
@@ -232,6 +267,7 @@ def get_last_timestamp(data_str: str) -> Optional[str]:
 
 
 __all__ = [
+    "compact_historical_data_for_prompt",
     "DEFAULT_FORECAST_HORIZON",
     "DEFAULT_LOOKBACK_WINDOW",
     "SYNTHETIC_TIMESTAMP_ANCHOR",

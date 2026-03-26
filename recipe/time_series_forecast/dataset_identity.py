@@ -4,11 +4,24 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
+from recipe.time_series_forecast.config_utils import (
+    ETTH1_COVARIATE_COLUMNS,
+    ETTH1_FEATURE_COLUMNS,
+    ETTH1_TARGET_COLUMN,
+)
+
 
 DATASET_KIND_RL_JSONL = "etth1_rl_jsonl"
 DATASET_KIND_TEACHER_CURATED_SFT = "etth1_teacher_curated_sft"
 DATASET_KIND_RUNTIME_SFT_PARQUET = "etth1_runtime_sft_parquet"
 DATASET_KIND_RUNTIME_SFT_SUBSET = "etth1_runtime_sft_subset"
+HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS = "timestamped_named_rows"
+
+
+def _coerce_text_list(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
 
 
 def load_metadata(metadata_path: str | Path) -> dict[str, Any]:
@@ -87,3 +100,59 @@ def validate_sibling_metadata(
         expected_kind=expected_kind,
         allowed_pipeline_stages=allowed_pipeline_stages,
     )
+
+
+def require_multivariate_etth1_metadata(
+    payload: dict[str, Any],
+    *,
+    metadata_path: str | Path,
+) -> dict[str, Any]:
+    protocol = str(payload.get("historical_data_protocol") or "").strip()
+    if protocol != HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS:
+        raise ValueError(
+            f"Dataset metadata must declare historical_data_protocol="
+            f"`{HISTORICAL_DATA_PROTOCOL_TIMESTAMPED_NAMED_ROWS}` for paper-aligned ETTh1. "
+            f"Got `{protocol or '__missing__'}` from {metadata_path}"
+        )
+
+    task_type = str(payload.get("task_type") or "").strip().lower()
+    if task_type != "multivariate time-series forecasting":
+        raise ValueError(
+            "Dataset metadata must declare task_type=`multivariate time-series forecasting` "
+            f"for paper-aligned ETTh1. Got `{task_type or '__missing__'}` from {metadata_path}"
+        )
+
+    target_column = str(payload.get("target_column") or "").strip()
+    if target_column != ETTH1_TARGET_COLUMN:
+        raise ValueError(
+            f"Dataset metadata must declare target_column=`{ETTH1_TARGET_COLUMN}`. "
+            f"Got `{target_column or '__missing__'}` from {metadata_path}"
+        )
+
+    observed_feature_columns = _coerce_text_list(payload.get("observed_feature_columns"))
+    if observed_feature_columns != list(ETTH1_FEATURE_COLUMNS):
+        raise ValueError(
+            f"Dataset metadata must declare observed_feature_columns={list(ETTH1_FEATURE_COLUMNS)}. "
+            f"Got {observed_feature_columns or '__missing__'} from {metadata_path}"
+        )
+
+    observed_covariates = _coerce_text_list(payload.get("observed_covariates"))
+    if observed_covariates != list(ETTH1_COVARIATE_COLUMNS):
+        raise ValueError(
+            f"Dataset metadata must declare observed_covariates={list(ETTH1_COVARIATE_COLUMNS)}. "
+            f"Got {observed_covariates or '__missing__'} from {metadata_path}"
+        )
+
+    model_input_width = payload.get("model_input_width")
+    try:
+        resolved_width = int(model_input_width)
+    except (TypeError, ValueError):
+        resolved_width = None
+    if resolved_width != len(ETTH1_FEATURE_COLUMNS):
+        raise ValueError(
+            f"Dataset metadata must declare model_input_width={len(ETTH1_FEATURE_COLUMNS)}. "
+            f"Got `{model_input_width if model_input_width is not None else '__missing__'}` "
+            f"from {metadata_path}"
+        )
+
+    return payload

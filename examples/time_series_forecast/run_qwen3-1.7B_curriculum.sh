@@ -43,9 +43,9 @@ print(resolve_transformers_model_dir(sys.argv[1]))
 PY
 }
 
-INITIAL_MODEL_PATH="${RL_MODEL_PATH:-${MODEL_PATH:-}}"
+INITIAL_MODEL_PATH="${RL_MODEL_PATH:-}"
 if [ -z "${INITIAL_MODEL_PATH}" ]; then
-    echo "RL_MODEL_PATH (or MODEL_PATH) is required for curriculum RL." >&2
+    echo "RL_MODEL_PATH is required for curriculum RL." >&2
     exit 1
 fi
 INITIAL_MODEL_PATH="$(resolve_transformers_model_dir "$INITIAL_MODEL_PATH")" || {
@@ -53,13 +53,17 @@ INITIAL_MODEL_PATH="$(resolve_transformers_model_dir "$INITIAL_MODEL_PATH")" || 
     exit 1
 }
 
-CURRICULUM_DATASET_DIR="${RL_CURRICULUM_DATASET_DIR:-$PROJECT_DIR/dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2}"
-VAL_FILES="${RL_VAL_FILES:-$CURRICULUM_DATASET_DIR/val.jsonl}"
+CURRICULUM_DATASET_DIR="${RL_CURRICULUM_DATASET_DIR:-}"
+VAL_FILES="$CURRICULUM_DATASET_DIR/val.jsonl"
 PHASES="${RL_CURRICULUM_PHASES:-stage1,stage12,stage123}"
-BASE_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper_strict_formal_20260323}"
+BASE_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper_20260326}"
 BASE_LOCAL_DIR="${RL_TRAINER_LOCAL_DIR:-$PROJECT_DIR/artifacts/checkpoints/rl/$BASE_EXP_NAME}"
 RUN_MODE=train
 
+if [ -z "$CURRICULUM_DATASET_DIR" ]; then
+    echo "RL_CURRICULUM_DATASET_DIR is required for curriculum RL." >&2
+    exit 1
+fi
 if [ ! -d "$CURRICULUM_DATASET_DIR" ]; then
     echo "Curriculum RL dataset directory not found: $CURRICULUM_DATASET_DIR" >&2
     exit 1
@@ -135,12 +139,10 @@ while IFS= read -r phase; do
     fi
 
     RL_MODEL_PATH="$CURRENT_MODEL_PATH" \
-    RL_TRAIN_FILES="$PHASE_TRAIN_FILE" \
-    RL_VAL_FILES="$VAL_FILES" \
+    RL_CURRICULUM_DATASET_DIR="$CURRICULUM_DATASET_DIR" \
     RL_CURRICULUM_PHASE="$phase" \
     RL_EXP_NAME="$PHASE_EXP_NAME" \
     RL_TRAINER_LOCAL_DIR="$PHASE_LOCAL_DIR" \
-    ALLOW_NONCURRICULUM_TRAIN=0 \
     RUN_MODE="$RUN_MODE" \
     bash "$SCRIPT_DIR/run_qwen3-1.7B.sh" "$@"
 

@@ -31,7 +31,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
-from recipe.time_series_forecast.config_utils import get_default_lengths
+from recipe.time_series_forecast.config_utils import ETTH1_FEATURE_COLUMNS, get_default_lengths
 
 
 # =============================================================================
@@ -321,6 +321,32 @@ def _extract_target_prediction(prediction_array: np.ndarray, *, target_idx: int)
     raise HTTPException(status_code=500, detail=f"Unexpected prediction shape: {list(array.shape)}")
 
 
+def _validate_pytorch_request_contract(
+    *,
+    model_name: str,
+    model_config: dict[str, Any],
+    values_batch: np.ndarray,
+    feature_columns: Sequence[str],
+    seq_len: int,
+) -> None:
+    expected_enc_in = int(model_config.get("enc_in", values_batch.shape[-1]))
+    if expected_enc_in != int(values_batch.shape[-1]):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{model_name} expects {expected_enc_in} variables {list(ETTH1_FEATURE_COLUMNS)}, "
+                f"but received {int(values_batch.shape[-1])} variable(s): {list(feature_columns)}"
+            ),
+        )
+
+    expected_seq_len = int(model_config.get("seq_len", seq_len))
+    if expected_seq_len != int(seq_len):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{model_name} expects lookback_window={expected_seq_len}, but received {int(seq_len)} rows",
+        )
+
+
 def predict_with_chronos2(request: PredictRequest) -> PredictResponse:
     """
     Generate predictions using Chronos2 with Non-stationary Transformer normalization.
@@ -416,8 +442,9 @@ def predict_with_pytorch_model_batch(
     device = next(model.parameters()).device
     seq_lens = {len(request.values) for request in requests}
     if len(seq_lens) != 1:
-        raise ValueError(
-            f"Batched {model_name} inference requires uniform context lengths, got {sorted(seq_lens)}"
+        raise HTTPException(
+            status_code=400,
+            detail=f"{model_name} batched inference requires uniform context lengths, got {sorted(seq_lens)}",
         )
 
     matrices: list[np.ndarray] = []
@@ -430,25 +457,30 @@ def predict_with_pytorch_model_batch(
         target_indices.append(int(target_idx))
 
     if len(signatures) != 1:
-        raise ValueError(
-            f"Batched {model_name} inference requires uniform feature columns and target selection, got {sorted(signatures)}"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{model_name} batched inference requires uniform feature columns and target selection, "
+                f"got {sorted(signatures)}"
+            ),
         )
 
     values_batch = np.stack(matrices, axis=0)
     if values_batch.ndim != 3:
-        raise ValueError(f"Expected {model_name} batched input to be rank 3, got {list(values_batch.shape)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected {model_name} batched input to be rank 3, got {list(values_batch.shape)}",
+        )
 
     model_config = _configs.get(model_name) or {}
-    expected_enc_in = int(model_config.get("enc_in", values_batch.shape[-1]))
-    if expected_enc_in != int(values_batch.shape[-1]):
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                f"{model_name} is loaded with enc_in={expected_enc_in}, but received "
-                f"{int(values_batch.shape[-1])}-variable input. Replace this checkpoint with "
-                "a multivariate ETTh1 expert before enabling paper-faithful routing."
-            ),
-        )
+    signature_feature_columns = list(next(iter(signatures))[0]) if signatures else []
+    _validate_pytorch_request_contract(
+        model_name=model_name,
+        model_config=model_config,
+        values_batch=values_batch,
+        feature_columns=signature_feature_columns,
+        seq_len=int(values_batch.shape[1]),
+    )
 
     input_tensor = torch.from_numpy(values_batch).to(device)
 

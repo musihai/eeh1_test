@@ -13,10 +13,16 @@
 # limitations under the License.
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
+
+
+ETTH1_TARGET_COLUMN = "OT"
+ETTH1_FEATURE_COLUMNS = ("HUFL", "HULL", "MUFL", "MULL", "LUFL", "LULL", ETTH1_TARGET_COLUMN)
+ETTH1_COVARIATE_COLUMNS = ETTH1_FEATURE_COLUMNS[:-1]
 
 
 def _parse_env_int(name: str) -> Optional[int]:
@@ -66,3 +72,32 @@ def get_default_lengths() -> Tuple[int, int]:
         horizon = 96
 
     return lookback, horizon
+
+
+def load_model_config_json(model_name: str) -> dict[str, Any]:
+    config_path = Path(__file__).parent / "models" / str(model_name).strip().lower() / "config.json"
+    if not config_path.exists():
+        return {}
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def expected_model_input_width(model_name: str) -> Optional[int]:
+    config = load_model_config_json(model_name)
+    value = config.get("enc_in")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def expected_model_seq_len(model_name: str) -> Optional[int]:
+    config = load_model_config_json(model_name)
+    value = config.get("seq_len")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None

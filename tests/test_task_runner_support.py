@@ -2,12 +2,12 @@ import unittest
 
 from omegaconf import OmegaConf
 
+from arft.main_agent_ppo import TaskRunner
 from arft.task_runner_support import (
     build_actor_rollout_spec,
     build_critic_worker_spec,
     build_resource_pool_spec,
     build_reward_model_worker_spec,
-    resolve_legacy_worker_impl,
     should_register_ref_policy,
 )
 
@@ -16,11 +16,11 @@ def _make_config():
     return OmegaConf.create(
         {
             "trainer": {
-                "use_legacy_worker_impl": "auto",
                 "n_gpus_per_node": 4,
                 "nnodes": 2,
             },
             "algorithm": {
+                "adv_estimator": "gae",
                 "use_kl_in_reward": False,
             },
             "actor_rollout_ref": {
@@ -33,6 +33,7 @@ def _make_config():
                 },
             },
             "critic": {
+                "enable": None,
                 "strategy": "fsdp",
             },
             "reward_model": {
@@ -47,20 +48,19 @@ def _make_config():
 
 
 class TestTaskRunnerSupport(unittest.TestCase):
-    def test_actor_rollout_spec_legacy_async_fsdp(self) -> None:
+    def test_actor_rollout_spec_uses_engine_worker(self) -> None:
         config = _make_config()
 
         spec = build_actor_rollout_spec(config)
 
-        self.assertEqual(spec.worker.module_path, "verl.workers.fsdp_workers")
-        self.assertEqual(spec.worker.attribute_name, "AsyncActorRolloutRefWorker")
+        self.assertEqual(spec.worker.module_path, "verl.workers.engine_workers")
+        self.assertEqual(spec.worker.attribute_name, "ActorRolloutRefWorker")
         self.assertEqual(spec.ray_worker_group.module_path, "verl.single_controller.ray")
         self.assertEqual(spec.ray_worker_group.attribute_name, "RayWorkerGroup")
         self.assertEqual(spec.role_name, "ActorRollout")
 
-    def test_actor_rollout_spec_new_engine_with_kl_uses_fused_role(self) -> None:
+    def test_actor_rollout_spec_with_kl_uses_fused_role(self) -> None:
         config = _make_config()
-        config.trainer.use_legacy_worker_impl = "disable"
         config.algorithm.use_kl_in_reward = True
 
         spec = build_actor_rollout_spec(config)
@@ -76,21 +76,23 @@ class TestTaskRunnerSupport(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_actor_rollout_spec(config)
 
-    def test_invalid_legacy_worker_mode_raises(self) -> None:
+    def test_critic_spec_uses_fsdp_worker_for_fsdp(self) -> None:
         config = _make_config()
-        config.trainer.use_legacy_worker_impl = "bad-mode"
-
-        with self.assertRaises(ValueError):
-            resolve_legacy_worker_impl(config)
-
-    def test_critic_spec_disable_uses_engine_worker(self) -> None:
-        config = _make_config()
-        config.trainer.use_legacy_worker_impl = "disable"
 
         spec = build_critic_worker_spec(config)
 
-        self.assertEqual(spec.worker.module_path, "verl.workers.engine_workers")
+        self.assertEqual(spec.worker.module_path, "verl.workers.fsdp_workers")
         self.assertEqual(spec.worker.attribute_name, "CriticWorker")
+
+    def test_task_runner_skips_critic_registration_for_grpo(self) -> None:
+        config = _make_config()
+        config.algorithm.adv_estimator = "grpo"
+
+        runner = TaskRunner.__ray_actor_class__()
+        runner.add_critic_worker(config)
+
+        self.assertEqual(runner.role_worker_mapping, {})
+        self.assertEqual(runner.mapping, {})
 
     def test_reward_model_spec_selects_reward_pool(self) -> None:
         config = _make_config()
@@ -123,13 +125,13 @@ class TestTaskRunnerSupport(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_resource_pool_spec(config)
 
-    def test_should_register_ref_policy_respects_legacy_mode(self) -> None:
+    def test_should_register_ref_policy_follows_kl_usage(self) -> None:
         config = _make_config()
         config.actor_rollout_ref.actor.use_kl_loss = True
 
         self.assertTrue(should_register_ref_policy(config))
 
-        config.trainer.use_legacy_worker_impl = "disable"
+        config.actor_rollout_ref.actor.use_kl_loss = False
         self.assertFalse(should_register_ref_policy(config))
 
 

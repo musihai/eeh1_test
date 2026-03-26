@@ -16,8 +16,6 @@ PREDICTION_ERROR_SCORE_WEIGHT = 0.6
 SEASON_COMPONENT_SCORE_WEIGHT = 0.0125
 TREND_COMPONENT_SCORE_WEIGHT = 0.0375
 CHANGE_POINT_COMPONENT_SCORE_WEIGHT = 0.025
-STRUCTURAL_TIE_BREAK_SCALE = 0.2
-STRUCTURAL_TIE_BREAK_MAX_NORM_MSE = 0.5
 
 
 class moving_avg(nn.Module):
@@ -213,17 +211,6 @@ def compute_season_trend_score(solution_str: str, ground_truth: str) -> float:
     ) * length_ratio
 
 
-def compute_structural_tie_break_gate(norm_mse: float) -> float:
-    try:
-        numeric_norm_mse = float(norm_mse)
-    except (TypeError, ValueError):
-        return 0.0
-    if not np.isfinite(numeric_norm_mse) or numeric_norm_mse >= STRUCTURAL_TIE_BREAK_MAX_NORM_MSE:
-        return 0.0
-    closeness = max(0.0, 1.0 - (numeric_norm_mse / STRUCTURAL_TIE_BREAK_MAX_NORM_MSE))
-    return float(STRUCTURAL_TIE_BREAK_SCALE * closeness)
-
-
 def find_change_points(data: List[float]) -> Tuple[List[int], List[int]]:
     if len(data) < 5:
         return [], []
@@ -291,8 +278,6 @@ __all__ = [
     "CHANGE_POINT_COMPONENT_SCORE_WEIGHT",
     "PREDICTION_ERROR_SCORE_WEIGHT",
     "SEASON_COMPONENT_SCORE_WEIGHT",
-    "STRUCTURAL_TIE_BREAK_MAX_NORM_MSE",
-    "STRUCTURAL_TIE_BREAK_SCALE",
     "TREND_COMPONENT_SCORE_WEIGHT",
     "compute_change_point_score",
     "compute_format_score",
@@ -300,7 +285,6 @@ __all__ = [
     "compute_length_score",
     "compute_mse_score",
     "compute_season_trend_score",
-    "compute_structural_tie_break_gate",
     "decompose",
     "find_change_points",
     "infer_format_failure_reason",
