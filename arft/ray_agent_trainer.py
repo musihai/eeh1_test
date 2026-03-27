@@ -53,6 +53,7 @@ from arft.metric_utils import (
     process_validation_metrics,
 )
 from arft.trainer_validation_support import (
+    build_compact_validation_debug_summary as _build_compact_validation_debug_summary,
     evaluate_validation_reward_manager as _evaluate_validation_reward_manager,
     extract_values_from_text as _extract_values_from_text,
     normalized_mse_mae as _normalized_mse_mae,
@@ -68,12 +69,15 @@ from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils import tensordict_utils as tu
+from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.ray_utils import auto_await
 from verl.utils.chain_debug import append_chain_debug
+from verl.workers.utils.padding import left_right_2_no_padding
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
     RayWorkerGroup,
@@ -134,7 +138,15 @@ def compute_advantage(
         valid_mask = ~is_pad
         valid_data = data.select_idxs(valid_mask)
     else:
+        valid_mask = None
         valid_data = data
+
+    def _assign_valid_rows(target: torch.Tensor, values: torch.Tensor) -> None:
+        if valid_mask is None:
+            target.copy_(values)
+        else:
+            target[valid_mask] = values
+
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
@@ -148,21 +160,22 @@ def compute_advantage(
             gamma=gamma,
             lam=lam,
         )
-        advantages[valid_mask] = valid_advantages
-        returns[valid_mask] = valid_returns
+        _assign_valid_rows(advantages, valid_advantages)
+        _assign_valid_rows(returns, valid_returns)
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         from arft.core_algos import compute_grpo_outcome_advantage
+        group_index_key = "group_uid" if "group_uid" in valid_data.non_tensor_batch else "uid"
         valid_advantages, valid_returns = compute_grpo_outcome_advantage(
             token_level_rewards=valid_data.batch["token_level_rewards"],
             response_mask=valid_data.batch["response_mask"],
-            index=valid_data.non_tensor_batch["uid"],
+            index=valid_data.non_tensor_batch[group_index_key],
             trajectory_uids=valid_data.non_tensor_batch["trajectory_uids"],
             step_indices=valid_data.non_tensor_batch["step_indices"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
-        advantages[valid_mask] = valid_advantages
-        returns[valid_mask] = valid_returns
+        _assign_valid_rows(advantages, valid_advantages)
+        _assign_valid_rows(returns, valid_returns)
 
     data.batch["advantages"] = advantages
     data.batch["returns"] = returns
@@ -213,6 +226,120 @@ class RayAgentTrainer(RayPPOTrainer):
     @staticmethod
     def _orig_mse_mae(pred_values: list[float], gt_values: list[float]) -> tuple[float, float]:
         return _orig_mse_mae(pred_values, gt_values)
+
+    @staticmethod
+    def _pick_compatible_divisor(total_size: int, target_size: int) -> int:
+        if total_size <= 0:
+            raise ValueError(f"total_size must be positive, got {total_size}")
+
+        target = max(1, min(int(target_size), int(total_size)))
+        divisors = [candidate for candidate in range(1, total_size + 1) if total_size % candidate == 0]
+        return min(divisors, key=lambda candidate: (abs(candidate - target), candidate < target, -candidate))
+
+    def _resolve_effective_batch_sizes(
+        self,
+        *,
+        batch_size_before_dispatch: int,
+        configured_global_mini_batch_size: int,
+        configured_micro_batch_size_per_gpu: int,
+        ulysses_sequence_parallel_size: int = 1,
+    ) -> tuple[int, int]:
+        total_devices = int(self.config.trainer.n_gpus_per_node) * int(self.config.trainer.nnodes)
+        dp_size = max(1, total_devices // max(1, int(ulysses_sequence_parallel_size)))
+        if int(batch_size_before_dispatch) % dp_size != 0:
+            raise ValueError(
+                f"batch_size_before_dispatch must be divisible by dp_size, got "
+                f"{batch_size_before_dispatch=} and {dp_size=}"
+            )
+
+        batch_size_per_dp = int(batch_size_before_dispatch) // dp_size
+        target_mini_batch_size_per_gpu = max(1, int(configured_global_mini_batch_size) // dp_size)
+        compatible_mini_batch_size_per_gpu = self._pick_compatible_divisor(
+            total_size=batch_size_per_dp,
+            target_size=target_mini_batch_size_per_gpu,
+        )
+        compatible_micro_batch_size_per_gpu = self._pick_compatible_divisor(
+            total_size=compatible_mini_batch_size_per_gpu,
+            target_size=int(configured_micro_batch_size_per_gpu),
+        )
+        return compatible_mini_batch_size_per_gpu * dp_size, compatible_micro_batch_size_per_gpu
+
+    def _update_actor(self, batch: DataProto) -> DataProto:
+        rollout_config = self.config.actor_rollout_ref.rollout
+        batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+        batch.meta_info["temperature"] = rollout_config.temperature
+
+        if self.use_legacy_worker_impl != "disable":
+            return super()._update_actor(batch)
+
+        batch_td = batch.to_tensordict()
+        batch_td = left_right_2_no_padding(batch_td)
+        calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+        configured_global_mini_batch_size = (
+            int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * int(self.config.actor_rollout_ref.rollout.n)
+        )
+        effective_global_mini_batch_size, compatible_micro_batch_size_per_gpu = self._resolve_effective_batch_sizes(
+            batch_size_before_dispatch=int(batch_td.batch_size[0]),
+            configured_global_mini_batch_size=configured_global_mini_batch_size,
+            configured_micro_batch_size_per_gpu=int(self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu),
+            ulysses_sequence_parallel_size=int(self.config.actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)),
+        )
+        ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+        seed = self.config.actor_rollout_ref.actor.data_loader_seed
+        shuffle = self.config.actor_rollout_ref.actor.shuffle
+
+        tu.assign_non_tensor(
+            batch_td,
+            calculate_entropy=calculate_entropy,
+            global_batch_size=effective_global_mini_batch_size,
+            mini_batch_size=effective_global_mini_batch_size,
+            micro_batch_size_per_gpu=compatible_micro_batch_size_per_gpu,
+            epochs=ppo_epochs,
+            seed=seed,
+            dataloader_kwargs={"shuffle": shuffle},
+        )
+
+        actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        actor_output = tu.get(actor_output, "metrics")
+        actor_output = rename_dict(actor_output, "actor/")
+        actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
+        return DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+
+    def _update_critic(self, batch: DataProto) -> DataProto:
+        if self.use_legacy_worker_impl != "disable":
+            return super()._update_critic(batch)
+
+        batch_td = batch.to_tensordict()
+        batch_td = left_right_2_no_padding(batch_td)
+        configured_global_mini_batch_size = (
+            int(self.config.critic.ppo_mini_batch_size) * int(self.config.actor_rollout_ref.rollout.n)
+        )
+        effective_global_mini_batch_size, compatible_micro_batch_size_per_gpu = self._resolve_effective_batch_sizes(
+            batch_size_before_dispatch=int(batch_td.batch_size[0]),
+            configured_global_mini_batch_size=configured_global_mini_batch_size,
+            configured_micro_batch_size_per_gpu=int(self.config.critic.ppo_micro_batch_size_per_gpu),
+            ulysses_sequence_parallel_size=int(self.config.critic.get("ulysses_sequence_parallel_size", 1)),
+        )
+        ppo_epochs = self.config.critic.ppo_epochs
+        seed = self.config.critic.data_loader_seed
+        shuffle = self.config.critic.shuffle
+
+        tu.assign_non_tensor(
+            batch_td,
+            global_batch_size=effective_global_mini_batch_size,
+            mini_batch_size=effective_global_mini_batch_size,
+            micro_batch_size_per_gpu=compatible_micro_batch_size_per_gpu,
+            epochs=ppo_epochs,
+            seed=seed,
+            dataloader_kwargs={"shuffle": shuffle},
+        )
+
+        critic_output = self.critic_wg.train_mini_batch(batch_td)
+        critic_output = critic_output.get()
+        critic_output = tu.get(critic_output, "metrics")
+        critic_output = rename_dict(critic_output, "critic/")
+        critic_output["perf/mfu/critic"] = critic_output.pop("critic/mfu")
+        return DataProto.from_single_dict(data={}, meta_info={"metrics": critic_output})
 
     def _write_min_eval_debug_files(
         self,
@@ -485,30 +612,6 @@ class RayAgentTrainer(RayPPOTrainer):
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
 
-        # Record validation metrics to chain debug
-        validation_debug_info = {
-            "global_step": int(self.global_steps),
-            "num_validation_samples": len(sample_scores),
-            "reward_min": float(np.min(sample_scores)) if sample_scores else float("nan"),
-            "reward_max": float(np.max(sample_scores)) if sample_scores else float("nan"),
-            "reward_mean": float(np.mean(sample_scores)) if sample_scores else float("nan"),
-            "reward_std": float(np.std(sample_scores)) if len(sample_scores) > 1 else 0.0,
-        }
-        
-        # Add extra metrics from reward_extra_infos_dict if available
-        for key, values in reward_extra_infos_dict.items():
-            if key == "reward":  # skip reward as we already added it
-                continue
-            if values and len(values) > 0 and isinstance(values[0], (int, float)):
-                try:
-                    validation_debug_info[f"{key}_min"] = float(np.min(values))
-                    validation_debug_info[f"{key}_max"] = float(np.max(values))
-                    validation_debug_info[f"{key}_mean"] = float(np.mean(values))
-                except (TypeError, ValueError):
-                    pass  # Skip non-numeric values
-        
-        append_chain_debug("validation_metrics", validation_debug_info)
-
         try:
             agg_row, _ = self._write_min_eval_debug_files(
                 sample_uids=sample_uids,
@@ -517,8 +620,25 @@ class RayAgentTrainer(RayPPOTrainer):
                 sample_scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
             )
+            append_chain_debug(
+                "validation_metrics",
+                _build_compact_validation_debug_summary(
+                    global_step=int(self.global_steps),
+                    agg_row=agg_row,
+                ),
+            )
             metric_dict.update(self._flatten_validation_aggregate_metrics(agg_row))
         except Exception as exc:
+            append_chain_debug(
+                "validation_metrics",
+                {
+                    "global_step": int(self.global_steps),
+                    "num_validation_samples": len(sample_scores),
+                    "validation_reward_mean": float(np.mean(sample_scores)) if sample_scores else float("nan"),
+                    "validation_reward_min": float(np.min(sample_scores)) if sample_scores else float("nan"),
+                    "validation_reward_max": float(np.max(sample_scores)) if sample_scores else float("nan"),
+                },
+            )
             append_chain_debug(
                 "validation_min_debug_error",
                 {
@@ -878,19 +998,12 @@ class RayAgentTrainer(RayPPOTrainer):
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
-                        # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
-                            if not self.ref_in_actor:
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            else:
-                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                            batch = batch.union(self._compute_ref_log_prob(batch))
 
-                    # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
+                            batch = batch.union(self._compute_values(batch))
 
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
@@ -983,10 +1096,9 @@ class RayAgentTrainer(RayPPOTrainer):
                             value_mask = torch.zeros_like(response_mask)
                             value_mask.scatter_(1, response_length, 1)
                             batch.batch["response_mask"] = value_mask
-                            
-                            # update critic
-                            critic_output = self.critic_wg.update_critic(batch)
-                            
+
+                            critic_output = self._update_critic(batch)
+
                             # restore response_mask
                             batch.batch["response_mask"] = response_mask
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
@@ -996,11 +1108,7 @@ class RayAgentTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
-                            rollout_config = self.config.actor_rollout_ref.rollout
-                            batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-                            # TODO: Make "temperature" single source of truth from generation.
-                            batch.meta_info["temperature"] = rollout_config.temperature
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output = self._update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 

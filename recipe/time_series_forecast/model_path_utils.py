@@ -13,12 +13,23 @@ LOADABLE_TRANSFORMERS_WEIGHT_FILES = (
     "flax_model.msgpack",
 )
 
+LOADABLE_TRANSFORMERS_WEIGHT_GLOBS = (
+    "model-*-of-*.safetensors",
+    "pytorch_model-*-of-*.bin",
+)
+
 
 def has_loadable_transformers_weights(model_dir: str | Path) -> bool:
     path = Path(model_dir).expanduser()
     if not path.is_dir():
         return False
-    return any((path / filename).is_file() for filename in LOADABLE_TRANSFORMERS_WEIGHT_FILES)
+    if any((path / filename).is_file() for filename in LOADABLE_TRANSFORMERS_WEIGHT_FILES):
+        return True
+    return any(
+        candidate.is_file()
+        for pattern in LOADABLE_TRANSFORMERS_WEIGHT_GLOBS
+        for candidate in path.glob(pattern)
+    )
 
 
 def resolve_transformers_model_dir(model_dir: str | Path) -> Path:

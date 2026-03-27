@@ -4,6 +4,10 @@ import numpy as np
 import torch
 
 from arft.core_algos import compute_grpo_outcome_advantage
+from arft.ray_agent_trainer import compute_advantage
+from verl import DataProto
+from verl.trainer.ppo.core_algos import AdvantageEstimator
+from tensordict import TensorDict
 
 
 class GrpoTerminalOutcomeTests(unittest.TestCase):
@@ -149,6 +153,128 @@ class GrpoTerminalOutcomeTests(unittest.TestCase):
         )
 
         self.assertTrue(torch.allclose(baseline_advantages, perturbed_advantages, atol=1e-6))
+
+    def test_grpo_raises_when_same_trajectory_spans_multiple_groups(self) -> None:
+        token_level_rewards = torch.tensor(
+            [
+                [0.0, 0.0],
+                [0.7, 0.0],
+                [0.0, 0.0],
+                [-1.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        response_mask = torch.tensor([[1.0, 0.0]] * 4, dtype=torch.float32)
+        trajectory_uids = np.array(["traj-1", "traj-1", "traj-2", "traj-2"], dtype=object)
+        step_indices = np.array([0, 1, 0, 1], dtype=np.int32)
+        broken_index = np.array(["sample-a", "sample-b", "sample-a", "sample-a"], dtype=object)
+
+        with self.assertRaisesRegex(ValueError, "trajectory_uid"):
+            compute_grpo_outcome_advantage(
+                token_level_rewards=token_level_rewards,
+                response_mask=response_mask,
+                index=broken_index,
+                trajectory_uids=trajectory_uids,
+                step_indices=step_indices,
+                norm_adv_by_std_in_grpo=True,
+            )
+
+    def test_compute_advantage_prefers_explicit_group_uid(self) -> None:
+        token_level_rewards = torch.tensor(
+            [
+                [0.0, 0.0],
+                [0.7, 0.0],
+                [0.0, 0.0],
+                [-1.0, 0.0],
+            ],
+            dtype=torch.float32,
+        )
+        response_mask = torch.tensor([[1.0, 0.0]] * 4, dtype=torch.float32)
+        trajectory_uids = np.array(["traj-1", "traj-1", "traj-2", "traj-2"], dtype=object)
+        step_indices = np.array([0, 1, 0, 1], dtype=np.int32)
+
+        batch = TensorDict(
+            {
+                "token_level_rewards": token_level_rewards,
+                "response_mask": response_mask,
+            },
+            batch_size=(4,),
+        )
+        data = DataProto(
+            batch=batch,
+            non_tensor_batch={
+                "uid": np.array(["sample-a", "sample-b", "sample-a", "sample-a"], dtype=object),
+                "group_uid": np.array(["sample-a", "sample-a", "sample-a", "sample-a"], dtype=object),
+                "trajectory_uids": trajectory_uids,
+                "step_indices": step_indices,
+            },
+            meta_info={},
+        )
+
+        result = compute_advantage(
+            data,
+            adv_estimator=AdvantageEstimator.GRPO,
+            norm_adv_by_std_in_grpo=True,
+        )
+
+        expected = 1.0 / torch.sqrt(torch.tensor(2.0))
+        self.assertTrue(
+            torch.allclose(
+                result.batch["advantages"][:, 0],
+                torch.tensor(
+                    [
+                        float(expected.item()),
+                        float(expected.item()),
+                        -float(expected.item()),
+                        -float(expected.item()),
+                    ],
+                    dtype=torch.float32,
+                ),
+                atol=1e-6,
+            )
+        )
+
+    def test_grpo_is_invariant_to_row_order_within_trajectory(self) -> None:
+        token_level_rewards = torch.tensor(
+            [
+                [0.0, 0.0],      # traj-1 step 0
+                [0.500001, 0.0], # traj-1 terminal
+                [0.0, 0.0],      # traj-2 step 0
+                [0.500003, 0.0], # traj-2 terminal
+            ],
+            dtype=torch.float32,
+        )
+        response_mask = torch.tensor([[1.0, 0.0]] * 4, dtype=torch.float32)
+        index = np.array(["sample-a"] * 4, dtype=object)
+        trajectory_uids = np.array(["traj-1", "traj-1", "traj-2", "traj-2"], dtype=object)
+        step_indices = np.array([0, 1, 0, 1], dtype=np.int32)
+
+        natural_advantages, _ = compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=index,
+            trajectory_uids=trajectory_uids,
+            step_indices=step_indices,
+            norm_adv_by_std_in_grpo=True,
+        )
+
+        reordered = np.array([1, 0, 3, 2], dtype=np.int32)
+        reordered_advantages, _ = compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards[reordered],
+            response_mask=response_mask[reordered],
+            index=index[reordered],
+            trajectory_uids=trajectory_uids[reordered],
+            step_indices=step_indices[reordered],
+            norm_adv_by_std_in_grpo=True,
+        )
+
+        self.assertTrue(
+            torch.allclose(
+                natural_advantages[reordered, 0],
+                reordered_advantages[:, 0],
+                atol=1e-6,
+            )
+        )
 
 
 if __name__ == "__main__":

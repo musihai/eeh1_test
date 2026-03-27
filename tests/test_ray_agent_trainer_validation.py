@@ -154,6 +154,147 @@ class TestValidationRewardManager(unittest.TestCase):
         self.assertIn("old_log_probs", old_log_prob.batch.keys())
         self.assertNotIn("entropys", old_log_prob.batch.keys())
 
+    def test_ray_agent_trainer_ref_log_prob_uses_tensordict_path_when_legacy_workers_disabled(self) -> None:
+        trainer = RayAgentTrainer.__new__(RayAgentTrainer)
+        trainer.use_legacy_worker_impl = "disable"
+        trainer.ref_in_actor = False
+
+        captured = {}
+
+        class _RefWorkerGroup:
+            def compute_ref_log_prob(self, batch_td):
+                captured["calculate_entropy"] = tu.get(batch_td, "calculate_entropy")
+                captured["compute_loss"] = tu.get(batch_td, "compute_loss")
+                return tu.get_tensordict({"log_probs": torch.ones((1, 2), dtype=torch.float32)})
+
+        trainer.ref_policy_wg = _RefWorkerGroup()
+        batch = DataProto(
+            batch=TensorDict({"dummy": torch.ones((1, 2), dtype=torch.float32)}, batch_size=[1]),
+            meta_info={},
+        )
+
+        with (
+            patch("verl.trainer.ppo.ray_trainer.left_right_2_no_padding", lambda batch_td: batch_td),
+            patch("verl.trainer.ppo.ray_trainer.no_padding_2_padding", lambda value, batch_td: value),
+        ):
+            ref_log_prob = trainer._compute_ref_log_prob(batch)
+
+        self.assertFalse(captured["calculate_entropy"])
+        self.assertFalse(captured["compute_loss"])
+        self.assertIn("ref_log_prob", ref_log_prob.batch.keys())
+
+    def test_ray_agent_trainer_update_actor_uses_tensordict_path_when_legacy_workers_disabled(self) -> None:
+        trainer = RayAgentTrainer.__new__(RayAgentTrainer)
+        trainer.use_legacy_worker_impl = "disable"
+        trainer.config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "rollout": {
+                        "multi_turn": {"enable": False},
+                        "temperature": 1.0,
+                        "n": 8,
+                    },
+                    "actor": {
+                        "entropy_coeff": 0.0,
+                        "ppo_mini_batch_size": 3,
+                        "ppo_micro_batch_size_per_gpu": 2,
+                        "ppo_epochs": 1,
+                        "data_loader_seed": 42,
+                        "shuffle": False,
+                    },
+                },
+                "trainer": {
+                    "n_gpus_per_node": 3,
+                    "nnodes": 1,
+                },
+            }
+        )
+
+        captured = {}
+
+        class _ActorWorkerGroup:
+            def update_actor(self, batch_td):
+                captured["is_tensordict"] = isinstance(batch_td, TensorDict)
+                captured["global_batch_size"] = tu.get(batch_td, "global_batch_size")
+                captured["mini_batch_size"] = tu.get(batch_td, "mini_batch_size")
+                captured["micro_batch_size_per_gpu"] = tu.get(batch_td, "micro_batch_size_per_gpu")
+                captured["epochs"] = tu.get(batch_td, "epochs")
+                captured["seed"] = tu.get(batch_td, "seed")
+                return tu.get_tensordict(
+                    {"dummy_metric": torch.zeros((1,), dtype=torch.float32)},
+                    non_tensor_dict={"metrics": {"mfu": 0.5}},
+                )
+
+        trainer.actor_rollout_wg = _ActorWorkerGroup()
+        batch = DataProto(
+            batch=TensorDict({"dummy": torch.ones((27, 2), dtype=torch.float32)}, batch_size=[27]),
+            meta_info={},
+        )
+
+        with patch("arft.ray_agent_trainer.left_right_2_no_padding", lambda batch_td: batch_td):
+            actor_output = trainer._update_actor(batch)
+
+        self.assertTrue(captured["is_tensordict"])
+        self.assertEqual(captured["global_batch_size"], 27)
+        self.assertEqual(captured["mini_batch_size"], 27)
+        self.assertEqual(captured["micro_batch_size_per_gpu"], 3)
+        self.assertEqual(captured["epochs"], 1)
+        self.assertEqual(captured["seed"], 42)
+        self.assertEqual(actor_output.meta_info["metrics"]["perf/mfu/actor"], 0.5)
+
+    def test_ray_agent_trainer_update_actor_uses_per_dp_batch_for_batch_sizing(self) -> None:
+        trainer = RayAgentTrainer.__new__(RayAgentTrainer)
+        trainer.use_legacy_worker_impl = "disable"
+        trainer.config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "rollout": {
+                        "multi_turn": {"enable": False},
+                        "temperature": 1.0,
+                        "n": 8,
+                    },
+                    "actor": {
+                        "entropy_coeff": 0.0,
+                        "ppo_mini_batch_size": 3,
+                        "ppo_micro_batch_size_per_gpu": 2,
+                        "ppo_epochs": 1,
+                        "data_loader_seed": 42,
+                        "shuffle": False,
+                    },
+                },
+                "trainer": {
+                    "n_gpus_per_node": 3,
+                    "nnodes": 1,
+                },
+            }
+        )
+
+        captured = {}
+
+        class _ActorWorkerGroup:
+            def update_actor(self, batch_td):
+                captured["global_batch_size"] = tu.get(batch_td, "global_batch_size")
+                captured["mini_batch_size"] = tu.get(batch_td, "mini_batch_size")
+                captured["micro_batch_size_per_gpu"] = tu.get(batch_td, "micro_batch_size_per_gpu")
+                return tu.get_tensordict(
+                    {"dummy_metric": torch.zeros((1,), dtype=torch.float32)},
+                    non_tensor_dict={"metrics": {"mfu": 0.5}},
+                )
+
+        trainer.actor_rollout_wg = _ActorWorkerGroup()
+        batch = DataProto(
+            batch=TensorDict({"dummy": torch.ones((258, 2), dtype=torch.float32)}, batch_size=[258]),
+            meta_info={},
+        )
+
+        with patch("arft.ray_agent_trainer.left_right_2_no_padding", lambda batch_td: batch_td):
+            actor_output = trainer._update_actor(batch)
+
+        self.assertEqual(captured["global_batch_size"], 6)
+        self.assertEqual(captured["mini_batch_size"], 6)
+        self.assertEqual(captured["micro_batch_size_per_gpu"], 2)
+        self.assertEqual(actor_output.meta_info["metrics"]["perf/mfu/actor"], 0.5)
+
     def test_rl_launcher_supports_val_only_mode(self) -> None:
         project_dir = os.path.dirname(os.path.dirname(__file__))
         script_path = os.path.join(project_dir, "examples/time_series_forecast/run_qwen3-1.7B.sh")
@@ -177,11 +318,107 @@ class TestValidationRewardManager(unittest.TestCase):
 
         self.assertIn("trainer.val_only=True", result.stdout)
         self.assertIn("trainer.val_before_train=True", result.stdout)
-        self.assertIn("data.train_batch_size=3", result.stdout)
+
+    def test_rl_launcher_enables_chain_debug_by_default_for_formal_train(self) -> None:
+        project_dir = os.path.dirname(os.path.dirname(__file__))
+        script_path = os.path.join(project_dir, "examples/time_series_forecast/run_qwen3-1.7B.sh")
+        checkpoint_path = os.path.join(
+            project_dir,
+            "artifacts/checkpoints/sft/qwen3-1.7b-etth1-sft-paper-20260326_231520/global_step_50/huggingface",
+        )
+        dataset_dir = os.path.join(project_dir, "dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2")
+        result = subprocess.run(
+            [
+                "bash",
+                script_path,
+            ],
+            cwd=project_dir,
+            env={
+                **os.environ,
+                "RUN_MODE": "train",
+                "PRINT_CMD_ONLY": "1",
+                "RL_MODEL_PATH": checkpoint_path,
+                "RL_CURRICULUM_DATASET_DIR": dataset_dir,
+                "RL_CURRICULUM_PHASE": "stage1",
+                "RL_EXP_NAME": "debug-chain-default-test",
+                "RL_TRAINER_LOCAL_DIR": os.path.join(project_dir, "artifacts/checkpoints/rl/debug-chain-default-test"),
+            },
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        self.assertIn("[CHAIN DEBUG] enabled", result.stdout)
+        self.assertIn("[MIN DEBUG] validation debug dir:", result.stdout)
+        self.assertIn("logs/debug/ts_chain_debug.jsonl", result.stdout)
+        self.assertIn("data.train_batch_size=9", result.stdout)
         self.assertIn("data.filter_overlong_prompts=False", result.stdout)
         self.assertIn("actor_rollout_ref.actor.ppo_mini_batch_size=3", result.stdout)
-        self.assertIn("data.train_max_samples=32", result.stdout)
-        self.assertIn("data.val_max_samples=256", result.stdout)
+
+    def test_curriculum_rl_launcher_respects_smoke_run_mode(self) -> None:
+        project_dir = os.path.dirname(os.path.dirname(__file__))
+        script_path = os.path.join(project_dir, "examples/time_series_forecast/run_qwen3-1.7B_curriculum.sh")
+        result = subprocess.run(
+            [
+                "bash",
+                script_path,
+            ],
+            cwd=project_dir,
+            env={
+                **os.environ,
+                "PRINT_CMD_ONLY": "1",
+                "RUN_MODE": "smoke",
+                "RL_CURRICULUM_PHASES": "stage1",
+                "RL_MODEL_PATH": "/data/linyujie/models/Qwen3-1.7B",
+                "RL_CURRICULUM_DATASET_DIR": os.path.join(
+                    project_dir, "dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2"
+                ),
+                "RL_EXP_NAME": "curriculum_smoke_test",
+                "RL_TRAINER_LOCAL_DIR": os.path.join(project_dir, "artifacts/checkpoints/rl/curriculum_smoke_test"),
+                "RL_LOGGER": "[\"console\"]",
+            },
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        self.assertIn("train_stage1.jsonl", result.stdout)
+        self.assertIn("trainer.total_training_steps=1", result.stdout)
+        self.assertIn("data.train_max_samples=3", result.stdout)
+        self.assertIn("rollout_gpu_memory_utilization=0.25", result.stdout)
+
+    def test_curriculum_rl_launcher_uses_lower_rollout_budget_for_later_phases(self) -> None:
+        project_dir = os.path.dirname(os.path.dirname(__file__))
+        script_path = os.path.join(project_dir, "examples/time_series_forecast/run_qwen3-1.7B_curriculum.sh")
+        result = subprocess.run(
+            [
+                "bash",
+                script_path,
+            ],
+            cwd=project_dir,
+            env={
+                **os.environ,
+                "PRINT_CMD_ONLY": "1",
+                "RUN_MODE": "smoke",
+                "RL_CURRICULUM_PHASES": "stage1,stage12",
+                "RL_MODEL_PATH": "/data/linyujie/models/Qwen3-1.7B",
+                "RL_CURRICULUM_DATASET_DIR": os.path.join(
+                    project_dir, "dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2"
+                ),
+                "RL_EXP_NAME": "curriculum_smoke_stage_budget_test",
+                "RL_TRAINER_LOCAL_DIR": os.path.join(
+                    project_dir, "artifacts/checkpoints/rl/curriculum_smoke_stage_budget_test"
+                ),
+                "RL_LOGGER": "[\"console\"]",
+            },
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        self.assertIn("rollout_gpu_memory_utilization=0.25", result.stdout)
+        self.assertIn("rollout_gpu_memory_utilization=0.20", result.stdout)
+        self.assertIn("actor_rollout_ref.rollout.gpu_memory_utilization=0.20", result.stdout)
 
     def test_sft_launcher_supports_print_only_with_sft_model_path(self) -> None:
         project_dir = os.path.dirname(os.path.dirname(__file__))
@@ -404,51 +641,41 @@ class TestValidationRewardManager(unittest.TestCase):
 
             self.assertEqual(returned_agg_row["validation_reward_mean"], agg_row["validation_reward_mean"])
 
-            self.assertAlmostEqual(agg_row["exact_96_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["validation_reward_mean"], (-0.85) / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["validation_reward_min"], -1.0, places=6)
+            self.assertAlmostEqual(agg_row["validation_reward_max"], 0.7, places=6)
+            self.assertAlmostEqual(agg_row["reward_negative_one_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["final_answer_accept_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["success_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["tool_error_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["workflow_rejected_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["missing_required_feature_tool_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["prediction_call_not_once_ratio"], 0.0, places=6)
             self.assertAlmostEqual(agg_row["orig_mse_mean"], 0.0, places=6)
             self.assertAlmostEqual(agg_row["norm_mse_mean"], 0.0, places=6)
-            self.assertAlmostEqual(agg_row["length_hard_fail_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["length_mismatch_ratio"], 2.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["selected_forecast_orig_mse_mean"], 0.9, places=6)
-            self.assertAlmostEqual(agg_row["selected_forecast_len_match_ratio"], 2.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["selected_forecast_exact_copy_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["final_vs_selected_mse_mean"], 0.075, places=6)
             self.assertAlmostEqual(agg_row["refinement_delta_orig_mse_mean"], 0.2, places=6)
-            self.assertAlmostEqual(agg_row["refinement_compare_len_mean"], 95.5, places=6)
-            self.assertAlmostEqual(agg_row["refinement_changed_value_count_mean"], 1.5, places=6)
-            self.assertAlmostEqual(agg_row["refinement_first_changed_index_mean"], 72.0, places=6)
-            self.assertAlmostEqual(agg_row["refinement_changed_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["refinement_improved_ratio"], 2.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["prediction_model_defaulted_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["analysis_coverage_ratio_mean"], (1.0 + 0.4 + 0.8) / 3.0, places=6)
             self.assertAlmostEqual(agg_row["feature_tool_count_mean"], 2.0, places=6)
             self.assertAlmostEqual(agg_row["required_feature_tool_count_mean"], 8.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["missing_required_feature_tool_count_mean"], 2.0 / 3.0, places=6)
-            self.assertAlmostEqual(agg_row["required_step_budget_mean"], 16.0 / 3.0, places=6)
-            self.assertAlmostEqual(agg_row["tool_call_count_mean"], 7.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["response_token_len_mean"], 407.6666666666667, places=6)
-            self.assertAlmostEqual(agg_row["history_analysis_count_mean"], 5.0 / 3.0, places=6)
-            self.assertAlmostEqual(agg_row["no_tool_call_ratio"], 1.0 / 3.0, places=6)
-            self.assertAlmostEqual(agg_row["no_history_analysis_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["illegal_turn3_tool_call_ratio"], 1.0 / 3.0, places=6)
             self.assertEqual(agg_row["prediction_tool_error_count"], 1)
+            self.assertEqual(
+                agg_row["debug_bucket_distribution"],
+                {"ok": 1, "tool_error": 1, "workflow_violation": 1},
+            )
+            self.assertEqual(
+                agg_row["debug_reason_distribution"],
+                {"illegal_refinement_tool_call": 1, "ok": 1, "prediction_tool_error": 1},
+            )
             self.assertEqual(agg_row["selected_model_distribution"], {"chronos2": 1, "itransformer": 2})
-            self.assertEqual(agg_row["prediction_requested_model_distribution"], {"__missing__": 1, "chronos2": 1, "itransformer": 1})
-            self.assertEqual(
-                agg_row["required_feature_tool_signature_distribution"],
-                {
-                    "extract_basic_statistics->extract_event_summary->extract_data_quality": 2,
-                    "extract_basic_statistics->extract_within_channel_dynamics": 1,
-                },
-            )
-            self.assertEqual(
-                agg_row["tool_call_sequence_distribution"],
-                {
-                    "extract_basic_statistics->extract_event_summary->extract_data_quality->predict_time_series": 1,
-                    "extract_basic_statistics->extract_within_channel_dynamics->predict_time_series": 1,
-                    "none": 1,
-                },
-            )
             self.assertEqual(agg_row["workflow_status_distribution"], {"accepted": 1, "not_attempted": 1, "rejected": 1})
             self.assertEqual(agg_row["format_failure_reason_distribution"]["missing_answer_close_tag"], 1)
             self.assertEqual(agg_row["generation_stop_reason_distribution"], {"length": 1, "stop": 2})
@@ -462,30 +689,24 @@ class TestValidationRewardManager(unittest.TestCase):
                 sample_rows = [json.loads(line) for line in handle if line.strip()]
 
             self.assertEqual(len(returned_sample_rows), len(sample_rows))
+            self.assertEqual({row["category"] for row in sample_rows}, {"best_success", "critical_failure", "near_miss_94_95"})
 
             near_miss_row = next(
                 row for row in sample_rows if row["category"] == "near_miss_94_95" and row["sample_id"] == "sample-2"
             )
+            self.assertEqual(near_miss_row["debug_bucket"], "workflow_violation")
+            self.assertEqual(near_miss_row["debug_reason"], "illegal_refinement_tool_call")
             self.assertEqual(near_miss_row["generation_stop_reason"], "stop")
             self.assertEqual(near_miss_row["generation_finish_reason"], "stop")
             self.assertEqual(near_miss_row["prediction_requested_model"], "chronos2")
             self.assertTrue(near_miss_row["refinement_changed"])
-            self.assertTrue(near_miss_row["selected_forecast_len_match"])
             self.assertFalse(near_miss_row["selected_forecast_exact_copy"])
-            self.assertEqual(near_miss_row["refinement_changed_value_count"], 3)
-            self.assertEqual(near_miss_row["refinement_first_changed_index"], 72)
             self.assertEqual(near_miss_row["required_step_budget"], 5)
-            self.assertEqual(near_miss_row["tool_call_count"], 3)
             self.assertEqual(near_miss_row["response_token_len"], 99)
-            self.assertEqual(near_miss_row["history_analysis_count"], 2)
             self.assertEqual(near_miss_row["prediction_step_index"], 2)
             self.assertEqual(near_miss_row["final_answer_step_index"], 3)
             self.assertEqual(near_miss_row["required_feature_tool_count"], 2)
             self.assertEqual(near_miss_row["missing_required_feature_tool_count"], 0)
-            self.assertEqual(
-                near_miss_row["required_feature_tool_signature"],
-                "extract_basic_statistics->extract_within_channel_dynamics",
-            )
             self.assertEqual(
                 near_miss_row["tool_call_sequence"],
                 "extract_basic_statistics->extract_within_channel_dynamics->predict_time_series",
@@ -494,7 +715,21 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertIn("94.5000", near_miss_row["final_answer_preview"])
             self.assertIn("filled_orig_mse", near_miss_row)
             self.assertIn("filled_norm_mse", near_miss_row)
-            self.assertAlmostEqual(near_miss_row["filled_raw_mse"], near_miss_row["filled_orig_mse"], places=6)
+            self.assertNotIn("required_feature_tool_signature", near_miss_row)
+            self.assertNotIn("tool_call_count", near_miss_row)
+
+            failure_row = next(
+                row for row in sample_rows if row["category"] == "critical_failure" and row["sample_id"] == "sample-1"
+            )
+            self.assertEqual(failure_row["debug_bucket"], "tool_error")
+            self.assertEqual(failure_row["debug_reason"], "prediction_tool_error")
+            self.assertEqual(failure_row["prediction_tool_error"], "RuntimeError: timeout")
+
+            success_row = next(
+                row for row in sample_rows if row["category"] == "best_success" and row["sample_id"] == "sample-0"
+            )
+            self.assertEqual(success_row["debug_bucket"], "ok")
+            self.assertTrue(success_row["selected_forecast_exact_copy"])
 
     def test_flatten_validation_aggregate_metrics_emits_scalar_val_agg_metrics(self) -> None:
         agg_row = {

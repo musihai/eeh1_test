@@ -8,6 +8,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DEFAULT_PROFILE_PATH="$SCRIPT_DIR/configs/etth1_ot_qwen3_gpu012.sh"
+ORIGINAL_RL_ROLLOUT_GPU_MEMORY_UTILIZATION="${RL_ROLLOUT_GPU_MEMORY_UTILIZATION-__unset__}"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/rl_launch_utils.sh"
 
 resolve_profile_path() {
     local candidate="$1"
@@ -32,6 +35,10 @@ RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
 }
 # shellcheck disable=SC1090
 source "$RESOLVED_PROFILE_PATH"
+
+if [ "${PRINT_CMD_ONLY:-0}" != "1" ]; then
+    trap cleanup_ray_and_stale_vllm EXIT
+fi
 
 resolve_transformers_model_dir() {
     python3 - "$1" <<'PY'
@@ -58,7 +65,28 @@ VAL_FILES="$CURRICULUM_DATASET_DIR/val.jsonl"
 PHASES="${RL_CURRICULUM_PHASES:-stage1,stage12,stage123}"
 BASE_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper_20260326}"
 BASE_LOCAL_DIR="${RL_TRAINER_LOCAL_DIR:-$PROJECT_DIR/artifacts/checkpoints/rl/$BASE_EXP_NAME}"
-RUN_MODE=train
+RUN_MODE="${RUN_MODE:-train}"
+
+resolve_phase_rollout_gpu_memory_utilization() {
+    local phase="$1"
+
+    if [ "$ORIGINAL_RL_ROLLOUT_GPU_MEMORY_UTILIZATION" != "__unset__" ]; then
+        printf '%s\n' "$ORIGINAL_RL_ROLLOUT_GPU_MEMORY_UTILIZATION"
+        return 0
+    fi
+
+    case "$phase" in
+        stage1)
+            printf '%s\n' "${RL_CURRICULUM_STAGE1_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
+            ;;
+        stage12|stage123)
+            printf '%s\n' "${RL_CURRICULUM_LATER_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.20}"
+            ;;
+        *)
+            printf '%s\n' "${RL_CURRICULUM_LATER_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.20}"
+            ;;
+    esac
+}
 
 if [ -z "$CURRICULUM_DATASET_DIR" ]; then
     echo "RL_CURRICULUM_DATASET_DIR is required for curriculum RL." >&2
@@ -123,6 +151,7 @@ while IFS= read -r phase; do
 
     PHASE_EXP_NAME="${BASE_EXP_NAME}_${phase}"
     PHASE_LOCAL_DIR="${BASE_LOCAL_DIR}/${phase}"
+    PHASE_ROLLOUT_GPU_MEMORY_UTILIZATION="$(resolve_phase_rollout_gpu_memory_utilization "$phase")"
 
     if [ "${PRINT_CMD_ONLY:-0}" = "1" ] && [ -n "$PREVIOUS_PHASE_DIR" ]; then
         CURRENT_MODEL_PATH="${PREVIOUS_PHASE_DIR}/global_step_<latest>/actor/huggingface"
@@ -133,9 +162,10 @@ while IFS= read -r phase; do
     echo "  val=$VAL_FILES"
     echo "  model=$CURRENT_MODEL_PATH"
     echo "  save_dir=$PHASE_LOCAL_DIR"
+    echo "  rollout_gpu_memory_utilization=$PHASE_ROLLOUT_GPU_MEMORY_UTILIZATION"
 
     if [ "${PRINT_CMD_ONLY:-0}" != "1" ]; then
-        ray stop --force >/dev/null 2>&1 || true
+        cleanup_ray_and_stale_vllm
     fi
 
     RL_MODEL_PATH="$CURRENT_MODEL_PATH" \
@@ -143,6 +173,7 @@ while IFS= read -r phase; do
     RL_CURRICULUM_PHASE="$phase" \
     RL_EXP_NAME="$PHASE_EXP_NAME" \
     RL_TRAINER_LOCAL_DIR="$PHASE_LOCAL_DIR" \
+    RL_ROLLOUT_GPU_MEMORY_UTILIZATION="$PHASE_ROLLOUT_GPU_MEMORY_UTILIZATION" \
     RUN_MODE="$RUN_MODE" \
     bash "$SCRIPT_DIR/run_qwen3-1.7B.sh" "$@"
 

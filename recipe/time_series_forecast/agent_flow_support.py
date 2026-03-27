@@ -114,6 +114,121 @@ def finite_or_nan(value: Any) -> float:
     return numeric
 
 
+def safe_int(value: Any, default: int = -1) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def summarize_debug_diagnosis(
+    *,
+    reward_score: Any = None,
+    workflow_status: str = "",
+    workflow_message: str = "",
+    format_failure_reason: str = "",
+    final_answer_reject_reason: str = "",
+    prediction_tool_error: str = "",
+    prediction_call_count: Any = None,
+    illegal_turn3_tool_call_count: Any = None,
+    missing_required_feature_tool_count: Any = None,
+    selected_forecast_exact_copy: bool = False,
+    refinement_degraded: bool = False,
+    prediction_model_defaulted: bool = False,
+) -> dict[str, Any]:
+    score = finite_or_nan(reward_score)
+    prediction_calls = safe_int(prediction_call_count, default=-1)
+    illegal_calls = safe_int(illegal_turn3_tool_call_count, default=0)
+    missing_required = safe_int(missing_required_feature_tool_count, default=0)
+    workflow_status_text = str(workflow_status or "").strip().lower()
+    workflow_message_text = str(workflow_message or "").strip().lower()
+    reject_reason = str(final_answer_reject_reason or "").strip()
+    format_reason = str(format_failure_reason or "").strip()
+    tool_error = str(prediction_tool_error or "").strip()
+
+    if tool_error:
+        return {
+            "debug_bucket": "tool_error",
+            "debug_reason": "prediction_tool_error",
+            "debug_severity": 100,
+        }
+
+    if workflow_status_text == "rejected":
+        if "copy input" in workflow_message_text or "future timestamps" in workflow_message_text:
+            reason = "copied_input"
+        elif illegal_calls > 0:
+            reason = "illegal_refinement_tool_call"
+        elif prediction_calls >= 0 and prediction_calls != 1:
+            reason = "prediction_call_count_invalid"
+        elif missing_required > 0 or "diagnostic" in workflow_message_text:
+            reason = "missing_required_diagnostics"
+        else:
+            reason = "workflow_rejected"
+        return {
+            "debug_bucket": "workflow_violation",
+            "debug_reason": reason,
+            "debug_severity": 95,
+        }
+
+    primary_reason = reject_reason or (format_reason if format_reason and format_reason != "ok" else "")
+    if primary_reason:
+        if primary_reason.startswith("missing_answer_close_tag"):
+            reason = "missing_answer_close_tag"
+        elif primary_reason.startswith("missing_answer_block"):
+            reason = "missing_answer_block"
+        elif primary_reason.startswith("missing_think"):
+            reason = "missing_think_block"
+        elif primary_reason.startswith("extra_text_outside_tags"):
+            reason = "extra_text_outside_tags"
+        elif primary_reason.startswith("invalid_answer_shape"):
+            reason = "invalid_answer_shape"
+        elif primary_reason.startswith("length_mismatch"):
+            reason = "length_mismatch"
+        elif primary_reason.startswith("empty_solution"):
+            reason = "empty_solution"
+        else:
+            reason = primary_reason
+        return {
+            "debug_bucket": "format_failure",
+            "debug_reason": reason,
+            "debug_severity": 85,
+        }
+
+    if np.isfinite(score) and score <= -0.99:
+        return {
+            "debug_bucket": "hard_failure",
+            "debug_reason": "negative_one_reward",
+            "debug_severity": 80,
+        }
+
+    if refinement_degraded:
+        return {
+            "debug_bucket": "quality_regression",
+            "debug_reason": "refinement_degraded",
+            "debug_severity": 60,
+        }
+
+    if prediction_model_defaulted:
+        return {
+            "debug_bucket": "policy_gap",
+            "debug_reason": "prediction_model_defaulted",
+            "debug_severity": 30,
+        }
+
+    if missing_required > 0:
+        return {
+            "debug_bucket": "policy_gap",
+            "debug_reason": "missing_required_diagnostics",
+            "debug_severity": 30,
+        }
+
+    return {
+        "debug_bucket": "ok",
+        "debug_reason": "ok",
+        "debug_severity": 0,
+    }
+
+
 def shared_reward_tracking_fields(
     *,
     sample_uid: Any,
@@ -328,17 +443,32 @@ def build_turn_debug_payload(
     }
     required_names = normalize_required_feature_tool_names(required_feature_tools, executed_feature_tool_names)
     missing_required = [name for name in required_names if name not in set(executed_feature_tool_names)]
+    diagnosis = summarize_debug_diagnosis(
+        reward_score=reward_extra_info.get("trainer_seq_score") or reward_extra_info.get("score"),
+        workflow_status=workflow_status,
+        workflow_message=workflow_message,
+        format_failure_reason=str(reward_extra_info.get("format_failure_reason", "")),
+        final_answer_reject_reason=final_answer_reject_reason or "",
+        prediction_tool_error=prediction_tool_error or "",
+        prediction_call_count=prediction_call_count,
+        illegal_turn3_tool_call_count=illegal_turn3_tool_call_count,
+        missing_required_feature_tool_count=reward_extra_info.get(
+            "missing_required_feature_tool_count",
+            len(missing_required),
+        ),
+        selected_forecast_exact_copy=bool(reward_extra_info.get("selected_forecast_exact_copy", False)),
+        refinement_degraded=bool(reward_extra_info.get("refinement_degraded", False)),
+        prediction_model_defaulted=bool(prediction_model_defaulted),
+    )
     payload = {
         "request_id": request_id,
         "sample_index": sample_index,
         "sample_uid": sample_uid_text(sample_uid or reward_extra_info.get("sample_uid")),
         "step_index": int(step_index),
         "turn_stage": turn_stage,
+        **diagnosis,
         "tool_call_sequence": tool_call_names,
         "tool_call_count": int(len(tool_call_names)),
-        "executed_tool_count": int(reward_extra_info.get("executed_tool_count", 0) or 0),
-        "executed_tool_sequence": reward_extra_info.get("executed_tool_sequence", ""),
-        "rejected_tool_call_count": int(reward_extra_info.get("rejected_tool_call_count", 0) or 0),
         "feature_tool_signature": reward_extra_info.get(
             "feature_tool_signature",
             feature_tool_signature(feature_tool_sequence),
@@ -380,9 +510,11 @@ def build_turn_debug_payload(
         "generation_finish_reason": generation_finish_reason,
         "final_answer_reject_reason": final_answer_reject_reason or "",
         "final_answer_parse_mode": final_answer_parse_mode or "",
-        "prompt_char_len": int(len(prompt_text)),
-        "response_char_len": int(len(response_text)),
-        "response_line_count": int(len([line for line in response_text.splitlines() if line.strip()])),
+        "pred_len": safe_int(reward_extra_info.get("pred_len"), default=-1),
+        "expected_len": safe_int(
+            reward_extra_info.get("expected_len", reward_extra_info.get("gt_len")),
+            default=-1,
+        ),
         "selected_forecast_preview": reward_extra_info.get("selected_forecast_preview", ""),
         "final_answer_preview": reward_extra_info.get("final_answer_preview", ""),
         "selected_forecast_orig_mse": finite_or_nan(reward_extra_info.get("selected_forecast_orig_mse")),
@@ -452,7 +584,9 @@ __all__ = [
     "finite_or_nan",
     "normalize_required_feature_tool_names",
     "required_step_budget",
+    "safe_int",
     "sample_uid_text",
     "series_preview",
     "shared_reward_tracking_fields",
+    "summarize_debug_diagnosis",
 ]

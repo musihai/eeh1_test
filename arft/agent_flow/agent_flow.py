@@ -39,6 +39,7 @@ from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.chain_debug import append_chain_debug
+from verl.utils.reward_extra_info import pack_reward_extra_infos
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
     rollout_trace_attr,
@@ -248,6 +249,10 @@ class AgentFlowBase(ABC):
 
     async def _postprocess(self, step: AgentFlowStep, **kwargs) -> _InternalAgentFlowStep:
         step.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        if kwargs.get("uid") is not None:
+            # Preserve the prompt-level grouping key on every emitted step so
+            # GRPO does not rely on implicit repeat/sample-level alignment.
+            step.extra_fields["group_uid"] = str(kwargs["uid"])
 
         # Token packing follows the current rollout tensor contract:
         # prompt_ids: left padded with zeros (e.g., [0,0,0,0,1,2,3,4])
@@ -741,10 +746,9 @@ class AgentFlowWorkerBase:
         for input in inputs:
             for step in input.steps:
                 reward_extra_infos.append(step.extra_fields.get("reward_extra_info", {}))
-        
-        reward_extra_keys = list(reward_extra_infos[0].keys())
-        for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info.get(key) for info in reward_extra_infos])
+
+        reward_extra_non_tensor, reward_extra_keys = pack_reward_extra_infos(reward_extra_infos)
+        non_tensor_batch.update(reward_extra_non_tensor)
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         if any(mmi is not None for mmi in multi_modal_inputs):

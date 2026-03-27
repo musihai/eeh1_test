@@ -120,7 +120,7 @@ export RL_ROLLOUT_MAX_NUM_SEQS="${RL_ROLLOUT_MAX_NUM_SEQS:-3}"
 # vLLM 张量并行大小。
 export RL_ROLLOUT_TP="${RL_ROLLOUT_TP:-1}"
 # vLLM 显存利用率目标。
-export RL_ROLLOUT_GPU_MEMORY_UTILIZATION="${RL_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
+# 不同 RUN_MODE 会给出不同默认值，见下方分支。
 # vLLM 模型加载格式。
 export RL_ROLLOUT_LOAD_FORMAT="${RL_ROLLOUT_LOAD_FORMAT:-safetensors}"
 # 是否启用即时采样模式。
@@ -135,6 +135,10 @@ export RL_ROLLOUT_FREE_CACHE_ENGINE="${RL_ROLLOUT_FREE_CACHE_ENGINE:-False}"
 export RL_FSDP_MODEL_DTYPE="${RL_FSDP_MODEL_DTYPE:-bfloat16}"
 # 是否在 actor/ref 进程中启用 torch.compile。
 export RL_FSDP_USE_TORCH_COMPILE="${RL_FSDP_USE_TORCH_COMPILE:-False}"
+# 说明：
+# - 1.7B 模型在 3x5090(32G) + bf16 下，正式 RL 不需要再把 actor/ref 参数和 actor optimizer 完全 offload 到 CPU。
+# - 关闭这些 offload 可以明显提升 GPU 利用率并减少主机内存来回搬运的开销。
+# - 若你换成更大模型或更小显存卡，再按需覆盖这些变量即可。
 
 case "$RUN_MODE" in
     val_only)
@@ -169,6 +173,11 @@ case "$RUN_MODE" in
         export RL_PPO_MICRO_BATCH_SIZE="${RL_PPO_MICRO_BATCH_SIZE:-1}"
         # RL log-prob 每卡微批大小。
         export RL_LOGPROB_MICRO_BATCH_SIZE="${RL_LOGPROB_MICRO_BATCH_SIZE:-1}"
+        # val-only 只做推理，保留适中的 rollout cache 即可。
+        export RL_ROLLOUT_GPU_MEMORY_UTILIZATION="${RL_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.30}"
+        export RL_ACTOR_PARAM_OFFLOAD="${RL_ACTOR_PARAM_OFFLOAD:-False}"
+        export RL_ACTOR_OPTIMIZER_OFFLOAD="${RL_ACTOR_OPTIMIZER_OFFLOAD:-False}"
+        export RL_REF_PARAM_OFFLOAD="${RL_REF_PARAM_OFFLOAD:-False}"
         # 每个提示词采样的轨迹数。
         export RL_ROLLOUT_N="${RL_ROLLOUT_N:-1}"
         # RL 权重保存频率。
@@ -223,6 +232,12 @@ case "$RUN_MODE" in
         export RL_PPO_MICRO_BATCH_SIZE="${RL_PPO_MICRO_BATCH_SIZE:-1}"
         # RL log-prob 每卡微批大小。
         export RL_LOGPROB_MICRO_BATCH_SIZE="${RL_LOGPROB_MICRO_BATCH_SIZE:-1}"
+        # 这里的 0.25 只是 vLLM cache 预算，不是整卡显存占用上限；
+        # actor/ref 仍会把单卡总占用推到 20GB+，同时避免和反向峰值打架。
+        export RL_ROLLOUT_GPU_MEMORY_UTILIZATION="${RL_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
+        export RL_ACTOR_PARAM_OFFLOAD="${RL_ACTOR_PARAM_OFFLOAD:-False}"
+        export RL_ACTOR_OPTIMIZER_OFFLOAD="${RL_ACTOR_OPTIMIZER_OFFLOAD:-False}"
+        export RL_REF_PARAM_OFFLOAD="${RL_REF_PARAM_OFFLOAD:-False}"
         # 每个提示词采样的轨迹数。
         export RL_ROLLOUT_N="${RL_ROLLOUT_N:-8}"
         # RL 权重保存频率。
@@ -273,10 +288,22 @@ case "$RUN_MODE" in
         # normalized_ppo_mini_batch_size = 3 * 8 / 3 = 8 trajectories / GPU-group。
         export RL_PPO_MINI_BATCH_SIZE="${RL_PPO_MINI_BATCH_SIZE:-3}"
         # RL PPO 每卡微批大小（trajectory 视角）。
-        # 取 2 后，actor 侧等效 gradient accumulation = 8 / 2 = 4，与论文一致。
-        export RL_PPO_MICRO_BATCH_SIZE="${RL_PPO_MICRO_BATCH_SIZE:-2}"
+        # 正式 stage1 在 batch=9 时，micro_batch=2 仍可能在 actor backward 峰值处 OOM。
+        # 默认收紧到 1，代价是更慢，但能显著降低反向峰值显存。
+        export RL_PPO_MICRO_BATCH_SIZE="${RL_PPO_MICRO_BATCH_SIZE:-1}"
         # RL log-prob 每卡微批大小。
         export RL_LOGPROB_MICRO_BATCH_SIZE="${RL_LOGPROB_MICRO_BATCH_SIZE:-1}"
+        # 正式 RL 默认关闭 FSDP offload。
+        # curriculum launcher 会按 phase 读取下面两个预算：
+        # - stage1: 0.20，避免正式 batch=9 时 actor backward 与 vLLM cache 叠加 OOM
+        # - stage12/stage123: 0.20，保持和已验证的后续 phase 配置一致
+        # 若显式传 RL_ROLLOUT_GPU_MEMORY_UTILIZATION，则仍以命令行覆盖为准。
+        export RL_ROLLOUT_GPU_MEMORY_UTILIZATION="${RL_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
+        export RL_CURRICULUM_STAGE1_ROLLOUT_GPU_MEMORY_UTILIZATION="${RL_CURRICULUM_STAGE1_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.20}"
+        export RL_CURRICULUM_LATER_ROLLOUT_GPU_MEMORY_UTILIZATION="${RL_CURRICULUM_LATER_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.20}"
+        export RL_ACTOR_PARAM_OFFLOAD="${RL_ACTOR_PARAM_OFFLOAD:-False}"
+        export RL_ACTOR_OPTIMIZER_OFFLOAD="${RL_ACTOR_OPTIMIZER_OFFLOAD:-False}"
+        export RL_REF_PARAM_OFFLOAD="${RL_REF_PARAM_OFFLOAD:-False}"
         # 每个提示词采样的轨迹数。
         export RL_ROLLOUT_N="${RL_ROLLOUT_N:-8}"
         # RL 权重保存频率。

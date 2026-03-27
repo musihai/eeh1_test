@@ -132,7 +132,7 @@ def compute_grpo_outcome_advantage(
         Returns: `(torch.Tensor)`
             shape is (bs, response_length)
     """
-    scores = token_level_rewards.sum(dim=-1)
+    terminal_rewards = token_level_rewards.sum(dim=-1)
     group_scores = defaultdict(list)
     group_means = {}
     group_stds = {}
@@ -140,17 +140,32 @@ def compute_grpo_outcome_advantage(
     terminal_row_by_trajectory = {}
 
     with torch.no_grad():
-        bsz = scores.shape[0]
+        bsz = terminal_rewards.shape[0]
+        trajectory_group_ids = {}
 
         for i in range(bsz):
             trajectory_uid = trajectory_uids[i]
+            group_id = index[i]
+            previous_group_id = trajectory_group_ids.get(trajectory_uid)
+            if previous_group_id is None:
+                trajectory_group_ids[trajectory_uid] = group_id
+            elif previous_group_id != group_id:
+                raise ValueError(
+                    "GRPO grouping invariant violated: the same trajectory_uid "
+                    f"{trajectory_uid!r} spans multiple group ids "
+                    f"{previous_group_id!r} and {group_id!r}."
+                )
+
             step_index = int(step_indices[i])
             previous_terminal = terminal_row_by_trajectory.get(trajectory_uid)
             if previous_terminal is None or step_index > previous_terminal[0]:
                 terminal_row_by_trajectory[trajectory_uid] = (step_index, i)
 
         for trajectory_uid, (_, row_index) in terminal_row_by_trajectory.items():
-            terminal_score = scores[row_index]
+            # Clone the scalar terminal reward so later in-place writes to the
+            # output tensor cannot corrupt subsequent rows of the same
+            # trajectory after batch reordering/balancing.
+            terminal_score = terminal_rewards[row_index].clone()
             terminal_score_by_trajectory[trajectory_uid] = terminal_score
             group_scores[index[row_index]].append(terminal_score)
 
@@ -165,12 +180,13 @@ def compute_grpo_outcome_advantage(
             else:
                 raise ValueError(f"no terminal trajectory score in prompt index: {group_id}")
 
+        advantages = torch.empty_like(terminal_rewards)
         for i in range(bsz):
             terminal_score = terminal_score_by_trajectory[trajectory_uids[i]]
             if norm_adv_by_std_in_grpo:
-                scores[i] = (terminal_score - group_means[index[i]]) / (group_stds[index[i]] + epsilon)
+                advantages[i] = (terminal_score - group_means[index[i]]) / (group_stds[index[i]] + epsilon)
             else:
-                scores[i] = terminal_score - group_means[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
+                advantages[i] = terminal_score - group_means[index[i]]
+        advantages = advantages.unsqueeze(-1) * response_mask
 
-    return scores, scores
+    return advantages, advantages

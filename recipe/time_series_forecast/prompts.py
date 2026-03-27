@@ -63,6 +63,7 @@ def build_timeseries_system_prompt(
 - Follow the CURRENT user turn instructions only.
 - Use tool calls only when tool schemas are available in the current turn.
 - If no tool schema is available, NEVER emit `<tool_call>`.
+- If you emit `<tool_call>`, the content inside it must be strict JSON with double-quoted strings.
 - When the user asks for the final forecast, output ONLY the required `<think>...</think><answer>...</answer>` blocks.
 - Never add markdown, bullets, or explanatory prose outside the requested output format.
 """
@@ -218,6 +219,7 @@ def build_runtime_user_prompt(
 - First decide what evidence you need from the current state before routing.
 - Stay in the diagnostic stage and call only the feature-extraction tools exposed in this turn.
 - You may call one or more feature tools in the same assistant turn.
+- Each `<tool_call>` block must contain strict JSON only, such as `{{"name":"extract_basic_statistics","arguments":{{}}}}`.
 - Use the tool outputs to characterize statistical properties, temporal patterns, and possible non-stationarity.
 - Do NOT call predict_time_series in this turn.
 """
@@ -238,6 +240,7 @@ def build_runtime_user_prompt(
 **Instructions**:
 - Do NOT call feature extraction tools again.
 - Use the accumulated analysis history to choose the forecasting expert whose inductive bias best matches the observed evidence.
+- The `predict_time_series` call must be emitted as strict JSON inside `<tool_call>...</tool_call>`.
 - Forecasting expert guidance:
   - `patchtst`: local temporal patterns with long-range dependencies.
   - `itransformer`: cross-channel dependencies or broader structural interactions.

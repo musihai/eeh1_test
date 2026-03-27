@@ -1,7 +1,15 @@
 import unittest
+import numpy as np
+import torch
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from arft.agent_flow.agent_flow import (
+    AgentFlowMetrics,
+    AgentFlowOutput,
+    AgentFlowWorkerBase,
+    _InternalAgentFlowStep,
+)
 from recipe.time_series_forecast.time_series_forecast_agent_flow import TimeSeriesForecastAgentFlow
 
 
@@ -226,6 +234,7 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
     def test_append_turn_debug_records_sample_uid(self) -> None:
         flow = self._make_flow()
         flow.required_feature_tools = ["extract_basic_statistics"]
+        flow.basic_statistics = {"mean": 1.0}
         flow.final_answer_step_index = 3
         reward_extra_info = flow._shared_reward_tracking_fields(sample_uid="etth1-val-00077")
         reward_extra_info.update({"required_step_budget": 4})
@@ -249,9 +258,89 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
 
         payload = mock_append.call_args.args[1]
         self.assertEqual(payload["sample_uid"], "etth1-val-00077")
-        self.assertEqual(payload["required_feature_tool_count"], 0)
-        self.assertEqual(payload["required_feature_tool_signature"], "none")
+        self.assertEqual(payload["debug_bucket"], "ok")
+        self.assertEqual(payload["debug_reason"], "ok")
+        self.assertEqual(payload["required_feature_tool_count"], 1)
+        self.assertEqual(payload["required_feature_tool_signature"], "extract_basic_statistics")
         self.assertEqual(payload["final_answer_step_index"], 3)
+
+    def test_agent_flow_worker_postprocess_preserves_explicit_group_uid(self) -> None:
+        worker = AgentFlowWorkerBase.__new__(AgentFlowWorkerBase)
+
+        def make_step(token_id: int, *, group_uid: str) -> _InternalAgentFlowStep:
+            return _InternalAgentFlowStep(
+                prompt_ids=torch.tensor([[11, 12]], dtype=torch.long),
+                response_ids=torch.tensor([[token_id, 0]], dtype=torch.long),
+                input_ids=torch.tensor([[11, 12, token_id, 0]], dtype=torch.long),
+                position_ids=torch.tensor([[0, 1, 2, 0]], dtype=torch.long),
+                response_mask=torch.tensor([[1, 0]], dtype=torch.long),
+                attention_mask=torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+                response_logprobs=None,
+                routed_experts=None,
+                multi_modal_inputs=None,
+                multi_modal_data=None,
+                reward_score=None,
+                num_turns=2,
+                extra_fields={"group_uid": group_uid},
+            )
+
+        outputs = [
+            AgentFlowOutput(
+                steps=[make_step(21, group_uid="uid-a"), make_step(22, group_uid="uid-a")],
+                metrics=AgentFlowMetrics(),
+            ),
+            AgentFlowOutput(
+                steps=[make_step(31, group_uid="uid-b")],
+                metrics=AgentFlowMetrics(),
+            ),
+        ]
+
+        result = worker._postprocess(outputs)
+
+        self.assertIn("group_uid", result.non_tensor_batch)
+        np.testing.assert_array_equal(
+            result.non_tensor_batch["group_uid"],
+            np.array(["uid-a", "uid-a", "uid-b"], dtype=object),
+        )
+
+    def test_agent_flow_worker_postprocess_keeps_union_of_reward_extra_info_keys(self) -> None:
+        worker = AgentFlowWorkerBase.__new__(AgentFlowWorkerBase)
+
+        def make_step(token_id: int, reward_extra_info: dict[str, object]) -> _InternalAgentFlowStep:
+            return _InternalAgentFlowStep(
+                prompt_ids=torch.tensor([[11, 12]], dtype=torch.long),
+                response_ids=torch.tensor([[token_id, 0]], dtype=torch.long),
+                input_ids=torch.tensor([[11, 12, token_id, 0]], dtype=torch.long),
+                position_ids=torch.tensor([[0, 1, 2, 0]], dtype=torch.long),
+                response_mask=torch.tensor([[1, 0]], dtype=torch.long),
+                attention_mask=torch.tensor([[1, 1, 1, 0]], dtype=torch.long),
+                response_logprobs=None,
+                routed_experts=None,
+                multi_modal_inputs=None,
+                multi_modal_data=None,
+                reward_score=None,
+                num_turns=2,
+                extra_fields={"reward_extra_info": reward_extra_info},
+            )
+
+        outputs = [
+            AgentFlowOutput(
+                steps=[
+                    make_step(21, {"a": 1, "shared": "x"}),
+                    make_step(22, {"shared": "y", "b": 2}),
+                ],
+                metrics=AgentFlowMetrics(),
+            )
+        ]
+
+        result = worker._postprocess(outputs)
+
+        self.assertIn("a", result.non_tensor_batch)
+        self.assertIn("b", result.non_tensor_batch)
+        self.assertIn("shared", result.non_tensor_batch)
+        self.assertEqual(result.non_tensor_batch["a"].tolist(), [1, None])
+        self.assertEqual(result.non_tensor_batch["b"].tolist(), [None, 2])
+        self.assertEqual(result.non_tensor_batch["shared"].tolist(), ["x", "y"])
 
 
 if __name__ == "__main__":

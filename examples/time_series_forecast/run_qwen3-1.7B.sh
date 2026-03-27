@@ -16,14 +16,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 DEFAULT_PROFILE_PATH="$SCRIPT_DIR/configs/etth1_ot_qwen3_gpu012.sh"
-
-DEBUG_CHAIN="${DEBUG_CHAIN:-0}"
-if [ "$DEBUG_CHAIN" = "1" ] || [ "${DEBUG_CHAIN,,}" = "true" ]; then
-    export TS_CHAIN_DEBUG=1
-    export TS_CHAIN_DEBUG_FILE="${TS_CHAIN_DEBUG_FILE:-$PROJECT_DIR/logs/debug/ts_chain_debug.jsonl}"
-    mkdir -p "$(dirname "$TS_CHAIN_DEBUG_FILE")"
-    echo "[CHAIN DEBUG] enabled, writing to: $TS_CHAIN_DEBUG_FILE"
-fi
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/rl_launch_utils.sh"
 
 resolve_profile_path() {
     local candidate="$1"
@@ -49,6 +43,31 @@ RESOLVED_PROFILE_PATH="$(resolve_profile_path "$PROFILE_PATH")" || {
 }
 # shellcheck disable=SC1090
 source "$RESOLVED_PROFILE_PATH"
+
+enable_chain_debug_if_requested() {
+    if [ -z "${DEBUG_CHAIN+x}" ]; then
+        if [ "${RUN_MODE:-train}" = "train" ]; then
+            DEBUG_CHAIN=1
+        else
+            DEBUG_CHAIN=0
+        fi
+    fi
+
+    if [ "$DEBUG_CHAIN" = "1" ] || [ "${DEBUG_CHAIN,,}" = "true" ]; then
+        export TS_CHAIN_DEBUG=1
+        export TS_CHAIN_DEBUG_FILE="${TS_CHAIN_DEBUG_FILE:-$PROJECT_DIR/logs/debug/ts_chain_debug.jsonl}"
+        export TS_MIN_DEBUG_DIR="${TS_MIN_DEBUG_DIR:-$PROJECT_DIR/logs/debug}"
+        mkdir -p "$(dirname "$TS_CHAIN_DEBUG_FILE")" "$TS_MIN_DEBUG_DIR"
+        echo "[CHAIN DEBUG] enabled, writing to: $TS_CHAIN_DEBUG_FILE"
+        echo "[MIN DEBUG] validation debug dir: $TS_MIN_DEBUG_DIR"
+    fi
+}
+
+enable_chain_debug_if_requested
+
+if is_true "${RL_CLEANUP_STALE_VLLM_BEFORE_LAUNCH:-0}"; then
+    cleanup_stale_vllm_processes
+fi
 
 require_env() {
     local name="$1"
@@ -84,6 +103,9 @@ require_env RL_TRAIN_BATCH_SIZE "Set RL_TRAIN_BATCH_SIZE in PROFILE_PATH or over
 require_env RL_PPO_MINI_BATCH_SIZE "Set RL_PPO_MINI_BATCH_SIZE in PROFILE_PATH or override it in the launch command."
 require_env RL_PPO_MICRO_BATCH_SIZE "Set RL_PPO_MICRO_BATCH_SIZE in PROFILE_PATH or override it in the launch command."
 require_env RL_LOGPROB_MICRO_BATCH_SIZE "Set RL_LOGPROB_MICRO_BATCH_SIZE in PROFILE_PATH or override it in the launch command."
+require_env RL_ACTOR_PARAM_OFFLOAD "Set RL_ACTOR_PARAM_OFFLOAD in PROFILE_PATH or override it in the launch command."
+require_env RL_ACTOR_OPTIMIZER_OFFLOAD "Set RL_ACTOR_OPTIMIZER_OFFLOAD in PROFILE_PATH or override it in the launch command."
+require_env RL_REF_PARAM_OFFLOAD "Set RL_REF_PARAM_OFFLOAD in PROFILE_PATH or override it in the launch command."
 require_env RL_ROLLOUT_GPU_MEMORY_UTILIZATION "Set RL_ROLLOUT_GPU_MEMORY_UTILIZATION in PROFILE_PATH or override it in the launch command."
 require_env RL_ROLLOUT_LOAD_FORMAT "Set RL_ROLLOUT_LOAD_FORMAT in PROFILE_PATH or override it in the launch command."
 require_env RL_ROLLOUT_N "Set RL_ROLLOUT_N in PROFILE_PATH or override it in the launch command."
@@ -184,6 +206,9 @@ TRAIN_BATCH_SIZE="$RL_TRAIN_BATCH_SIZE"
 PPO_MINI_BATCH_SIZE="$RL_PPO_MINI_BATCH_SIZE"
 PPO_MICRO_BATCH_SIZE="$RL_PPO_MICRO_BATCH_SIZE"
 LOGPROB_MICRO_BATCH_SIZE="$RL_LOGPROB_MICRO_BATCH_SIZE"
+ACTOR_PARAM_OFFLOAD="$RL_ACTOR_PARAM_OFFLOAD"
+ACTOR_OPTIMIZER_OFFLOAD="$RL_ACTOR_OPTIMIZER_OFFLOAD"
+REF_PARAM_OFFLOAD="$RL_REF_PARAM_OFFLOAD"
 ROLLOUT_GPU_MEMORY_UTILIZATION="$RL_ROLLOUT_GPU_MEMORY_UTILIZATION"
 ROLLOUT_LOAD_FORMAT="$RL_ROLLOUT_LOAD_FORMAT"
 ROLLOUT_N="$RL_ROLLOUT_N"
@@ -251,8 +276,8 @@ CMD=(
     "actor_rollout_ref.model.enable_gradient_checkpointing=True"
     "actor_rollout_ref.actor.fsdp_config.model_dtype=$FSDP_MODEL_DTYPE"
     "actor_rollout_ref.actor.fsdp_config.use_torch_compile=$FSDP_USE_TORCH_COMPILE"
-    "actor_rollout_ref.actor.fsdp_config.param_offload=True"
-    "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True"
+    "actor_rollout_ref.actor.fsdp_config.param_offload=$ACTOR_PARAM_OFFLOAD"
+    "actor_rollout_ref.actor.fsdp_config.optimizer_offload=$ACTOR_OPTIMIZER_OFFLOAD"
     "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOGPROB_MICRO_BATCH_SIZE"
     "actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP"
     "actor_rollout_ref.rollout.name=vllm"
@@ -273,7 +298,7 @@ CMD=(
     "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$LOGPROB_MICRO_BATCH_SIZE"
     "actor_rollout_ref.ref.fsdp_config.model_dtype=$FSDP_MODEL_DTYPE"
     "actor_rollout_ref.ref.fsdp_config.use_torch_compile=$FSDP_USE_TORCH_COMPILE"
-    "actor_rollout_ref.ref.fsdp_config.param_offload=True"
+    "actor_rollout_ref.ref.fsdp_config.param_offload=$REF_PARAM_OFFLOAD"
     "algorithm.use_kl_in_reward=False"
     "algorithm.norm_adv_by_std_in_grpo=True"
     "trainer.logger=$LOGGER"
@@ -303,6 +328,10 @@ echo "FINAL MAX_PROMPT_LENGTH=$MAX_PROMPT_LENGTH"
 echo "FINAL MAX_RESPONSE_LENGTH=$MAX_RESPONSE_LENGTH"
 echo "FINAL ACTOR_MAX_TOKEN_LEN_PER_GPU=$ACTOR_MAX_TOKEN_LEN_PER_GPU"
 echo "FINAL ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN:-<unset>}"
+echo "FINAL ACTOR_PARAM_OFFLOAD=$ACTOR_PARAM_OFFLOAD"
+echo "FINAL ACTOR_OPTIMIZER_OFFLOAD=$ACTOR_OPTIMIZER_OFFLOAD"
+echo "FINAL REF_PARAM_OFFLOAD=$REF_PARAM_OFFLOAD"
+echo "FINAL ROLLOUT_GPU_MEMORY_UTILIZATION=$ROLLOUT_GPU_MEMORY_UTILIZATION"
 echo "FINAL TEMPERATURE=$TEMPERATURE"
 echo "FINAL VAL_TEMPERATURE=$VAL_TEMPERATURE"
 

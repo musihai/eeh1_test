@@ -298,7 +298,7 @@ SFT 在 SwanLab 里建议重点看：
 SFT 完成后，执行：
 
 ```bash
-SFT_SAVE_DIR=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/checkpoints/sft/qwen3-1.7b-etth1-sft-paper-20260326_095551 
+SFT_SAVE_DIR=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/checkpoints/sft/qwen3-1.7b-etth1-sft-paper-20260326_231520 
 
 RL_MODEL_PATH=$(find "$SFT_SAVE_DIR" -maxdepth 2 -type d -path "*/global_step_*/huggingface" | sort -V | tail -1)
 echo "$RL_MODEL_PATH"

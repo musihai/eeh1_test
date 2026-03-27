@@ -118,6 +118,7 @@ if [ ! -f "${VAL_FILES}" ]; then
     echo "Generate or restore the SFT dataset first."
     exit 1
 fi
+if [ "${PRINT_CMD_ONLY:-0}" != "1" ]; then
 python3 - "$TRAIN_FILES" "$VAL_FILES" <<'PY'
 import sys
 import pandas as pd
@@ -162,6 +163,7 @@ def inspect(path: str) -> None:
 inspect(sys.argv[1])
 inspect(sys.argv[2])
 PY
+fi
 SAVE_DIR="$SFT_SAVE_DIR"
 PROJECT_NAME="$SFT_PROJECT_NAME"
 EXPERIMENT_NAME="$SFT_EXPERIMENT_NAME"

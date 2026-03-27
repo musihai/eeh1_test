@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import json
 import logging
 import os
 from typing import Any, Optional
@@ -21,7 +20,6 @@ from uuid import uuid4
 import numpy as np
 
 from arft.agent_flow.agent_flow import AgentFlowBase, AgentFlowOutput, AgentFlowStep, register
-from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
 from verl.utils.chain_debug import append_chain_debug
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -48,6 +46,11 @@ from recipe.time_series_forecast.prompts import (
     build_timeseries_system_prompt,
 )
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
+from recipe.time_series_forecast.tool_call_protocol import (
+    TimeSeriesToolCall,
+    extract_tool_calls,
+    load_time_series_chat_template,
+)
 from recipe.time_series_forecast.utils import (
     format_prediction_tool_output,
     format_predictions_to_string,
@@ -66,6 +69,7 @@ from recipe.time_series_forecast.reward import (
 from recipe.time_series_forecast.reward_protocol import extract_forecast_block, normalized_nonempty_lines
 from recipe.time_series_forecast.diagnostic_policy import (
     FEATURE_TOOL_ORDER,
+    build_diagnostic_plan,
 )
 
 logger = logging.getLogger(__file__)
@@ -112,6 +116,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
     def _reset_episode_state(self) -> None:
         self.history_analysis = []
         self.steps = []
+        self.required_feature_tools = []
         self.final_answer = None
         self.final_answer_reject_reason = None
         self.final_answer_parse_mode = None
@@ -135,7 +140,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         cls.max_parallel_calls = kwargs.get("max_parallel_calls", 5)
         cls.lookback_window = kwargs.get("lookback_window", 96)
         cls.forecast_horizon = kwargs.get("forecast_horizon", 96)
-        cls.tool_parser = ToolParser.get_tool_parser(config.actor_rollout_ref.rollout.multi_turn.format, cls.tokenizer)
+        cls.tokenizer.chat_template = load_time_series_chat_template()
+        if cls.processor is not None and hasattr(cls.processor, "chat_template"):
+            cls.processor.chat_template = cls.tokenizer.chat_template
         cls.prompt_length = config.actor_rollout_ref.rollout.prompt_length
         cls.response_length = config.actor_rollout_ref.rollout.response_length
         cls.tool_schemas = TIMESERIES_TOOL_SCHEMAS
@@ -166,6 +173,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 self.time_series_data,
                 target_column=self.target_column,
             )
+            self.required_feature_tools = self._infer_required_feature_tools()
         except Exception as e:
             sample_index = kwargs.get("index")
             self.parse_error_message = f"{type(e).__name__}: {e}"
@@ -175,6 +183,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 self.parse_error_message,
             )
             self.timestamps, self.values = [], []
+            self.required_feature_tools = []
 
         metrics = {}
         request_id = uuid4().hex[:8]
@@ -253,7 +262,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             workflow_status = "not_attempted"
             workflow_message = ""
             tool_call_names: list[str] = []
-            tool_calls: list[FunctionCall] = []
+            tool_calls: list[TimeSeriesToolCall] = []
             executed_tool_names: list[str] = []
             terminate_after_step = False
 
@@ -261,8 +270,12 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 turn_stage != "refinement" or "<tool_call>" in response_text or "</tool_call>" in response_text
             )
             if should_parse_tool_calls:
-                assistant_content, tool_calls = await self.tool_parser.extract_tool_calls(response_ids)
-                tool_calls = tool_calls[:self.max_parallel_calls]
+                allowed_tool_names = [schema["function"]["name"] for schema in tool_schemas]
+                _assistant_content, tool_calls = extract_tool_calls(
+                    response_text,
+                    allowed_tool_names=allowed_tool_names,
+                    max_calls=self.max_parallel_calls,
+                )
                 tool_call_names = [tool_call.name for tool_call in tool_calls]
 
             if turn_stage == "refinement" or not tool_calls:
@@ -582,7 +595,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             prediction_turn_stage=self.prediction_turn_stage or "",
             final_answer_step_index=self.final_answer_step_index,
             feature_tool_sequence=list(self.feature_tool_sequence),
-            required_feature_tools=[],
+            required_feature_tools=list(self.required_feature_tools),
             executed_feature_tool_names=self._executed_feature_tool_names(),
             history_analysis=list(self.history_analysis),
             required_step_budget=int(self._required_step_budget()),
@@ -622,7 +635,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 workflow_message=workflow_message,
                 reward_extra_info=reward_extra_info,
                 feature_tool_sequence=list(self.feature_tool_sequence),
-                required_feature_tools=[],
+                required_feature_tools=list(self.required_feature_tools),
                 executed_feature_tool_names=self._executed_feature_tool_names(),
                 history_analysis=list(self.history_analysis),
                 prediction_requested_model=self.prediction_requested_model or "",
@@ -640,6 +653,14 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 required_step_budget=int(self._required_step_budget()),
             ),
         )
+
+    def _infer_required_feature_tools(self) -> list[str]:
+        try:
+            plan = build_diagnostic_plan(self.values or [])
+        except Exception as exc:
+            logger.warning("Failed to build diagnostic plan for debug tracking: %s", exc)
+            return []
+        return [str(name) for name in plan.tool_names if str(name).strip()]
 
     def _final_answer_max_tokens(self) -> int:
         expected = self._expected_prediction_count()
@@ -901,7 +922,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             turn_stage=turn_stage,
         )
 
-    async def _execute_tool_call(self, tool_call: FunctionCall, **kwargs) -> Optional[str]:
+    async def _execute_tool_call(self, tool_call: TimeSeriesToolCall, **kwargs) -> Optional[str]:
         turn_stage = str(kwargs.get("turn_stage") or self._current_turn_stage()).strip().lower()
         if self.prediction_results is not None:
             self.illegal_turn3_tool_call_count += 1
@@ -910,15 +931,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
         if tool_call.name == "predict_time_series":
             requested_model_name = "__missing__"
-            if hasattr(tool_call, "arguments") and tool_call.arguments:
-                args = tool_call.arguments
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except json.JSONDecodeError:
-                        args = {}
-                if isinstance(args, dict):
-                    requested_model_name = str(args.get("model_name") or "__missing__").strip().lower()
+            args = tool_call.arguments if isinstance(getattr(tool_call, "arguments", None), dict) else {}
+            if args:
+                requested_model_name = str(args.get("model_name") or "__missing__").strip().lower()
 
             self.prediction_requested_model = requested_model_name
             if turn_stage == "diagnostic":
