@@ -322,10 +322,6 @@ class TestValidationRewardManager(unittest.TestCase):
     def test_rl_launcher_enables_chain_debug_by_default_for_formal_train(self) -> None:
         project_dir = os.path.dirname(os.path.dirname(__file__))
         script_path = os.path.join(project_dir, "examples/time_series_forecast/run_qwen3-1.7B.sh")
-        checkpoint_path = os.path.join(
-            project_dir,
-            "artifacts/checkpoints/sft/qwen3-1.7b-etth1-sft-paper-20260326_231520/global_step_50/huggingface",
-        )
         dataset_dir = os.path.join(project_dir, "dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2")
         result = subprocess.run(
             [
@@ -337,7 +333,7 @@ class TestValidationRewardManager(unittest.TestCase):
                 **os.environ,
                 "RUN_MODE": "train",
                 "PRINT_CMD_ONLY": "1",
-                "RL_MODEL_PATH": checkpoint_path,
+                "RL_MODEL_PATH": "/data/linyujie/models/Qwen3-1.7B",
                 "RL_CURRICULUM_DATASET_DIR": dataset_dir,
                 "RL_CURRICULUM_PHASE": "stage1",
                 "RL_EXP_NAME": "debug-chain-default-test",
@@ -433,6 +429,7 @@ class TestValidationRewardManager(unittest.TestCase):
                 **os.environ,
                 "PRINT_CMD_ONLY": "1",
                 "SFT_MODEL_PATH": "/data/linyujie/models/Qwen3-1.7B",
+                "SFT_DATASET_DIR": os.path.join(project_dir, "dataset/ett_sft_etth1_runtime_teacher200_paper_same2"),
             },
             text=True,
             capture_output=True,
@@ -497,6 +494,7 @@ class TestValidationRewardManager(unittest.TestCase):
                     format_score=-1.0,
                     length_score=0.0,
                     length_penalty=0.0,
+                    recovery_penalty=0.0,
                     mse_score=0.0,
                     change_point_score=0.0,
                     season_trend_score=0.0,

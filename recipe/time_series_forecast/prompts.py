@@ -14,9 +14,10 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
-from recipe.time_series_forecast.time_series_io import compact_historical_data_for_prompt, get_last_timestamp
+from recipe.time_series_forecast.time_series_io import compact_historical_data_for_prompt
+from recipe.time_series_forecast.refinement_support import REFINEMENT_OP_DESCRIPTIONS
 
 def _build_dataset_description(
     data_source: Optional[str],
@@ -89,6 +90,183 @@ def _normalize_turn_stage(turn_stage: Optional[str]) -> str:
     return ""
 
 
+ROUTING_EVIDENCE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("acf1", "acf1"),
+    ("acf_seasonal", "acf_seasonal"),
+    ("cusum_max", "cusum_max"),
+    ("changepoint_count", "changepoints"),
+    ("peak_count", "peak_count"),
+    ("peak_spacing_cv", "peak_spacing_cv"),
+    ("monotone_duration", "monotone_duration"),
+    ("residual_exceed_ratio", "residual_exceed_ratio"),
+    ("quality_quantization_score", "quantization_score"),
+    ("quality_saturation_ratio", "saturation_ratio"),
+    ("dominant_pattern", "dominant_pattern"),
+)
+
+ROUTING_TOOL_FIELD_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("extract_basic_statistics", ("acf1", "acf_seasonal", "cusum_max")),
+    ("extract_within_channel_dynamics", ("changepoint_count", "peak_count", "peak_spacing_cv", "monotone_duration")),
+    ("extract_forecast_residuals", ("residual_exceed_ratio",)),
+    ("extract_data_quality", ("quality_quantization_score", "quality_saturation_ratio")),
+    ("extract_event_summary", ("dominant_pattern",)),
+)
+
+ROUTING_REASON_GUIDE = """### Routing Decision Guide
+- `arima`: stable linear trend or seasonality, high acf, few changepoints, low residual excursions.
+- `patchtst`: repeatable local motifs, regular peaks, moderate seasonal structure.
+- `itransformer`: broader structural drift, multiple changepoints, long monotone segments.
+- `chronos2`: irregular, noisy, weakly structured, or zero-shot windows."""
+
+
+def _format_routing_field_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if abs(numeric) >= 100:
+        return f"{numeric:.1f}"
+    return f"{numeric:.4f}"
+
+
+def _routing_tool_payload(
+    payload: Mapping[str, Mapping[str, Any]],
+    tool_name: str,
+) -> Mapping[str, Any] | None:
+    value = payload.get(tool_name)
+    return value if isinstance(value, Mapping) else None
+
+
+def _routing_signal_value(condition: bool | None) -> str:
+    if condition is None:
+        return "unknown"
+    return "yes" if bool(condition) else "no"
+
+
+def _routing_support_codes_from_payload(
+    payload: Mapping[str, Mapping[str, Any]],
+) -> dict[str, list[str]]:
+    basic = _routing_tool_payload(payload, "extract_basic_statistics")
+    dynamics = _routing_tool_payload(payload, "extract_within_channel_dynamics")
+    residuals = _routing_tool_payload(payload, "extract_forecast_residuals")
+    quality = _routing_tool_payload(payload, "extract_data_quality")
+    events = _routing_tool_payload(payload, "extract_event_summary")
+
+    acf1 = float(basic.get("acf1", 0.0)) if basic else 0.0
+    acf_seasonal = float(basic.get("acf_seasonal", 0.0)) if basic else 0.0
+    cusum_max = float(basic.get("cusum_max", 0.0)) if basic else 0.0
+    changepoint_count = float(dynamics.get("changepoint_count", 0.0)) if dynamics else 0.0
+    peak_count = float(dynamics.get("peak_count", 0.0)) if dynamics else 0.0
+    peak_spacing_cv = float(dynamics.get("peak_spacing_cv", 0.0)) if dynamics else 0.0
+    monotone_duration = float(dynamics.get("monotone_duration", 0.0)) if dynamics else 0.0
+    residual_exceed_ratio = float(residuals.get("residual_exceed_ratio", 0.0)) if residuals else 0.0
+    quality_quantization_score = float(quality.get("quality_quantization_score", 0.0)) if quality else 0.0
+    quality_saturation_ratio = float(quality.get("quality_saturation_ratio", 0.0)) if quality else 0.0
+    dominant_pattern = str(events.get("dominant_pattern", "unknown")) if events else "unknown"
+
+    supports = {
+        "arima": [],
+        "patchtst": [],
+        "itransformer": [],
+        "chronos2": [],
+    }
+
+    if basic and acf1 >= 0.93:
+        supports["arima"].append("acf1_high")
+    if basic and acf_seasonal >= 0.05:
+        supports["arima"].append("seasonality_visible")
+        supports["patchtst"].append("seasonality_visible")
+    if dynamics and changepoint_count <= 1.0:
+        supports["arima"].append("few_breaks")
+    if residuals and residual_exceed_ratio <= 0.05:
+        supports["arima"].append("residual_low")
+
+    if dynamics and 2.0 <= peak_count <= 5.0:
+        supports["patchtst"].append("repeatable_peaks")
+    if dynamics and peak_spacing_cv <= 0.30:
+        supports["patchtst"].append("peak_spacing_regular")
+    if events and dominant_pattern == "oscillation":
+        supports["patchtst"].append("oscillation")
+
+    if dynamics and changepoint_count >= 3.0:
+        supports["itransformer"].append("multi_breaks")
+    if basic and cusum_max >= 70.0:
+        supports["itransformer"].append("drift_high")
+    if dynamics and monotone_duration >= 0.10:
+        supports["itransformer"].append("long_monotone_segment")
+
+    if residuals and residual_exceed_ratio >= 0.08:
+        supports["chronos2"].append("residual_high")
+    if quality and (quality_saturation_ratio >= 0.08 or quality_quantization_score >= 0.24):
+        supports["chronos2"].append("quality_stress")
+    if dynamics and peak_count >= 6.0 and peak_spacing_cv >= 0.35:
+        supports["chronos2"].append("irregular_local_dynamics")
+    return supports
+
+
+def build_routing_evidence_card(
+    *,
+    routing_feature_payload: Mapping[str, Mapping[str, Any]] | None,
+    completed_feature_tools: Sequence[str] | None = None,
+) -> str:
+    payload = dict(routing_feature_payload or {})
+    completed = [str(name) for name in (completed_feature_tools or []) if str(name).strip()]
+    lines: list[str] = []
+    lines.append("### Routing Evidence Card")
+    lines.append(f"observed_tools=[{', '.join(completed) if completed else 'none'}]")
+    lines.append("expert_support_signals:")
+    supports = _routing_support_codes_from_payload(payload)
+    for model_name in ("arima", "patchtst", "itransformer", "chronos2"):
+        values = supports[model_name]
+        lines.append(f"- {model_name}=[{', '.join(values) if values else 'none'}]")
+
+    missing_tools = [tool_name for tool_name, _field_names in ROUTING_TOOL_FIELD_GROUPS if tool_name not in payload]
+    lines.append(f"missing_tool_groups=[{', '.join(missing_tools) if missing_tools else 'none'}]")
+    lines.append(ROUTING_REASON_GUIDE)
+    return "\n".join(lines)
+
+
+def build_refinement_evidence_card(
+    *,
+    refinement_feature_payload: Mapping[str, Any] | None,
+    prediction_model_used: Optional[str] = None,
+) -> str:
+    payload = dict(refinement_feature_payload or {})
+    observed_tools = [str(item) for item in payload.get("observed_tools", []) if str(item).strip()]
+    support_signals = [str(item) for item in payload.get("support_signals", []) if str(item).strip()]
+    keep_support_signals = [str(item) for item in payload.get("keep_support_signals", []) if str(item).strip()]
+    raw_edit_support_signals = payload.get("edit_support_signals", {}) or {}
+    edit_support_signals = {
+        str(name).strip(): [str(item) for item in values if str(item).strip()]
+        for name, values in dict(raw_edit_support_signals).items()
+        if str(name).strip()
+    }
+    candidate_adjustments = [str(item) for item in payload.get("candidate_adjustments", []) if str(item).strip()]
+    keep_baseline_allowed = bool(payload.get("keep_baseline_allowed", True))
+
+    lines = ["### Refinement Evidence Card"]
+    if prediction_model_used:
+        lines.append(f"selected_model={prediction_model_used}")
+    lines.append(f"observed_tools=[{', '.join(observed_tools) if observed_tools else 'none'}]")
+    lines.append(f"keep_support=[{', '.join(keep_support_signals) if keep_support_signals else 'none'}]")
+    lines.append(f"support_signals=[{', '.join(support_signals) if support_signals else 'evidence_consistent'}]")
+    decision_options = ["keep_baseline"]
+    if candidate_adjustments and candidate_adjustments != ["none"]:
+        lines.append("edit_support:")
+        for adjustment in candidate_adjustments:
+            description = REFINEMENT_OP_DESCRIPTIONS.get(adjustment, adjustment.replace("_", " "))
+            support_values = edit_support_signals.get(adjustment, ["none"])
+            lines.append(f"- {adjustment}={description}; support=[{', '.join(support_values)}]")
+            decision_options.append(adjustment)
+    else:
+        lines.append("candidate_adjustments=[none]")
+    lines.append(f"decision_options=[{', '.join(decision_options)}]")
+    lines.append(f"keep_baseline_allowed={'yes' if keep_baseline_allowed else 'no'}")
+    return "\n".join(lines)
+
+
 def get_runtime_turn_info(
     history_analysis: Sequence[str] | None,
     prediction_results: Optional[str],
@@ -115,10 +293,9 @@ def get_runtime_turn_info(
     if stage == "routing":
         return "Routing", "Choose one forecasting expert from the current analysis state and call predict_time_series exactly once."
     return "Refinement", (
-        "Convert the selected model forecast into the final protocol. Do NOT forecast again from scratch. "
-        "Choose exactly one of two actions: KEEP the base forecast unchanged, or apply one small local refinement on the same 96-row template. "
-        "KEEP means the final answer must copy the provided forecast rows exactly. "
-        "Reuse the provided timestamps exactly, stop at the last provided row, and output only <think>...</think><answer>...</answer>."
+        "Review the selected model forecast against the diagnostics, then produce the final forecast. "
+        "Do not forecast again from scratch. Reuse the provided forecast grid, keep the horizon fixed, "
+        "and output only <think>...</think><answer>...</answer>."
     )
 
 
@@ -134,6 +311,8 @@ def build_runtime_user_prompt(
     prediction_model_used: Optional[str] = None,
     available_feature_tools: Sequence[str] | None = None,
     completed_feature_tools: Sequence[str] | None = None,
+    routing_feature_payload: Mapping[str, Mapping[str, Any]] | None = None,
+    refinement_feature_payload: Mapping[str, Any] | None = None,
     turn_stage: Optional[str] = None,
 ) -> str:
     history_records = list(history_analysis or [])
@@ -154,51 +333,41 @@ def build_runtime_user_prompt(
 
     if normalized_stage == "refinement":
         model_line = f"### Selected Forecast Model: {prediction_model_used}\n" if prediction_model_used else ""
-        terminal_timestamp = get_last_timestamp(prediction_results or "")
-        prediction_lines = [line.strip() for line in str(prediction_results or "").splitlines() if line.strip()]
-        terminal_row = prediction_lines[-1] if prediction_lines else ""
-        terminal_line = (
-            f"### Final Allowed Forecast Timestamp: {terminal_timestamp}\n" if terminal_timestamp else ""
-        )
-        terminal_row_line = (
-            f"### Final Required Forecast Row: {terminal_row}\n" if terminal_row else ""
-        )
         truncated_history = truncate_time_series_data(
             compact_history,
             recent_rows=min(max(int(lookback_window or 96) // 2, 24), int(lookback_window or 96)),
         )
+        refinement_card = build_refinement_evidence_card(
+            refinement_feature_payload=refinement_feature_payload,
+            prediction_model_used=prediction_model_used,
+        )
         return f"""**[Stage: {stage_name}] Action: {action}**
 ### Lookback Window: {lookback_window} rows
 ### Forecast Horizon: {forecast_horizon} rows
-{model_line}### Analysis Summary
+{model_line}{refinement_card}
+
+### Analysis Summary
 {history_text}
 
 ### Recent Historical Window
 {truncated_history}
 
-{terminal_line}{terminal_row_line}### Prediction Tool Output
+### Prediction Tool Output
 {prediction_results}
 
 **Instructions**:
-1. Do NOT call more tools.
-2. No tool schema is available in this turn. Any <tool_call> output is invalid.
-3. Treat "Prediction Tool Output" as the canonical base forecast produced by the selected model. It is the only legal row template for <answer>.
-4. You must choose exactly one action:
-   KEEP: copy the 96 forecast rows from "Prediction Tool Output" exactly once into <answer>, with identical timestamps and identical numeric values.
-   LOCAL_REFINE: keep the same 96 timestamps and row order, but change only a small contiguous set of numeric values. Most rows should remain identical to the base forecast.
-5. If unsure, choose KEEP. Flat or repeated tail values are allowed and do NOT by themselves justify adding rows or inventing new timestamps.
-6. Reuse the timestamps from "Prediction Tool Output" in the same order. If you refine, adjust values only. Do NOT alter, renumber, skip, or invent timestamps.
-7. If <think> says KEEP, then <answer> must be an exact row-for-row copy of "Prediction Tool Output". Do NOT reorder rows, restart from an earlier timestamp, or splice in rows from another part of the sequence.
-8. Output ONLY one <think>...</think> block followed immediately by one <answer>...</answer> block.
-9. <think> must be one short sentence that explicitly says either KEEP or LOCAL_REFINE and why.
-10. <answer> must contain EXACTLY {forecast_horizon} lines, one forecast item per line, and must use `YYYY-MM-DD HH:MM:SS value`.
-11. Do NOT emit any timestamp that does not already appear in "Prediction Tool Output". Never synthesize timestamps such as `24:00:00` or `25:00:00`.
-12. The final answer must end at the last timestamp shown in "Final Allowed Forecast Timestamp". Do NOT emit any later timestamp and do NOT add extra rows beyond that terminal row.
-13. The {forecast_horizon}th row must be exactly the line shown in "Final Required Forecast Row". After you write that exact row, immediately output </answer>.
-14. Do NOT restart from row 1, do NOT duplicate the sequence, and do NOT continue a flat last value past the terminal timestamp.
-15. Do not add extra words, markdown, bullets, or commentary on answer lines.
-        16. Stop immediately after </answer>, with no extra text after it.
-        17. Your reply must start with <think>. Do NOT copy placeholder text or template scaffolding into the final answer."""
+1. Do NOT call more tools. No tool schema is available in this turn.
+2. Treat "Prediction Tool Output" as the base forecast from the selected model.
+3. Make the refinement decision from the Refinement Evidence Card first, then verify it against the recent historical window.
+4. Choose exactly one decision from `decision_options`.
+5. Use `keep_support` to decide whether the selected forecast already matches the evidence card.
+6. `keep_baseline` is always allowed when the selected forecast already matches the evidence card.
+7. Only choose a local edit when that exact edit's `support=[...]` line clearly justifies changing the selected forecast.
+8. Output exactly one `<think>...</think>` block followed immediately by one `<answer>...</answer>` block.
+9. `<think>` should briefly explain whether the selected forecast already matches the evidence card or why one local edit is needed.
+10. `<answer>` must contain exactly one non-empty line in the form `decision=<name>`.
+11. Do not output forecast rows, markdown, bullets, JSON, or extra commentary inside `<answer>`.
+12. Stop immediately after `</answer>`."""
 
     if normalized_stage == "diagnostic":
         available_tools_text = ", ".join(available_diagnostic_tools) if available_diagnostic_tools else "extract_basic_statistics"
@@ -225,27 +394,21 @@ def build_runtime_user_prompt(
 """
 
     if normalized_stage == "routing":
+        evidence_card = build_routing_evidence_card(
+            routing_feature_payload=routing_feature_payload,
+            completed_feature_tools=completed_tools,
+        )
         return f"""**[Stage: {stage_name}] Action: {action}**
 ### Lookback Window: {lookback_window} rows
 ### Forecast Horizon: {forecast_horizon} rows
-### Historical Data
-{compact_history}
-
-### Analysis Summary
-{history_text}
-
-### Completed Diagnostic Tools
-{", ".join(completed_tools) if completed_tools else "none"}
+{evidence_card}
 
 **Instructions**:
 - Do NOT call feature extraction tools again.
-- Use the accumulated analysis history to choose the forecasting expert whose inductive bias best matches the observed evidence.
+- Make the routing decision from the structured evidence card only.
+- Do NOT restate the evidence in long prose.
 - The `predict_time_series` call must be emitted as strict JSON inside `<tool_call>...</tool_call>`.
-- Forecasting expert guidance:
-  - `patchtst`: local temporal patterns with long-range dependencies.
-  - `itransformer`: cross-channel dependencies or broader structural interactions.
-  - `arima`: linear trends and stable seasonality.
-  - `chronos2`: irregular, noisy, or zero-shot scenarios.
+- Choose exactly one model_name from `patchtst`, `itransformer`, `arima`, `chronos2`.
 - Call predict_time_series exactly once with your chosen model_name.
 """
 

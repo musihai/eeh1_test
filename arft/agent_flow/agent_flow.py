@@ -643,8 +643,13 @@ class AgentFlowWorkerBase:
                 tokenizer=self.tokenizer,
                 processor=self.processor,
             )
-            output: AgentFlowOutput = await agent_flow.run(sampling_params, **kwargs)
-
+            output: AgentFlowOutput = await agent_flow.run(
+                sampling_params,
+                global_step=trajectory["step"],
+                validate=trajectory["validate"],
+                run_name=str(getattr(self.config.trainer, "experiment_name", "") or ""),
+                **kwargs,
+            )
             return output
 
     def _postprocess(self, inputs: list[AgentFlowOutput]) -> DataProto:

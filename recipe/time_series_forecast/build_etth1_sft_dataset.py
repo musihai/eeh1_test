@@ -21,8 +21,17 @@ from recipe.time_series_forecast.config_utils import (
 from recipe.time_series_forecast.prompts import (
     FEATURE_TOOL_SCHEMAS,
     PREDICT_TIMESERIES_TOOL_SCHEMA,
+    build_routing_evidence_card,
     build_runtime_user_prompt,
     build_timeseries_system_prompt,
+)
+from recipe.time_series_forecast.refinement_support import (
+    REFINEMENT_KEEP_DECISION,
+    build_refinement_candidate_prediction_text_map,
+    build_refinement_support_payload,
+    filter_refinement_candidates_for_model,
+    generate_local_refinement_candidates,
+    refinement_decision_name,
 )
 from recipe.time_series_forecast.time_series_io import DEFAULT_FORECAST_HORIZON, DEFAULT_LOOKBACK_WINDOW
 from recipe.time_series_forecast.dataset_identity import (
@@ -87,7 +96,9 @@ SUPPORTED_TRAIN_TURN3_REBALANCE_MODES = {
     TRAIN_TURN3_REBALANCE_MODE_OVERSAMPLE_LOCAL_REFINE,
 }
 DEFAULT_TURN3_TARGET_MODE = TURN3_TARGET_MODE_PAPER_STRICT
-DEFAULT_ROUTING_LABEL_SOURCE = ROUTING_LABEL_SOURCE_HEURISTIC
+# Formal step-wise SFT should imitate the offline reference teacher route by
+# default; the heuristic router remains available only for ablations/debugging.
+DEFAULT_ROUTING_LABEL_SOURCE = ROUTING_LABEL_SOURCE_REFERENCE_TEACHER
 DEFAULT_SFT_STAGE_MODE = SFT_STAGE_MODE_FULL
 DEFAULT_TRAIN_TURN3_REBALANCE_MODE = TRAIN_TURN3_REBALANCE_MODE_DOWNSAMPLE_KEEP
 DEFAULT_OUTPUT_DIR = Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise")
@@ -99,6 +110,13 @@ DEFAULT_TRAIN_STAGE_REPEAT_FACTORS = {"diagnostic": 1, "routing": 1, "refinement
 DEFAULT_BALANCE_TRAIN_ROUTING_MODELS = True
 DEFAULT_TRAIN_PRIORITY_VALIDATED_KEEP_REPEAT_FACTOR = 1
 DEFAULT_TRAIN_LOCAL_REFINE_REFINEMENT_REPEAT_FACTOR = 1
+DEFAULT_TRAIN_ROUTING_CONFIDENCE_MIN_TIER = "none"
+SUPPORTED_TRAIN_ROUTING_CONFIDENCE_MIN_TIERS = {"none", "mid", "high"}
+DEFAULT_TRAIN_HIGH_CONFIDENCE_ROUTING_REPEAT_FACTOR = 1
+DEFAULT_ROUTING_MID_CONF_MIN_DIAGNOSTIC_PLAN_SCORE_GAP = 0.15
+DEFAULT_ROUTING_HIGH_CONF_MIN_DIAGNOSTIC_PLAN_SCORE_GAP = 0.25
+DEFAULT_ROUTING_MID_CONF_MIN_TEACHER_EVAL_SCORE_MARGIN = 0.01
+DEFAULT_ROUTING_HIGH_CONF_MIN_TEACHER_EVAL_SCORE_MARGIN = 0.03
 
 
 @dataclass(frozen=True)
@@ -127,6 +145,19 @@ FEATURE_TOOL_LABELS = {
     "extract_data_quality": "data quality",
     "extract_event_summary": "event-level changes",
 }
+ROUTING_FEATURE_TOOLS = {
+    "acf1": "extract_basic_statistics",
+    "acf_seasonal": "extract_basic_statistics",
+    "cusum_max": "extract_basic_statistics",
+    "changepoint_count": "extract_within_channel_dynamics",
+    "peak_count": "extract_within_channel_dynamics",
+    "peak_spacing_cv": "extract_within_channel_dynamics",
+    "monotone_duration": "extract_within_channel_dynamics",
+    "residual_exceed_ratio": "extract_forecast_residuals",
+    "quality_quantization_score": "extract_data_quality",
+    "quality_saturation_ratio": "extract_data_quality",
+    "dominant_pattern": "extract_event_summary",
+}
 EVENT_PATTERN_NAMES = ["rise", "fall", "flat", "oscillation"]
 ROUTING_MODEL_RATIONALES = {
     "patchtst": "patch-level local patterns and seasonality",
@@ -140,6 +171,7 @@ ROUTING_FALLBACK_PREFERENCE = {
     "itransformer": 1,
     "chronos2": 0,
 }
+ROUTING_CONFIDENCE_TIER_RANK = {"low": 0, "mid": 1, "high": 2}
 
 
 def _select_model_from_scores(scores: dict[str, float]) -> str:
@@ -152,7 +184,52 @@ def _select_model_from_scores(scores: dict[str, float]) -> str:
     )[0]
 
 
+def _normalize_train_routing_confidence_min_tier(min_tier: str | None) -> str:
+    tier = str(min_tier or DEFAULT_TRAIN_ROUTING_CONFIDENCE_MIN_TIER).strip().lower()
+    if tier not in SUPPORTED_TRAIN_ROUTING_CONFIDENCE_MIN_TIERS:
+        raise ValueError(
+            f"Unsupported train_routing_confidence_min_tier={min_tier!r}. "
+            f"Expected one of {sorted(SUPPORTED_TRAIN_ROUTING_CONFIDENCE_MIN_TIERS)}."
+        )
+    return tier
+
+
+def _routing_confidence_tier(
+    *,
+    heuristic_selected_prediction_model: str,
+    reference_teacher_model: str,
+    diagnostic_plan_score_gap: Any,
+    teacher_eval_score_margin: Any,
+) -> str:
+    agrees = str(heuristic_selected_prediction_model or "").strip().lower() == str(reference_teacher_model or "").strip().lower()
+    if not agrees:
+        return "low"
+    try:
+        score_gap = float(diagnostic_plan_score_gap or 0.0)
+    except Exception:
+        score_gap = 0.0
+    try:
+        teacher_margin = float(teacher_eval_score_margin or 0.0)
+    except Exception:
+        teacher_margin = 0.0
+    if (
+        score_gap >= DEFAULT_ROUTING_HIGH_CONF_MIN_DIAGNOSTIC_PLAN_SCORE_GAP
+        and teacher_margin >= DEFAULT_ROUTING_HIGH_CONF_MIN_TEACHER_EVAL_SCORE_MARGIN
+    ):
+        return "high"
+    if (
+        score_gap >= DEFAULT_ROUTING_MID_CONF_MIN_DIAGNOSTIC_PLAN_SCORE_GAP
+        and teacher_margin >= DEFAULT_ROUTING_MID_CONF_MIN_TEACHER_EVAL_SCORE_MARGIN
+    ):
+        return "mid"
+    return "low"
+
+
 def _last_assistant_content(messages: Any) -> str:
+    if isinstance(messages, np.ndarray):
+        messages = messages.tolist()
+    elif isinstance(messages, tuple):
+        messages = list(messages)
     if not isinstance(messages, list):
         return ""
     for msg in reversed(messages):
@@ -272,6 +349,10 @@ def _paper_turn3_protocol_reason(content: str, expected_len: int) -> str:
 
     answer_text = match.group(2).strip()
     lines = [line.strip() for line in answer_text.splitlines() if line.strip()]
+    if len(lines) == 1:
+        decision_line = lines[0]
+        if decision_line.lower().startswith("decision=") and decision_line.split("=", 1)[1].strip():
+            return "ok"
     values = _extract_prediction_values(answer_text)
     if len(lines) != expected_len:
         return f"invalid_answer_shape:lines={len(lines)},expected={expected_len}"
@@ -415,7 +496,25 @@ def _compute_routing_feature_snapshot(history_values: Sequence[float]) -> dict[s
     }
 
 
-def _heuristic_routing_scores(feature_snapshot: dict[str, Any]) -> dict[str, float]:
+def _visible_feature_tools(selected_feature_tools: Sequence[str] | None) -> set[str] | None:
+    if selected_feature_tools is None:
+        return None
+    visible = {str(tool_name).strip() for tool_name in selected_feature_tools if str(tool_name).strip()}
+    return visible or set()
+
+
+def _feature_is_visible(visible_tools: set[str] | None, feature_name: str) -> bool:
+    if visible_tools is None:
+        return True
+    required_tool = ROUTING_FEATURE_TOOLS.get(feature_name)
+    return required_tool in visible_tools if required_tool else False
+
+
+def _heuristic_routing_scores(
+    feature_snapshot: dict[str, Any],
+    *,
+    selected_feature_tools: Sequence[str] | None = None,
+) -> dict[str, float]:
     acf1 = float(feature_snapshot.get("acf1", 0.0))
     acf_seasonal = float(feature_snapshot.get("acf_seasonal", 0.0))
     cusum_max = float(feature_snapshot.get("cusum_max", 0.0))
@@ -426,32 +525,50 @@ def _heuristic_routing_scores(feature_snapshot: dict[str, Any]) -> dict[str, flo
     residual_exceed_ratio = float(feature_snapshot.get("residual_exceed_ratio", 0.0))
     quality_quantization_score = float(feature_snapshot.get("quality_quantization_score", 0.0))
     quality_saturation_ratio = float(feature_snapshot.get("quality_saturation_ratio", 0.0))
+    visible_tools = _visible_feature_tools(selected_feature_tools)
 
     scores = {model_name: 0.0 for model_name in sorted(SUPPORTED_PREDICTION_MODELS)}
     scores["arima"] += 0.10
     scores["patchtst"] += 0.15
     scores["chronos2"] -= 0.50
 
-    scores["arima"] += 1.50 if acf1 >= 0.92 else (0.75 if acf1 >= 0.88 else 0.0)
-    scores["arima"] += 0.75 if changepoint_count <= 1.0 else 0.0
-    scores["arima"] += 0.50 if residual_exceed_ratio <= 0.05 else 0.0
+    if _feature_is_visible(visible_tools, "acf1"):
+        scores["arima"] += 1.50 if acf1 >= 0.92 else (0.75 if acf1 >= 0.88 else 0.0)
+    if _feature_is_visible(visible_tools, "changepoint_count"):
+        scores["arima"] += 0.75 if changepoint_count <= 1.0 else 0.0
+    if _feature_is_visible(visible_tools, "residual_exceed_ratio"):
+        scores["arima"] += 0.50 if residual_exceed_ratio <= 0.05 else 0.0
 
-    scores["patchtst"] += 1.00 if 2.0 <= peak_count <= 5.0 else 0.0
-    scores["patchtst"] += 0.75 if peak_spacing_cv <= 0.30 else 0.0
-    scores["patchtst"] += 0.50 if acf_seasonal >= 0.05 else 0.0
+    if _feature_is_visible(visible_tools, "peak_count"):
+        scores["patchtst"] += 1.00 if 2.0 <= peak_count <= 5.0 else 0.0
+    if _feature_is_visible(visible_tools, "peak_spacing_cv"):
+        scores["patchtst"] += 0.75 if peak_spacing_cv <= 0.30 else 0.0
+    if _feature_is_visible(visible_tools, "acf_seasonal"):
+        scores["patchtst"] += 0.50 if acf_seasonal >= 0.05 else 0.0
 
-    scores["itransformer"] += 1.25 if changepoint_count >= 2.0 else 0.0
-    scores["itransformer"] += 0.75 if cusum_max >= 70.0 else 0.0
-    scores["itransformer"] += 0.50 if monotone_duration >= 0.10 else 0.0
+    if _feature_is_visible(visible_tools, "changepoint_count"):
+        scores["itransformer"] += 1.25 if changepoint_count >= 2.0 else 0.0
+    if _feature_is_visible(visible_tools, "cusum_max"):
+        scores["itransformer"] += 0.75 if cusum_max >= 70.0 else 0.0
+    if _feature_is_visible(visible_tools, "monotone_duration"):
+        scores["itransformer"] += 0.50 if monotone_duration >= 0.10 else 0.0
 
-    scores["chronos2"] += 0.75 if residual_exceed_ratio >= 0.08 else 0.0
-    scores["chronos2"] += 0.50 if quality_saturation_ratio >= 0.08 or quality_quantization_score >= 0.24 else 0.0
-    scores["chronos2"] += 0.50 if peak_count >= 6.0 and peak_spacing_cv >= 0.35 else 0.0
+    if _feature_is_visible(visible_tools, "residual_exceed_ratio"):
+        scores["chronos2"] += 0.75 if residual_exceed_ratio >= 0.08 else 0.0
+    if _feature_is_visible(visible_tools, "quality_saturation_ratio") or _feature_is_visible(visible_tools, "quality_quantization_score"):
+        scores["chronos2"] += 0.50 if quality_saturation_ratio >= 0.08 or quality_quantization_score >= 0.24 else 0.0
+    if _feature_is_visible(visible_tools, "peak_count") and _feature_is_visible(visible_tools, "peak_spacing_cv"):
+        scores["chronos2"] += 0.50 if peak_count >= 6.0 and peak_spacing_cv >= 0.35 else 0.0
     return scores
 
 
-def _select_prediction_model_by_heuristic(history_values: Sequence[float]) -> tuple[str, dict[str, Any], str]:
+def _select_prediction_model_by_heuristic(
+    history_values: Sequence[float],
+    *,
+    selected_feature_tools: Sequence[str] | None = None,
+) -> tuple[str, dict[str, Any], str]:
     feature_snapshot = _compute_routing_feature_snapshot(history_values)
+    visible_tools = _visible_feature_tools(selected_feature_tools)
     acf1 = float(feature_snapshot["acf1"])
     changepoint_count = float(feature_snapshot["changepoint_count"])
     residual_exceed_ratio = float(feature_snapshot["residual_exceed_ratio"])
@@ -460,36 +577,67 @@ def _select_prediction_model_by_heuristic(history_values: Sequence[float]) -> tu
     monotone_duration = float(feature_snapshot["monotone_duration"])
     cusum_max = float(feature_snapshot["cusum_max"])
     quality_issue = (
+        _feature_is_visible(visible_tools, "quality_saturation_ratio")
+        or _feature_is_visible(visible_tools, "quality_quantization_score")
+    ) and (
         float(feature_snapshot["quality_saturation_ratio"]) >= 0.08
         or float(feature_snapshot["quality_quantization_score"]) >= 0.24
     )
 
-    if quality_issue or (residual_exceed_ratio >= 0.085 and peak_count >= 6.0 and peak_spacing_cv >= 0.40):
+    if quality_issue or (
+        _feature_is_visible(visible_tools, "residual_exceed_ratio")
+        and _feature_is_visible(visible_tools, "peak_count")
+        and _feature_is_visible(visible_tools, "peak_spacing_cv")
+        and residual_exceed_ratio >= 0.085
+        and peak_count >= 6.0
+        and peak_spacing_cv >= 0.40
+    ):
         return (
             "chronos2",
             feature_snapshot,
             "The diagnostics show strong irregularity, residual stress, or data-quality risk in the current window.",
         )
-    if acf1 >= 0.93 and changepoint_count <= 1.0 and residual_exceed_ratio <= 0.05 and peak_count <= 4.0:
+    if (
+        _feature_is_visible(visible_tools, "acf1")
+        and _feature_is_visible(visible_tools, "changepoint_count")
+        and _feature_is_visible(visible_tools, "residual_exceed_ratio")
+        and _feature_is_visible(visible_tools, "peak_count")
+        and acf1 >= 0.93
+        and changepoint_count <= 1.0
+        and residual_exceed_ratio <= 0.05
+        and peak_count <= 4.0
+    ):
         return (
             "arima",
             feature_snapshot,
             "The diagnostics remain stable, with high short-lag autocorrelation, few structural breaks, and low residual stress.",
         )
-    if changepoint_count >= 3.0 and (cusum_max >= 70.0 or monotone_duration >= 0.10):
+    if (
+        _feature_is_visible(visible_tools, "changepoint_count")
+        and changepoint_count >= 3.0
+        and (
+            (_feature_is_visible(visible_tools, "cusum_max") and cusum_max >= 70.0)
+            or (_feature_is_visible(visible_tools, "monotone_duration") and monotone_duration >= 0.10)
+        )
+    ):
         return (
             "itransformer",
             feature_snapshot,
             "The diagnostics indicate broader structural change, with multiple changepoints or sustained drift across the window.",
         )
-    if 2.0 <= peak_count <= 5.0 and peak_spacing_cv <= 0.30:
+    if (
+        _feature_is_visible(visible_tools, "peak_count")
+        and _feature_is_visible(visible_tools, "peak_spacing_cv")
+        and 2.0 <= peak_count <= 5.0
+        and peak_spacing_cv <= 0.30
+    ):
         return (
             "patchtst",
             feature_snapshot,
             "The diagnostics indicate repeatable local peaks, stable spacing, and usable seasonal structure in the window.",
         )
 
-    scores = _heuristic_routing_scores(feature_snapshot)
+    scores = _heuristic_routing_scores(feature_snapshot, selected_feature_tools=selected_feature_tools)
     selected_model = _select_model_from_scores(scores)
     fallback_reason_by_model = {
         "arima": "The diagnostics remain comparatively stable, with structured short-lag behavior and limited break activity.",
@@ -645,24 +793,6 @@ def _normalize_turn3_target_mode(turn3_target_mode: str | None) -> str:
     return mode
 
 
-def _median_abs_deviation(values: list[float]) -> float:
-    if not values:
-        return 0.0
-    arr = np.asarray(values, dtype=float)
-    median = float(np.median(arr))
-    mad = float(np.median(np.abs(arr - median)))
-    return mad
-
-
-def _compute_diff_mad(values: list[float]) -> float:
-    if len(values) < 2:
-        return 1e-6
-    diffs = np.diff(np.asarray(values, dtype=float))
-    median = float(np.median(diffs))
-    mad = float(np.median(np.abs(diffs - median)))
-    return max(mad, 1e-6)
-
-
 def _compute_error_metrics(candidate_values: list[float], ground_truth_values: list[float]) -> tuple[float, float]:
     min_len = min(len(candidate_values), len(ground_truth_values))
     if min_len <= 0:
@@ -672,166 +802,20 @@ def _compute_error_metrics(candidate_values: list[float], ground_truth_values: l
     mse = float(np.mean((candidate - reference) ** 2))
     mae = float(np.mean(np.abs(candidate - reference)))
     return mse, mae
-
-
-def _detect_isolated_spikes(values: list[float], diff_mad: float) -> list[int]:
-    if len(values) < 3:
-        return []
-    threshold = max(3.0 * diff_mad, 1e-4)
-    spike_indices: list[int] = []
-    for idx in range(1, len(values) - 1):
-        left_delta = values[idx] - values[idx - 1]
-        right_delta = values[idx + 1] - values[idx]
-        if abs(left_delta) <= threshold or abs(right_delta) <= threshold:
-            continue
-        if left_delta * right_delta < 0:
-            spike_indices.append(idx)
-    return spike_indices
-
-
-def _smooth_isolated_spikes(values: list[float]) -> tuple[list[float], list[str]]:
-    smoothed = list(values)
-    diff_mad = _compute_diff_mad(smoothed)
-    spike_indices = _detect_isolated_spikes(smoothed, diff_mad)
-    if not spike_indices:
-        return smoothed, []
-    for idx in spike_indices:
-        smoothed[idx] = 0.5 * (smoothed[idx - 1] + smoothed[idx + 1])
-    return smoothed, ["isolated_spike_smoothing"]
-
-
-def _repair_flat_tail(values: list[float], history_values: list[float]) -> tuple[list[float], list[str]]:
-    if len(values) < 8 or len(history_values) < 8:
-        return list(values), []
-    repaired = list(values)
-    tail_value = repaired[-1]
-    flat_run = 1
-    for idx in range(len(repaired) - 2, -1, -1):
-        if abs(repaired[idx] - tail_value) <= 1e-8:
-            flat_run += 1
-        else:
-            break
-    if flat_run < 6:
-        return repaired, []
-    history_tail = history_values[-flat_run:]
-    if len(history_tail) != flat_run:
-        return repaired, []
-    history_center = float(np.mean(history_tail))
-    tail_center = float(np.mean(repaired[-flat_run:]))
-    adjusted_tail = [tail_center + (float(v) - history_center) for v in history_tail]
-    if np.allclose(np.asarray(adjusted_tail, dtype=float), np.asarray(repaired[-flat_run:], dtype=float), atol=1e-6):
-        return repaired, []
-    repaired[-flat_run:] = adjusted_tail
-    return repaired, ["flat_tail_repair"]
-
-
-def _clip_implausible_amplitude(values: list[float], history_values: list[float]) -> tuple[list[float], list[str]]:
-    if not history_values:
-        return list(values), []
-    history_median = float(np.median(np.asarray(history_values, dtype=float)))
-    history_mad = max(_median_abs_deviation(history_values), 1e-6)
-    lower = history_median - 6.0 * history_mad
-    upper = history_median + 6.0 * history_mad
-    clipped = [float(np.clip(v, lower, upper)) for v in values]
-    if np.allclose(np.asarray(clipped, dtype=float), np.asarray(values, dtype=float), atol=1e-8):
-        return list(values), []
-    return clipped, ["amplitude_clip"]
-
-
-def _adjust_local_level(values: list[float], history_values: list[float]) -> tuple[list[float], list[str]]:
-    window = min(12, len(values), len(history_values))
-    if window < 4:
-        return list(values), []
-
-    adjusted = list(values)
-    pred_tail = np.asarray(adjusted[-window:], dtype=float)
-    history_tail = np.asarray(history_values[-window:], dtype=float)
-    level_gap = float(np.mean(history_tail) - np.mean(pred_tail))
-    history_scale = max(_median_abs_deviation(history_values), 1e-4)
-    if abs(level_gap) <= max(1.5 * history_scale, 1e-4):
-        return adjusted, []
-
-    correction = 0.5 * level_gap
-    adjusted[-window:] = [float(v + correction) for v in adjusted[-window:]]
-    return adjusted, ["local_level_adjust"]
-
-
-def _adjust_local_slope(values: list[float], history_values: list[float]) -> tuple[list[float], list[str]]:
-    window = min(12, len(values), len(history_values))
-    if window < 4:
-        return list(values), []
-
-    adjusted = list(values)
-    pred_tail = np.asarray(adjusted[-window:], dtype=float)
-    history_tail = np.asarray(history_values[-window:], dtype=float)
-    pred_slope = float((pred_tail[-1] - pred_tail[0]) / max(window - 1, 1))
-    history_slope = float((history_tail[-1] - history_tail[0]) / max(window - 1, 1))
-    slope_gap = history_slope - pred_slope
-    slope_scale = max(_compute_diff_mad(history_values), 1e-4)
-    if abs(slope_gap) <= max(2.0 * slope_scale, 1e-4):
-        return adjusted, []
-
-    slope_correction = 0.5 * slope_gap
-    start_index = len(adjusted) - window
-    for offset in range(window):
-        adjusted[start_index + offset] = float(adjusted[start_index + offset] + slope_correction * offset)
-    return adjusted, ["local_slope_adjust"]
-
-
 def _should_attempt_refinement(
-    selected_feature_tools: list[str],
-    score_margin: float,
-    candidate_refinements: Sequence[tuple[list[float], list[str]]],
+    refinement_support_payload: dict[str, Any],
 ) -> tuple[bool, list[str]]:
-    reasons: list[str] = []
-    if "extract_data_quality" in selected_feature_tools:
-        reasons.append("quality_signal")
-    if "extract_forecast_residuals" in selected_feature_tools:
-        reasons.append("residual_signal")
-    if "extract_within_channel_dynamics" in selected_feature_tools and score_margin <= 0.05:
-        reasons.append("dynamics_small_margin")
-    candidate_ops = {op for _values, ops in candidate_refinements for op in ops}
-    if score_margin <= 0.05:
-        if "isolated_spike_smoothing" in candidate_ops:
-            reasons.append("prediction_spike_signal")
-        if "flat_tail_repair" in candidate_ops:
-            reasons.append("prediction_flat_tail_signal")
-        if "local_level_adjust" in candidate_ops:
-            reasons.append("prediction_level_signal")
-        if "local_slope_adjust" in candidate_ops:
-            reasons.append("prediction_slope_signal")
-        if "amplitude_clip" in candidate_ops:
-            reasons.append("prediction_amplitude_signal")
-    return bool(reasons), reasons or ["evidence_consistent"]
-
-
-def _generate_local_refinement_candidates(
-    values: list[float],
-    history_values: list[float],
-) -> list[tuple[list[float], list[str]]]:
-    candidate_builders = [
-        lambda current: _smooth_isolated_spikes(current),
-        lambda current: _repair_flat_tail(current, history_values),
-        lambda current: _adjust_local_level(current, history_values),
-        lambda current: _adjust_local_slope(current, history_values),
-        lambda current: _clip_implausible_amplitude(current, history_values),
+    candidate_adjustments = [
+        str(item)
+        for item in refinement_support_payload.get("candidate_adjustments", [])
+        if str(item).strip() and str(item).strip().lower() != "none"
     ]
-    candidates: list[tuple[list[float], list[str]]] = []
-    seen_signatures: set[tuple[str, tuple[float, ...]]] = set()
-    for builder in candidate_builders:
-        candidate_values, candidate_ops = builder(list(values))
-        deduped_ops = list(dict.fromkeys(candidate_ops))
-        if not deduped_ops:
-            continue
-        signature = (
-            "->".join(deduped_ops),
-            tuple(round(float(value), 6) for value in candidate_values),
-        )
-        if signature in seen_signatures:
-            continue
-        seen_signatures.add(signature)
-        candidates.append((candidate_values, deduped_ops))
-    return candidates
+    reasons = [
+        str(item)
+        for item in refinement_support_payload.get("support_signals", [])
+        if str(item).strip() and str(item).strip().lower() not in {"evidence_consistent", "none"}
+    ]
+    return bool(candidate_adjustments and reasons), reasons or ["evidence_consistent"]
 
 
 def _summarize_refine_delta(base_values: list[float], refined_values: list[float]) -> dict[str, float]:
@@ -913,12 +897,19 @@ def _build_turn3_target(
     ground_truth_values = ground_truth_values[:forecast_horizon]
     best_delta_summary = _summarize_refine_delta(base_values, base_values)
 
-    score_margin = float(sample.get("teacher_eval_score_margin", 0.0) or 0.0)
-    candidate_refinements = _generate_local_refinement_candidates(base_values, history_values)
+    candidate_refinements = filter_refinement_candidates_for_model(
+        generate_local_refinement_candidates(base_values, history_values),
+        prediction_model_used=model_name,
+    )
+    refinement_support_payload = build_refinement_support_payload(
+        base_values=base_values,
+        history_values=history_values,
+        selected_feature_tools=selected_feature_tools,
+        candidate_refinements=candidate_refinements,
+        prediction_model_used=model_name,
+    )
     attempt_refine, trigger_reasons = _should_attempt_refinement(
-        selected_feature_tools,
-        score_margin,
-        candidate_refinements,
+        refinement_support_payload,
     )
 
     base_mse, base_mae = _compute_error_metrics(base_values, ground_truth_values)
@@ -957,24 +948,45 @@ def _build_turn3_target(
     refine_gain_mae = float(base_mae - best_mae)
     refine_ops_signature = "none" if not best_ops else "->".join(best_ops)
     trigger_reason = "none" if not trigger_reasons else "->".join(dict.fromkeys(trigger_reasons))
+    base_teacher_prediction_text = _prediction_text_from_values(
+        base_values,
+        reference_prediction_text=base_prediction_text,
+        history_text=historical_data,
+    )
+    refined_prediction_text = _prediction_text_from_values(
+        best_values,
+        reference_prediction_text=base_prediction_text,
+        history_text=historical_data,
+    )
+    candidate_prediction_text_map = build_refinement_candidate_prediction_text_map(
+        base_prediction_text=base_teacher_prediction_text,
+        candidate_refinements=candidate_refinements,
+        prediction_model_used=model_name,
+    )
+    decision_name = refinement_decision_name(best_ops)
 
     return {
         "turn3_target_type": best_target_type,
         "refine_ops": list(dict.fromkeys(best_ops)),
         "refine_ops_signature": refine_ops_signature,
+        "refinement_decision_name": decision_name,
+        "refinement_support_signals": list(refinement_support_payload["support_signals"]),
+        "refinement_support_signal_signature": "->".join(refinement_support_payload["support_signals"]),
+        "refinement_keep_support_signals": list(refinement_support_payload["keep_support_signals"]),
+        "refinement_keep_support_signal_signature": "->".join(refinement_support_payload["keep_support_signals"]),
+        "refinement_edit_support_signals": json.dumps(
+            refinement_support_payload["edit_support_signals"],
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        "refinement_candidate_adjustments": list(refinement_support_payload["candidate_adjustments"]),
+        "refinement_candidate_adjustment_signature": "->".join(refinement_support_payload["candidate_adjustments"]),
+        "refinement_candidate_prediction_text_map": json.dumps(candidate_prediction_text_map, ensure_ascii=False),
         "refine_gain_mse": refine_gain_mse,
         "refine_gain_mae": refine_gain_mae,
         "turn3_trigger_reason": trigger_reason,
-        "base_teacher_prediction_text": _prediction_text_from_values(
-            base_values,
-            reference_prediction_text=base_prediction_text,
-            history_text=historical_data,
-        ),
-        "refined_prediction_text": _prediction_text_from_values(
-            best_values,
-            reference_prediction_text=base_prediction_text,
-            history_text=historical_data,
-        ),
+        "base_teacher_prediction_text": base_teacher_prediction_text,
+        "refined_prediction_text": refined_prediction_text,
         **best_delta_summary,
     }
 
@@ -985,10 +997,8 @@ def _format_refine_ops_for_reflection(refine_ops: list[str]) -> str:
 
     name_map = {
         "isolated_spike_smoothing": "smooth an isolated spike",
-        "flat_tail_repair": "repair a flat tail",
         "local_level_adjust": "adjust a local level shift",
         "local_slope_adjust": "adjust a local slope change",
-        "amplitude_clip": "clip an implausible amplitude excursion",
     }
     phrases = [name_map.get(op, op.replace("_", " ")) for op in refine_ops]
     if len(phrases) == 1:
@@ -1025,59 +1035,105 @@ def _format_phrase_list(phrases: Sequence[str]) -> str:
     return ", ".join(unique_phrases[:-1]) + f", and {unique_phrases[-1]}"
 
 
-def _format_routing_metric_value(metric_name: str, metric_value: Any) -> str:
-    if isinstance(metric_value, str):
-        return metric_value
-    try:
-        value = float(metric_value)
-    except Exception:
-        return str(metric_value)
-    if metric_name in {"Changepoint Count", "Peak Count"}:
-        return f"{value:.1f}"
-    return f"{value:.4f}"
-
-
-def _build_routing_metric_items(
+def _build_routing_feature_payload(
     *,
     history_values: Sequence[float],
     selected_feature_tools: Sequence[str],
-) -> list[str]:
-    metric_items: list[tuple[str, Any]] = []
-    selected = set(selected_feature_tools or [])
+) -> dict[str, dict[str, Any]]:
+    payload: dict[str, dict[str, Any]] = {}
+    selected = {str(name).strip() for name in selected_feature_tools if str(name).strip()}
     values = [float(value) for value in history_values]
 
     if "extract_basic_statistics" in selected:
         basic = extract_basic_statistics(values)
-        metric_items.extend(
-            [
-                ("ACF(1)", basic.get("acf1", 0.0)),
-                ("ACF(seasonal)", basic.get("acf_seasonal", 0.0)),
-            ]
-        )
+        payload["extract_basic_statistics"] = {
+            "acf1": float(basic.get("acf1", 0.0)),
+            "acf_seasonal": float(basic.get("acf_seasonal", 0.0)),
+            "cusum_max": float(basic.get("cusum_max", 0.0)),
+        }
 
     if "extract_within_channel_dynamics" in selected:
         dynamics = extract_within_channel_dynamics(values)
-        metric_items.extend(
-            [
-                ("Changepoint Count", dynamics.get("changepoint_count", 0.0)),
-                ("Peak Count", dynamics.get("peak_count", 0.0)),
-            ]
-        )
+        payload["extract_within_channel_dynamics"] = {
+            "changepoint_count": float(dynamics.get("changepoint_count", 0.0)),
+            "peak_count": float(dynamics.get("peak_count", 0.0)),
+            "peak_spacing_cv": float(dynamics.get("peak_spacing_cv", 0.0)),
+            "monotone_duration": float(dynamics.get("monotone_duration", 0.0)),
+        }
 
     if "extract_forecast_residuals" in selected:
         residuals = extract_forecast_residuals(values)
-        metric_items.append(("Exceed Ratio", residuals.get("residual_exceed_ratio", 0.0)))
+        payload["extract_forecast_residuals"] = {
+            "residual_exceed_ratio": float(residuals.get("residual_exceed_ratio", 0.0)),
+        }
+
+    if "extract_data_quality" in selected:
+        quality = extract_data_quality(values)
+        payload["extract_data_quality"] = {
+            "quality_quantization_score": float(quality.get("quality_quantization_score", 0.0)),
+            "quality_saturation_ratio": float(quality.get("quality_saturation_ratio", 0.0)),
+        }
 
     if "extract_event_summary" in selected:
         events = extract_event_summary(values)
-        dominant_idx = int(float(events.get("event_dominant_pattern", 0.0) or 0.0))
-        dominant_idx = min(max(dominant_idx, 0), len(EVENT_PATTERN_NAMES) - 1)
-        metric_items.append(("Dominant Pattern", EVENT_PATTERN_NAMES[dominant_idx]))
+        dominant_pattern_idx = int(float(events.get("event_dominant_pattern", 0.0) or 0.0))
+        dominant_pattern_idx = min(max(dominant_pattern_idx, 0), len(EVENT_PATTERN_NAMES) - 1)
+        payload["extract_event_summary"] = {
+            "dominant_pattern": EVENT_PATTERN_NAMES[dominant_pattern_idx],
+        }
+    return payload
 
-    return [
-        f"{metric_name}={_format_routing_metric_value(metric_name, metric_value)}"
-        for metric_name, metric_value in metric_items
-    ]
+
+def _build_routing_reason_codes(
+    *,
+    model_name: str,
+    history_values: Sequence[float],
+    selected_feature_tools: Sequence[str],
+) -> list[str]:
+    snapshot = _compute_routing_feature_snapshot(history_values)
+    selected = set(selected_feature_tools or [])
+    codes: list[str] = []
+
+    if model_name == "arima":
+        if "extract_basic_statistics" in selected and float(snapshot.get("acf1", 0.0)) >= 0.88:
+            codes.append("acf1_high")
+        if "extract_basic_statistics" in selected and float(snapshot.get("acf_seasonal", 0.0)) >= 0.05:
+            codes.append("seasonality_visible")
+        if "extract_within_channel_dynamics" in selected and float(snapshot.get("changepoint_count", 0.0)) <= 1.0:
+            codes.append("few_breaks")
+        if "extract_forecast_residuals" in selected and float(snapshot.get("residual_exceed_ratio", 0.0)) <= 0.05:
+            codes.append("residual_low")
+    elif model_name == "patchtst":
+        if "extract_within_channel_dynamics" in selected and 2.0 <= float(snapshot.get("peak_count", 0.0)) <= 5.0:
+            codes.append("repeatable_peaks")
+        if "extract_within_channel_dynamics" in selected and float(snapshot.get("peak_spacing_cv", 0.0)) <= 0.30:
+            codes.append("peak_spacing_regular")
+        if "extract_event_summary" in selected and str(snapshot.get("dominant_pattern", "") or "") == "oscillation":
+            codes.append("oscillation")
+    elif model_name == "itransformer":
+        if "extract_within_channel_dynamics" in selected and float(snapshot.get("changepoint_count", 0.0)) >= 2.0:
+            codes.append("multi_breaks")
+        if "extract_basic_statistics" in selected and float(snapshot.get("cusum_max", 0.0)) >= 70.0:
+            codes.append("drift_high")
+        if "extract_within_channel_dynamics" in selected and float(snapshot.get("monotone_duration", 0.0)) >= 0.10:
+            codes.append("long_monotone_segment")
+    else:
+        if "extract_forecast_residuals" in selected and float(snapshot.get("residual_exceed_ratio", 0.0)) >= 0.08:
+            codes.append("residual_high")
+        if "extract_data_quality" in selected and (
+            float(snapshot.get("quality_quantization_score", 0.0)) >= 0.24
+            or float(snapshot.get("quality_saturation_ratio", 0.0)) >= 0.08
+        ):
+            codes.append("quality_stress")
+        if "extract_within_channel_dynamics" in selected and (
+            float(snapshot.get("peak_count", 0.0)) >= 6.0
+            and float(snapshot.get("peak_spacing_cv", 0.0)) >= 0.35
+        ):
+            codes.append("irregular_local_dynamics")
+
+    if not codes:
+        codes.append("evidence_match")
+    return codes
 
 
 def _build_snapshot_grounded_routing_reason(
@@ -1175,98 +1231,45 @@ def build_routing_reflection(
     decision_reason: str = "",
     include_heuristic_comparison: bool = True,
 ) -> str:
-    metric_items = _build_routing_metric_items(
+    del include_heuristic_comparison
+    reason_codes = _build_routing_reason_codes(
+        model_name=model_name,
         history_values=history_values,
         selected_feature_tools=selected_feature_tools,
     )
-    if metric_items:
-        comparison_text = ""
-        if include_heuristic_comparison:
-            feature_snapshot = _compute_routing_feature_snapshot(history_values)
-            routing_scores = _heuristic_routing_scores(feature_snapshot)
-            alternative_candidates = sorted(
-                (
-                    (candidate, float(score))
-                    for candidate, score in routing_scores.items()
-                    if candidate != model_name
-                ),
-                key=lambda item: (-item[1], item[0]),
-            )
-            selected_score = float(routing_scores.get(model_name, 0.0))
-            if alternative_candidates:
-                runner_up_name, runner_up_score = alternative_candidates[0]
-                score_margin = selected_score - runner_up_score
-                if score_margin >= 0.0:
-                    comparison_text = _build_routing_comparison_text(
-                        model_name=model_name,
-                        runner_up_name=runner_up_name,
-                    )
-                else:
-                    comparison_text = (
-                        f"A high-confidence trigger overrides the fallback order here, "
-                        f"so I still prefer {model_name} over {runner_up_name}."
-                    )
-        reason_text = str(decision_reason or "").strip()
-        detail_lines = [
-            f"Observed diagnostics: {'; '.join(metric_items)}.",
-            f"Decision: {model_name}.",
-        ]
-        if reason_text:
-            detail_lines.append(reason_text)
-        if comparison_text:
-            detail_lines.append(comparison_text)
-        detail_lines.append(f"I will call predict_time_series with {model_name}.")
-        return "\n".join(detail_lines)
-
-    evidence_phrases = [
-        FEATURE_TOOL_LABELS.get(tool_name, tool_name.replace("_", " "))
-        for tool_name in selected_feature_tools
+    reason_text = str(decision_reason or "").strip()
+    lines = [
+        f'RouteDecision(model_name="{model_name}", reason_codes=[{", ".join(reason_codes)}])',
     ]
-    evidence_text = _format_phrase_list(evidence_phrases)
-    if evidence_text:
-        return (
-            f"Decision: {model_name}.\n"
-            f"I reviewed the diagnostic evidence from {evidence_text}. "
-            "The routing label follows the model whose inductive bias best matches the observed evidence in this window, "
-            f"so I will call predict_time_series with {model_name}."
-        )
-    return (
-        f"Decision: {model_name}.\n"
-        "The routing label follows the model whose inductive bias best matches the observed evidence in this window, "
-        f"so I will call predict_time_series with {model_name}."
-    )
-
-
-def _build_routing_comparison_text(*, model_name: str, runner_up_name: str) -> str:
-    return (
-        f"Compared with {runner_up_name}, the observed evidence remains more consistent with {model_name} "
-        "for this window."
-    )
+    if reason_text:
+        lines.append(f"RouteSummary: {reason_text}")
+    return "\n".join(lines)
 
 
 def build_final_answer(
+    decision_name: str,
     prediction_text: str,
-    *,
+    turn3_target_mode: str,
     turn3_target_type: str,
     model_name: str,
     refine_ops: list[str],
 ) -> str:
     if turn3_target_type == "local_refine":
         reflection = (
-            f"The selected {model_name} forecast is mostly consistent with the diagnostics, "
-            f"but I apply a small local correction to {_format_refine_ops_for_reflection(refine_ops)} "
-            "while preserving the overall trajectory."
+            f"I compare the selected {model_name} forecast against the diagnostics and make a small local adjustment "
+            f"around {_format_refine_ops_for_reflection(refine_ops)} while preserving the overall trajectory."
         )
     else:
         reflection = (
-            f"The selected {model_name} forecast is consistent with the diagnostic evidence, "
-            "so I keep the forecast unchanged."
+            f"I compare the selected {model_name} forecast against the diagnostics and keep it unchanged because it "
+            "already matches the evidence."
         )
 
-    return (
-        f"<think>\n{reflection}\n</think>\n"
-        f"<answer>\n{prediction_text}\n</answer>"
-    )
+    normalized_mode = _normalize_turn3_target_mode(turn3_target_mode)
+    if normalized_mode == TURN3_TARGET_MODE_ENGINEERING_REFINE:
+        normalized_decision = (str(decision_name or "").strip() or REFINEMENT_KEEP_DECISION)
+        return f"<think>\n{reflection}\n</think>\n<answer>\ndecision={normalized_decision}\n</answer>"
+    return f"<think>\n{reflection}\n</think>\n<answer>\n{prediction_text}\n</answer>"
 
 
 def _make_stage_record(
@@ -1342,8 +1345,6 @@ def build_sft_records(
     turn3_target_mode = _normalize_turn3_target_mode(turn3_target_mode)
     sft_stage_mode = _normalize_sft_stage_mode(sft_stage_mode)
     routing_label_source = _normalize_routing_label_source(routing_label_source)
-    if sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY:
-        routing_label_source = ROUTING_LABEL_SOURCE_REFERENCE_TEACHER
     raw_prompt = sample["raw_prompt"][0]["content"]
     reward_model = sample.get("reward_model", {}) if isinstance(sample.get("reward_model"), dict) else {}
     task_spec = parse_task_prompt(raw_prompt, data_source=sample.get("data_source"))
@@ -1365,7 +1366,14 @@ def build_sft_records(
     reference_teacher_model = _resolve_reference_teacher_model(sample)
     second_teacher_model = _normalize_teacher_model(sample.get("teacher_eval_second_best_model"))
     heuristic_selected_prediction_model, routing_feature_snapshot, heuristic_routing_policy_reason = _select_prediction_model_by_heuristic(
-        history_values
+        history_values,
+        selected_feature_tools=selected_feature_tools,
+    )
+    routing_confidence_tier = _routing_confidence_tier(
+        heuristic_selected_prediction_model=heuristic_selected_prediction_model,
+        reference_teacher_model=reference_teacher_model,
+        diagnostic_plan_score_gap=diagnostic_plan.score_gap,
+        teacher_eval_score_margin=sample.get("teacher_eval_score_margin"),
     )
     selected_prediction_model = heuristic_selected_prediction_model
     routing_policy_reason = heuristic_routing_policy_reason
@@ -1451,12 +1459,18 @@ def build_sft_records(
         "forecast_horizon": forecast_horizon,
         "lookback_window": lookback_window,
         "reference_teacher_model": reference_teacher_model,
+        "heuristic_selected_prediction_model": heuristic_selected_prediction_model,
+        "heuristic_matches_reference_teacher": (
+            str(heuristic_selected_prediction_model or "").strip().lower()
+            == str(reference_teacher_model or "").strip().lower()
+        ),
         "selected_prediction_model": selected_prediction_model,
         "routing_label_source": routing_label_source,
         "diagnostic_plan_reason": diagnostic_plan.rationale,
         "diagnostic_primary_model": diagnostic_plan.primary_model,
         "diagnostic_runner_up_model": diagnostic_plan.runner_up_model,
         "diagnostic_plan_score_gap": diagnostic_plan.score_gap,
+        "routing_confidence_tier": routing_confidence_tier,
         "routing_policy_source": routing_policy_source,
         "routing_policy_reason": routing_policy_reason,
         "base_prediction_source": base_prediction_source,
@@ -1466,6 +1480,15 @@ def build_sft_records(
         "turn3_target_mode": turn3_target_mode,
         "turn3_target_type": turn3_target["turn3_target_type"],
         "turn3_trigger_reason": turn3_target["turn3_trigger_reason"],
+        "refinement_support_signals": turn3_target["refinement_support_signals"],
+        "refinement_support_signal_signature": turn3_target["refinement_support_signal_signature"],
+        "refinement_keep_support_signals": turn3_target["refinement_keep_support_signals"],
+        "refinement_keep_support_signal_signature": turn3_target["refinement_keep_support_signal_signature"],
+        "refinement_edit_support_signals": turn3_target["refinement_edit_support_signals"],
+        "refinement_candidate_adjustments": turn3_target["refinement_candidate_adjustments"],
+        "refinement_candidate_adjustment_signature": turn3_target["refinement_candidate_adjustment_signature"],
+        "refinement_decision_name": turn3_target["refinement_decision_name"],
+        "refinement_candidate_prediction_text_map": turn3_target["refinement_candidate_prediction_text_map"],
         "refine_ops": turn3_target["refine_ops"],
         "refine_ops_signature": turn3_target["refine_ops_signature"],
         "refine_gain_mse": turn3_target["refine_gain_mse"],
@@ -1554,6 +1577,10 @@ def build_sft_records(
         prediction_results=None,
         available_feature_tools=selected_feature_tools,
         completed_feature_tools=selected_feature_tools,
+        routing_feature_payload=_build_routing_feature_payload(
+            history_values=history_values,
+            selected_feature_tools=selected_feature_tools,
+        ),
         turn_stage="routing",
     )
     turn_3_prompt = build_runtime_user_prompt(
@@ -1567,6 +1594,16 @@ def build_sft_records(
         prediction_model_used=selected_prediction_model,
         available_feature_tools=selected_feature_tools,
         completed_feature_tools=selected_feature_tools,
+        refinement_feature_payload=build_refinement_support_payload(
+            base_values=_require_prediction_values(
+                turn3_base_prediction_text,
+                forecast_horizon,
+                source_name=f"{selected_prediction_model}_turn3_prompt",
+            ),
+            history_values=history_values,
+            selected_feature_tools=selected_feature_tools,
+            prediction_model_used=selected_prediction_model,
+        ),
         turn_stage="refinement",
     )
 
@@ -1614,7 +1651,9 @@ def build_sft_records(
                 {
                     "role": "assistant",
                     "content": build_final_answer(
-                        turn3_target["refined_prediction_text"],
+                        decision_name=turn3_target["refinement_decision_name"],
+                        prediction_text=turn3_target["refined_prediction_text"],
+                        turn3_target_mode=turn3_target_mode,
                         turn3_target_type=turn3_target["turn3_target_type"],
                         model_name=selected_prediction_model,
                         refine_ops=turn3_target["refine_ops"],
@@ -1676,8 +1715,6 @@ def convert_jsonl_to_sft_parquet(
     turn3_target_mode = _normalize_turn3_target_mode(turn3_target_mode)
     routing_label_source = _normalize_routing_label_source(routing_label_source)
     sft_stage_mode = _normalize_sft_stage_mode(sft_stage_mode)
-    if sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY:
-        routing_label_source = ROUTING_LABEL_SOURCE_REFERENCE_TEACHER
     input_path = Path(input_path)
     output_path = Path(output_path)
     records: list[dict[str, Any]] = []
@@ -2086,6 +2123,73 @@ def repeat_local_refine_refinement_rows(
     return balanced
 
 
+def filter_train_routing_records_by_confidence(
+    dataframe: pd.DataFrame,
+    *,
+    min_tier: str,
+) -> pd.DataFrame:
+    normalized_min_tier = _normalize_train_routing_confidence_min_tier(min_tier)
+    if dataframe.empty or normalized_min_tier == "none":
+        return dataframe
+    if "turn_stage" not in dataframe.columns or "routing_confidence_tier" not in dataframe.columns:
+        return dataframe
+
+    min_rank = ROUTING_CONFIDENCE_TIER_RANK[normalized_min_tier]
+    keep_rows: list[dict[str, Any]] = []
+    for _, row in dataframe.iterrows():
+        stage = str(row.get("turn_stage") or "").strip().lower()
+        if stage != "routing":
+            keep_rows.append(row.to_dict())
+            continue
+        if str(row.get("routing_label_source") or "").strip().lower() != ROUTING_LABEL_SOURCE_HEURISTIC:
+            keep_rows.append(row.to_dict())
+            continue
+        tier = str(row.get("routing_confidence_tier") or "low").strip().lower()
+        tier_rank = ROUTING_CONFIDENCE_TIER_RANK.get(tier, ROUTING_CONFIDENCE_TIER_RANK["low"])
+        if tier_rank >= min_rank:
+            keep_rows.append(row.to_dict())
+
+    balanced = pd.DataFrame(keep_rows)
+    if balanced.empty:
+        return balanced
+    sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in balanced.columns]
+    if sort_columns:
+        balanced = balanced.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+    if "sample_index" in balanced.columns:
+        balanced["sample_index"] = list(range(len(balanced)))
+    return balanced
+
+
+def repeat_high_confidence_routing_rows(
+    dataframe: pd.DataFrame,
+    *,
+    repeat_factor: int,
+) -> pd.DataFrame:
+    if dataframe.empty or repeat_factor <= 1:
+        return dataframe
+    if "turn_stage" not in dataframe.columns or "routing_confidence_tier" not in dataframe.columns:
+        return dataframe
+
+    high_conf_mask = (
+        dataframe["turn_stage"].astype(str).str.lower().eq("routing")
+        & dataframe["routing_confidence_tier"].astype(str).str.lower().eq("high")
+        & dataframe["routing_label_source"].astype(str).str.lower().eq(ROUTING_LABEL_SOURCE_HEURISTIC)
+    )
+    high_conf_df = dataframe.loc[high_conf_mask].copy()
+    if high_conf_df.empty:
+        return dataframe
+
+    repeated_frames: list[pd.DataFrame] = [dataframe.copy()]
+    repeated_frames.extend(high_conf_df.copy() for _ in range(int(repeat_factor) - 1))
+    balanced = pd.concat(repeated_frames, ignore_index=True)
+    sort_columns = [col for col in ("source_sample_index", "turn_stage_order", "sample_index") if col in balanced.columns]
+    if sort_columns:
+        balanced = balanced.sort_values(sort_columns, kind="stable").reset_index(drop=True)
+    if "sample_index" in balanced.columns:
+        balanced["sample_index"] = list(range(len(balanced)))
+    return balanced
+
+
 def rebalance_train_routing_model_records(
     dataframe: pd.DataFrame,
     *,
@@ -2159,7 +2263,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Which stage records to keep in the generated parquet. "
             "`full` keeps the full three-stage trajectory; "
-            "`routing_only` keeps only routing rows with reference-teacher routing supervision; "
+            "`routing_only` keeps only routing rows; "
             "`refinement_only` keeps only refinement rows for stage-local Turn-3 training."
         ),
     )
@@ -2175,8 +2279,8 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ROUTING_LABEL_SOURCE,
         help=(
             "Source for routing labels in step-wise SFT. "
-            "`heuristic` keeps the existing rule-based routing teacher; "
-            "`reference_teacher` uses the offline best/reference teacher model."
+            "`reference_teacher` uses the offline best/reference teacher model and is the formal default; "
+            "`heuristic` keeps the rule-based routing teacher for ablations/debugging."
         ),
     )
     parser.add_argument(
@@ -2228,6 +2332,25 @@ def parse_args() -> argparse.Namespace:
             "Set <=1 to disable."
         ),
     )
+    parser.add_argument(
+        "--train-routing-confidence-min-tier",
+        choices=sorted(SUPPORTED_TRAIN_ROUTING_CONFIDENCE_MIN_TIERS),
+        default=DEFAULT_TRAIN_ROUTING_CONFIDENCE_MIN_TIER,
+        help=(
+            "Optional train-only filter for heuristic routing supervision. "
+            "`high` keeps only routing rows whose heuristic choice matches the reference teacher and whose "
+            "diagnostic/teacher margins are both strong; `mid` keeps mid+high confidence rows; `none` disables filtering."
+        ),
+    )
+    parser.add_argument(
+        "--train-high-confidence-routing-repeat-factor",
+        type=int,
+        default=DEFAULT_TRAIN_HIGH_CONFIDENCE_ROUTING_REPEAT_FACTOR,
+        help=(
+            "Extra repeat factor applied only to train routing rows with routing_confidence_tier=high. "
+            "Set <=1 to disable."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -2236,9 +2359,10 @@ def main() -> None:
     sft_stage_mode = _normalize_sft_stage_mode(args.sft_stage_mode)
     turn3_target_mode = _normalize_turn3_target_mode(args.turn3_target_mode)
     routing_label_source = _normalize_routing_label_source(args.routing_label_source)
-    if sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY:
-        routing_label_source = ROUTING_LABEL_SOURCE_REFERENCE_TEACHER
     train_turn3_rebalance_mode = _normalize_train_turn3_rebalance_mode(args.train_turn3_rebalance_mode)
+    train_routing_confidence_min_tier = _normalize_train_routing_confidence_min_tier(
+        getattr(args, "train_routing_confidence_min_tier", DEFAULT_TRAIN_ROUTING_CONFIDENCE_MIN_TIER)
+    )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     effective_train_min_local_refine_ratio = float(args.train_min_local_refine_ratio)
@@ -2294,6 +2418,21 @@ def main() -> None:
             min_local_refine_ratio=effective_train_min_local_refine_ratio,
             rebalance_mode=train_turn3_rebalance_mode,
         )
+    train_df = filter_train_routing_records_by_confidence(
+        train_df,
+        min_tier=train_routing_confidence_min_tier,
+    )
+    train_high_confidence_routing_repeat_factor = int(
+        getattr(
+            args,
+            "train_high_confidence_routing_repeat_factor",
+            DEFAULT_TRAIN_HIGH_CONFIDENCE_ROUTING_REPEAT_FACTOR,
+        )
+    )
+    train_df = repeat_high_confidence_routing_rows(
+        train_df,
+        repeat_factor=train_high_confidence_routing_repeat_factor,
+    )
 
     if sft_stage_mode in {SFT_STAGE_MODE_FULL, SFT_STAGE_MODE_ROUTING_ONLY}:
         train_df = rebalance_train_routing_model_records(
@@ -2412,6 +2551,8 @@ def main() -> None:
             "local_refine_refinement_repeat_factor": train_local_refine_refinement_repeat_factor,
             "priority_validated_keep_repeat_factor": train_priority_validated_keep_repeat_factor,
             "routing_model_balance_enabled": bool(args.balance_train_routing_models),
+            "routing_confidence_min_tier": train_routing_confidence_min_tier,
+            "high_confidence_routing_repeat_factor": train_high_confidence_routing_repeat_factor,
         },
         train_turn3_target_type_distribution_before_balance=distribution_from_series(
             _source_level_frame(train_df_raw)["turn3_target_type"]
@@ -2429,6 +2570,16 @@ def main() -> None:
         ),
         train_routing_row_selected_prediction_model_distribution=distribution_from_series(
             train_df.loc[train_df["turn_stage"] == "routing", "selected_prediction_model"]
+        ),
+        train_routing_confidence_tier_distribution_before_filter=distribution_from_series(
+            train_df_raw.loc[train_df_raw["turn_stage"] == "routing", "routing_confidence_tier"]
+            if "routing_confidence_tier" in train_df_raw.columns
+            else []
+        ),
+        train_routing_confidence_tier_distribution=distribution_from_series(
+            train_df.loc[train_df["turn_stage"] == "routing", "routing_confidence_tier"]
+            if "routing_confidence_tier" in train_df.columns
+            else []
         ),
         routing_only_selected_model_distribution=distribution_from_series(
             train_df["selected_prediction_model"]
@@ -2469,6 +2620,11 @@ def main() -> None:
             left_column="selected_prediction_model",
             right_column="reference_teacher_model",
         ),
+        val_routing_confidence_tier_distribution=distribution_from_series(
+            val_df.loc[val_df["turn_stage"] == "routing", "routing_confidence_tier"]
+            if "routing_confidence_tier" in val_df.columns
+            else []
+        ),
         val_turn3_target_type_distribution=distribution_from_series(_source_level_frame(val_df)["turn3_target_type"]),
         val_turn3_trigger_reason_distribution=distribution_from_series(_source_level_frame(val_df)["turn3_trigger_reason"]),
         val_refine_ops_signature_distribution=distribution_from_series(_source_level_frame(val_df)["refine_ops_signature"]),
@@ -2502,6 +2658,11 @@ def main() -> None:
                 _source_level_frame(test_df),
                 left_column="selected_prediction_model",
                 right_column="reference_teacher_model",
+            ),
+            test_routing_confidence_tier_distribution=distribution_from_series(
+                test_df.loc[test_df["turn_stage"] == "routing", "routing_confidence_tier"]
+                if "routing_confidence_tier" in test_df.columns
+                else []
             ),
             test_turn3_target_type_distribution=distribution_from_series(
                 _source_level_frame(test_df)["turn3_target_type"]

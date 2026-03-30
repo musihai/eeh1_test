@@ -9,6 +9,20 @@ swanlog/
 logs/
 *.log
 
+# 实验报告产物
+artifacts/reports/*.run.log
+artifacts/reports/*.json
+artifacts/reports/*.jsonl
+artifacts/reports/final_launch_cmd.txt
+artifacts/reports/formal_pipeline_inspection/
+artifacts/reports/*/launch_info.txt
+artifacts/reports/*/run.log
+artifacts/reports/*/launcher.pid
+artifacts/reports/*/pid.txt
+artifacts/reports/*/run_name.txt
+artifacts/reports/*/*.json
+artifacts/reports/*/*.jsonl
+
 # Python缓存
 __pycache__/
 *.py[cod]

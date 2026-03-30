@@ -146,6 +146,14 @@ def build_compact_validation_debug_summary(*, global_step: int, agg_row: dict[st
         "prediction_model_defaulted_ratio",
         "refinement_degraded_ratio",
         "analysis_coverage_ratio_mean",
+        "strict_score_mean",
+        "recovered_score_mean",
+        "recovery_gap_mean",
+        "raw_overrun_penalty_mean",
+        "answer_line_count_mean",
+        "think_token_len_mean",
+        "answer_token_len_mean",
+        "wrote_expected_rows_before_stop_ratio",
         "response_token_len_mean",
         "response_token_len_p90",
         "orig_mse_mean",
@@ -266,6 +274,53 @@ def write_min_eval_debug_files(
     )
     generation_stop_reason = to_str_list(reward_extra_infos_dict.get("generation_stop_reason"), n)
     generation_finish_reason = to_str_list(reward_extra_infos_dict.get("generation_finish_reason"), n)
+    strict_score = to_float_list(
+        reward_extra_infos_dict.get("strict_score") or reward_extra_infos_dict.get("score"),
+        n,
+        default=float("nan"),
+    )
+    recovered_score = to_float_list(
+        reward_extra_infos_dict.get("recovered_score") or reward_extra_infos_dict.get("score"),
+        n,
+        default=float("nan"),
+    )
+    recovery_gap = to_float_list(reward_extra_infos_dict.get("recovery_gap"), n, default=float("nan"))
+    raw_overrun_penalty = to_float_list(
+        reward_extra_infos_dict.get("raw_overrun_penalty"),
+        n,
+        default=float("nan"),
+    )
+    answer_line_count = to_float_list(reward_extra_infos_dict.get("answer_line_count"), n, default=float("nan"))
+    expected_answer_line_count = to_float_list(
+        reward_extra_infos_dict.get("expected_answer_line_count"),
+        n,
+        default=float("nan"),
+    )
+    wrote_expected_rows_before_stop = to_bool_list(
+        reward_extra_infos_dict.get("wrote_expected_rows_before_stop"),
+        n,
+    )
+    think_token_len = to_float_list(reward_extra_infos_dict.get("think_token_len"), n, default=float("nan"))
+    answer_token_len = to_float_list(reward_extra_infos_dict.get("answer_token_len"), n, default=float("nan"))
+    turn3_horizon_clamped = to_bool_list(reward_extra_infos_dict.get("turn3_horizon_clamped"), n)
+    turn3_horizon_clamp_discarded_lines = to_float_list(
+        reward_extra_infos_dict.get("turn3_horizon_clamp_discarded_lines"),
+        n,
+        default=float("nan"),
+    )
+    turn3_horizon_clamp_valid_prefix_lines = to_float_list(
+        reward_extra_infos_dict.get("turn3_horizon_clamp_valid_prefix_lines"),
+        n,
+        default=float("nan"),
+    )
+    turn3_horizon_clamp_raw_answer_lines = to_float_list(
+        reward_extra_infos_dict.get("turn3_horizon_clamp_raw_answer_lines"),
+        n,
+        default=float("nan"),
+    )
+    turn3_horizon_clamp_reason = to_str_list(reward_extra_infos_dict.get("turn3_horizon_clamp_reason"), n)
+    validate_flag = to_bool_list(reward_extra_infos_dict.get("validate"), n)
+    run_name = to_str_list(reward_extra_infos_dict.get("run_name"), n)
     workflow_violation_reason = to_str_list(reward_extra_infos_dict.get("workflow_violation_reason"), n)
     selected_model = to_str_list(
         reward_extra_infos_dict.get("selected_model")
@@ -417,6 +472,22 @@ def write_min_eval_debug_files(
     final_vs_selected_mse_values = [float(v) for v in final_vs_selected_mse if np.isfinite(v)]
     refinement_delta_orig_mse_values = [float(v) for v in refinement_delta_orig_mse if np.isfinite(v)]
     analysis_coverage_ratio_values = [float(v) for v in analysis_coverage_ratio if np.isfinite(v)]
+    strict_score_values = [float(v) for v in strict_score if np.isfinite(v)]
+    recovered_score_values = [float(v) for v in recovered_score if np.isfinite(v)]
+    recovery_gap_values = [float(v) for v in recovery_gap if np.isfinite(v)]
+    raw_overrun_penalty_values = [float(v) for v in raw_overrun_penalty if np.isfinite(v)]
+    answer_line_count_values = [float(v) for v in answer_line_count if np.isfinite(v)]
+    turn3_horizon_clamp_discarded_values = [
+        float(v) for v in turn3_horizon_clamp_discarded_lines if np.isfinite(v)
+    ]
+    turn3_horizon_clamp_valid_prefix_values = [
+        float(v) for v in turn3_horizon_clamp_valid_prefix_lines if np.isfinite(v)
+    ]
+    turn3_horizon_clamp_raw_answer_values = [
+        float(v) for v in turn3_horizon_clamp_raw_answer_lines if np.isfinite(v)
+    ]
+    think_token_len_values = [float(v) for v in think_token_len if np.isfinite(v)]
+    answer_token_len_values = [float(v) for v in answer_token_len if np.isfinite(v)]
     feature_tool_count_values = [float(v) for v in feature_tool_count if np.isfinite(v)]
     required_feature_tool_count_values = [float(v) for v in required_feature_tool_count if np.isfinite(v)]
     missing_required_feature_tool_count_values = [
@@ -456,6 +527,7 @@ def write_min_eval_debug_files(
     final_answer_reject_counter = Counter(reason for reason in final_answer_reject_reason if reason)
     generation_stop_reason_counter = Counter(reason for reason in generation_stop_reason if reason)
     generation_finish_reason_counter = Counter(reason for reason in generation_finish_reason if reason)
+    turn3_horizon_clamp_reason_counter = Counter(reason for reason in turn3_horizon_clamp_reason if reason)
     selected_model_counter = Counter(model for model in selected_model if model)
     workflow_status_counter = Counter(status for status in workflow_status if status)
     turn_stage_counter = Counter(stage for stage in turn_stage if stage)
@@ -523,6 +595,28 @@ def write_min_eval_debug_files(
         "analysis_coverage_ratio_mean": float(np.mean(analysis_coverage_ratio_values))
         if analysis_coverage_ratio_values
         else float("nan"),
+        "strict_score_mean": float(np.mean(strict_score_values)) if strict_score_values else float("nan"),
+        "recovered_score_mean": float(np.mean(recovered_score_values)) if recovered_score_values else float("nan"),
+        "recovery_gap_mean": float(np.mean(recovery_gap_values)) if recovery_gap_values else float("nan"),
+        "raw_overrun_penalty_mean": float(np.mean(raw_overrun_penalty_values))
+        if raw_overrun_penalty_values
+        else float("nan"),
+        "answer_line_count_mean": float(np.mean(answer_line_count_values)) if answer_line_count_values else float("nan"),
+        "turn3_horizon_clamped_ratio": float(np.mean(np.asarray(turn3_horizon_clamped, dtype=np.float64))),
+        "turn3_horizon_clamp_discarded_lines_mean": float(np.mean(turn3_horizon_clamp_discarded_values))
+        if turn3_horizon_clamp_discarded_values
+        else float("nan"),
+        "turn3_horizon_clamp_valid_prefix_lines_mean": float(np.mean(turn3_horizon_clamp_valid_prefix_values))
+        if turn3_horizon_clamp_valid_prefix_values
+        else float("nan"),
+        "turn3_horizon_clamp_raw_answer_lines_mean": float(np.mean(turn3_horizon_clamp_raw_answer_values))
+        if turn3_horizon_clamp_raw_answer_values
+        else float("nan"),
+        "think_token_len_mean": float(np.mean(think_token_len_values)) if think_token_len_values else float("nan"),
+        "answer_token_len_mean": float(np.mean(answer_token_len_values)) if answer_token_len_values else float("nan"),
+        "wrote_expected_rows_before_stop_ratio": float(
+            np.mean(np.asarray(wrote_expected_rows_before_stop, dtype=np.float64))
+        ),
         "feature_tool_count_mean": float(np.mean(feature_tool_count_values)) if feature_tool_count_values else float("nan"),
         "required_feature_tool_count_mean": float(np.mean(required_feature_tool_count_values))
         if required_feature_tool_count_values
@@ -545,6 +639,7 @@ def write_min_eval_debug_files(
         "final_answer_reject_reason_distribution": top_counter_items(final_answer_reject_counter, limit=8),
         "generation_stop_reason_distribution": top_counter_items(generation_stop_reason_counter, limit=6),
         "generation_finish_reason_distribution": top_counter_items(generation_finish_reason_counter, limit=6),
+        "turn3_horizon_clamp_reason_distribution": top_counter_items(turn3_horizon_clamp_reason_counter, limit=6),
         "workflow_status_distribution": {str(k): int(v) for k, v in sorted(workflow_status_counter.items())},
         "turn_stage_distribution": {str(k): int(v) for k, v in sorted(turn_stage_counter.items())},
         "patchtst_share": float(selected_model_counter.get("patchtst", 0) / total),
@@ -613,6 +708,22 @@ def write_min_eval_debug_files(
             "response_token_len": _int_or_default(response_token_len[i]),
             "generation_stop_reason": generation_stop_reason[i] if generation_stop_reason[i] else "",
             "generation_finish_reason": generation_finish_reason[i] if generation_finish_reason[i] else "",
+            "strict_score": _float_or_nan(strict_score[i]),
+            "recovered_score": _float_or_nan(recovered_score[i]),
+            "recovery_gap": _float_or_nan(recovery_gap[i]),
+            "raw_overrun_penalty": _float_or_nan(raw_overrun_penalty[i]),
+            "answer_line_count": _int_or_default(answer_line_count[i]),
+            "expected_answer_line_count": _int_or_default(expected_answer_line_count[i]),
+            "wrote_expected_rows_before_stop": bool(wrote_expected_rows_before_stop[i]),
+            "think_token_len": _int_or_default(think_token_len[i]),
+            "answer_token_len": _int_or_default(answer_token_len[i]),
+            "turn3_horizon_clamped": bool(turn3_horizon_clamped[i]),
+            "turn3_horizon_clamp_reason": turn3_horizon_clamp_reason[i] if turn3_horizon_clamp_reason[i] else "",
+            "turn3_horizon_clamp_discarded_lines": _int_or_default(turn3_horizon_clamp_discarded_lines[i]),
+            "turn3_horizon_clamp_valid_prefix_lines": _int_or_default(turn3_horizon_clamp_valid_prefix_lines[i]),
+            "turn3_horizon_clamp_raw_answer_lines": _int_or_default(turn3_horizon_clamp_raw_answer_lines[i]),
+            "validate": bool(validate_flag[i]),
+            "run_name": run_name[i] if run_name[i] else "",
             "feature_tool_count": _int_or_default(feature_tool_count[i]),
             "required_feature_tool_count": _int_or_default(required_feature_tool_count[i]),
             "missing_required_feature_tool_count": _int_or_default(missing_required_feature_tool_count[i]),

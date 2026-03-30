@@ -119,37 +119,27 @@ if [ ! -f "${VAL_FILES}" ]; then
     exit 1
 fi
 if [ "${PRINT_CMD_ONLY:-0}" != "1" ]; then
-python3 - "$TRAIN_FILES" "$VAL_FILES" <<'PY'
+python3 - "$TRAIN_FILES" "$VAL_FILES" "$SFT_METADATA_PATH" <<'PY'
 import sys
+import json
 import pandas as pd
 
-from recipe.time_series_forecast.validate_turn3_format import (
-    check_paper_turn3_protocol,
-    get_last_assistant_content,
-    record_requires_paper_turn3_protocol,
-)
+from recipe.time_series_forecast.build_etth1_sft_dataset import _summarize_paper_turn3_protocol
+
+metadata_path = sys.argv[3]
+with open(metadata_path, "r", encoding="utf-8") as handle:
+    metadata = json.load(handle)
+allow_no_refinement = str(metadata.get("sft_stage_mode", "") or "").strip().lower() == "routing_only"
 
 
 def inspect(path: str) -> None:
     frame = pd.read_parquet(path)
-    failures = []
-    checked = 0
-    for row_idx, row in frame.iterrows():
-        record = {
-            "messages": row["messages"],
-            "turn_stage": row.get("turn_stage", ""),
-            "paper_turn3_required": row.get("paper_turn3_required", None),
-        }
-        if not record_requires_paper_turn3_protocol(record):
-            continue
-        checked += 1
-        content = get_last_assistant_content(record)
-        expected_len = int(row.get("forecast_horizon", 96) or 96)
-        ok, reason, pred_len = check_paper_turn3_protocol(content, expected_len=expected_len)
-        if not ok:
-            failures.append((int(row_idx), reason, int(pred_len)))
-            if len(failures) >= 5:
-                break
+    summary = _summarize_paper_turn3_protocol(frame)
+    checked = int(summary.get("turn3_protocol_checked_count", 0))
+    failures = summary.get("turn3_protocol_invalid_examples", [])[:5]
+    if checked <= 0 and allow_no_refinement:
+        print(f"[SFT TURN3 PROTOCOL] path={path} checked=0 total={len(frame)} status=skipped(routing_only)")
+        return
     if checked <= 0:
         raise SystemExit(f"SFT parquet {path} does not contain any refinement rows to validate.")
     if failures:

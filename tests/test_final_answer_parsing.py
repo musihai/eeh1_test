@@ -2,7 +2,11 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
-from recipe.time_series_forecast.reward_protocol import extract_values_from_time_series_string
+from recipe.time_series_forecast.reward_protocol import (
+    clamp_turn3_answer_horizon,
+    extract_values_from_time_series_string,
+    parse_final_answer_protocol,
+)
 from recipe.time_series_forecast.time_series_forecast_agent_flow import TimeSeriesForecastAgentFlow
 
 
@@ -35,12 +39,23 @@ class FinalAnswerParsingTest(unittest.TestCase):
     def _numeric_answer_lines(self, count: int) -> str:
         return "\n".join(f"{30.0 + idx / 1000:.4f}" for idx in range(count))
 
+    def _timestamp_answer_lines(self, count: int) -> str:
+        lines = []
+        day = 1
+        hour = 0
+        for idx in range(count):
+            lines.append(f"2026-03-{day:02d} {hour:02d}:00:00 {30.0 + idx / 1000:.4f}")
+            hour += 1
+            if hour == 24:
+                hour = 0
+                day += 1
+        return "\n".join(lines)
+
     def test_extracts_well_formed_answer_block(self) -> None:
         agent = self._make_agent()
         text = f"<think>x</think><answer>\n{self._numeric_answer_lines(96)}\n</answer>"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNotNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertIsNone(agent.final_answer_reject_reason)
         self.assertEqual(agent.final_answer_parse_mode, "strict_protocol")
         self.assertTrue(answer.startswith("30.0000"))
@@ -48,18 +63,16 @@ class FinalAnswerParsingTest(unittest.TestCase):
     def test_accepts_empty_think_when_answer_is_valid(self) -> None:
         agent = self._make_agent()
         text = f"<think></think><answer>\n{self._numeric_answer_lines(96)}\n</answer>"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNotNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertIsNone(agent.final_answer_reject_reason)
         self.assertEqual(agent.final_answer_parse_mode, "strict_protocol")
 
     def test_rejects_truncated_answer_block(self) -> None:
         agent = self._make_agent()
         text = f"<think>x</think><answer>\n{self._numeric_answer_lines(95)}\n</answer>"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "invalid_answer_shape:lines=95,expected=96")
 
     def test_rejects_timestamped_answer_block(self) -> None:
@@ -68,9 +81,8 @@ class FinalAnswerParsingTest(unittest.TestCase):
             f"2026-03-20 {idx:02d}:00:00 {30.0 + idx / 1000:.4f}" for idx in range(24)
         )
         text = f"<think>x</think><answer>\n{timestamped_lines}\n</answer>"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "invalid_answer_shape:lines=24,expected=96")
 
     def test_rejects_invalid_timestamp_hour_in_answer_block(self) -> None:
@@ -82,9 +94,8 @@ class FinalAnswerParsingTest(unittest.TestCase):
                 hour = 24
             timestamped_lines.append(f"2026-03-20 {hour:02d}:00:00 {30.0 + idx / 1000:.4f}")
         text = f"<think>x</think><answer>\n{chr(10).join(timestamped_lines)}\n</answer>"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "invalid_answer_shape:values=95,expected=96")
         self.assertEqual(len(extract_values_from_time_series_string(text)), 95)
 
@@ -92,81 +103,142 @@ class FinalAnswerParsingTest(unittest.TestCase):
         agent = self._make_agent()
         agent.prediction_results = None
         text = f"I will output the final forecast candidate.\n{self._numeric_answer_lines(96)}\n<|im_end|>"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "missing_answer_block")
 
     def test_rejects_missing_close_tag_without_runtime_recovery(self) -> None:
         agent = self._make_agent()
         text = f"<think>x</think><answer>\n{self._numeric_answer_lines(96)}"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "missing_answer_close_tag")
         self.assertEqual(agent.final_answer_parse_mode, "rejected_missing_answer_close_tag")
+
+    def test_recovers_missing_close_tag_during_refinement_runtime(self) -> None:
+        agent = self._make_agent()
+        text = f"<think>x</think><answer>\n{self._numeric_answer_lines(96)}"
+        answer = agent._extract_final_answer(text, allow_recovery=True)
+        self.assertIsNotNone(answer)
+        self.assertIsNone(agent.final_answer_reject_reason)
+        self.assertEqual(agent.final_answer_parse_mode, "recovered_missing_answer_close_tag_answer_block")
 
     def test_rejects_overlong_answer_block_instead_of_canonicalizing(self) -> None:
         agent = self._make_agent()
         text = f"<think>x</think><answer>\n{self._numeric_answer_lines(97)}\n</answer>"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "invalid_answer_shape:lines=97,expected=96")
         self.assertEqual(agent.final_answer_parse_mode, "rejected_invalid_answer_shape:lines=97,expected=96")
+
+    def test_recovers_overlong_answer_block_during_refinement_runtime(self) -> None:
+        agent = self._make_agent()
+        text = f"<think>x</think><answer>\n{self._numeric_answer_lines(97)}\n</answer>"
+        answer = agent._extract_final_answer(text, allow_recovery=True)
+        self.assertIsNotNone(answer)
+        self.assertIsNone(agent.final_answer_reject_reason)
+        self.assertEqual(agent.final_answer_parse_mode, "recovered_invalid_answer_shape:lines=97,expected=96_answer_block")
+
+    def test_turn3_horizon_clamp_closes_after_exact_timestamp_horizon(self) -> None:
+        text = f"<think>x</think><answer>\n{self._timestamp_answer_lines(96)}"
+        clamped_text, clamp_info = clamp_turn3_answer_horizon(text, 96)
+
+        self.assertTrue(clamp_info["applied"])
+        self.assertEqual(clamp_info["discarded_line_count"], 0)
+        self.assertIn("</answer>", clamped_text)
+
+        answer_text, parse_mode, reject_reason = parse_final_answer_protocol(clamped_text, 96, allow_recovery=False)
+        self.assertIsNotNone(answer_text)
+        self.assertEqual(parse_mode, "strict_protocol")
+        self.assertIsNone(reject_reason)
+
+    def test_turn3_horizon_clamp_discards_extra_timestamp_rows(self) -> None:
+        text = f"<think>x</think><answer>\n{self._timestamp_answer_lines(100)}"
+        clamped_text, clamp_info = clamp_turn3_answer_horizon(text, 96)
+
+        self.assertTrue(clamp_info["applied"])
+        self.assertEqual(clamp_info["discarded_line_count"], 4)
+
+        answer_text, _parse_mode, reject_reason = parse_final_answer_protocol(clamped_text, 96, allow_recovery=False)
+        self.assertIsNotNone(answer_text)
+        self.assertIsNone(reject_reason)
+        self.assertEqual(len(answer_text.splitlines()), 96)
+
+    def test_turn3_horizon_clamp_does_not_repair_short_answers(self) -> None:
+        text = f"<think>x</think><answer>\n{self._timestamp_answer_lines(95)}"
+        clamped_text, clamp_info = clamp_turn3_answer_horizon(text, 96)
+
+        self.assertFalse(clamp_info["applied"])
+        self.assertEqual(clamped_text, text)
 
     def test_rejects_answer_only_protocol_during_refinement(self) -> None:
         agent = self._make_agent()
         text = f"<answer>\n{self._numeric_answer_lines(96)}\n</answer>"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "missing_think_block")
         self.assertEqual(agent.final_answer_parse_mode, "rejected_missing_think_block")
 
     def test_rejects_plain_numeric_forecast_block_during_refinement(self) -> None:
         agent = self._make_agent()
         text = f"{self._numeric_answer_lines(96)}\n<|im_end|>"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "missing_answer_block")
         self.assertEqual(agent.final_answer_parse_mode, "rejected_missing_answer_block")
 
     def test_tool_call_response_is_not_treated_as_final_answer_failure(self) -> None:
         agent = self._make_agent()
         text = '<tool_call>\n{"name":"predict_time_series","arguments":{"model_name":"chronos2"}}\n</tool_call>'
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "missing_answer_block")
         self.assertEqual(agent.final_answer_parse_mode, "rejected_missing_answer_block")
 
     def test_rejects_non_forecast_text(self) -> None:
         agent = self._make_agent()
-        answer, penalty = agent._extract_final_answer("I think chronos2 is a good fit for this window.")
+        answer = agent._extract_final_answer("I think chronos2 is a good fit for this window.")
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "missing_answer_block")
 
     def test_accepts_answer_block_before_prediction_but_workflow_rejects_later(self) -> None:
         agent = self._make_agent()
         agent.prediction_results = None
         text = f"<think>x</think><answer>\n{self._numeric_answer_lines(96)}\n</answer>"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNotNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertIsNone(agent.final_answer_reject_reason)
         self.assertEqual(agent.final_answer_parse_mode, "strict_protocol")
 
     def test_rejects_extra_text_outside_tags(self) -> None:
         agent = self._make_agent()
         text = f"<think>x</think><answer>\n{self._numeric_answer_lines(96)}\n</answer>\nextra"
-        answer, penalty = agent._extract_final_answer(text)
+        answer = agent._extract_final_answer(text)
         self.assertIsNone(answer)
-        self.assertEqual(penalty, 0.0)
         self.assertEqual(agent.final_answer_reject_reason, "extra_text_outside_tags")
         self.assertEqual(agent.final_answer_parse_mode, "rejected_extra_text_outside_tags")
+
+    def test_refinement_decision_materialization_prefers_timestamped_prediction_results(self) -> None:
+        agent = self._make_agent()
+        agent.prediction_results = self._timestamp_answer_lines(96)
+        agent.prediction_tool_output = "predictions: 30.0000, 30.0010, 30.0020"
+        agent._current_turn_stage = lambda: "refinement"
+        agent._canonical_answer_from_prediction_text = TimeSeriesForecastAgentFlow._canonical_answer_from_prediction_text.__get__(
+            agent, TimeSeriesForecastAgentFlow
+        )
+        agent._refinement_candidate_prediction_text_map = (
+            TimeSeriesForecastAgentFlow._refinement_candidate_prediction_text_map.__get__(
+                agent, TimeSeriesForecastAgentFlow
+            )
+        )
+        text = "<think>keep</think><answer>\ndecision=keep_baseline\n</answer>"
+
+        answer = agent._extract_final_answer(text)
+
+        self.assertIsNotNone(answer)
+        self.assertEqual(agent.final_answer_parse_mode, "refinement_decision_protocol")
+        self.assertIn("2026-03-01 00:00:00 30.0000", answer)
+        self.assertEqual(answer.count("\n"), 100)
 
     def test_final_turn_sampling_params_add_stop_and_cap_tokens(self) -> None:
         agent = self._make_agent()

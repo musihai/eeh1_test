@@ -13,6 +13,7 @@ from recipe.time_series_forecast.reward_metrics import (
     PREDICTION_ERROR_SCORE_WEIGHT,
     SEASON_COMPONENT_SCORE_WEIGHT,
     TREND_COMPONENT_SCORE_WEIGHT,
+    compute_length_penalty,
 )
 from recipe.time_series_forecast.time_series_io import compact_historical_data_for_prompt
 from recipe.time_series_forecast.utils import compact_prediction_tool_output_from_string, format_prediction_tool_output
@@ -30,11 +31,24 @@ class CompactProtocolTests(unittest.TestCase):
             prediction_results=None,
             available_feature_tools=["extract_basic_statistics"],
             completed_feature_tools=["extract_basic_statistics"],
+            routing_feature_payload={
+                "extract_basic_statistics": {
+                    "acf1": 0.91,
+                    "acf_seasonal": 0.12,
+                    "cusum_max": 42.0,
+                }
+            },
             turn_stage="routing",
         )
-        self.assertIn("### Analysis Summary", prompt)
-        self.assertIn("### Historical Data", prompt)
-        self.assertIn("Median: 2.0000", prompt)
+        self.assertIn("### Routing Evidence Card", prompt)
+        self.assertIn("observed_tools=[extract_basic_statistics]", prompt)
+        self.assertIn("expert_support_signals:", prompt)
+        self.assertIn("- arima=[seasonality_visible]", prompt)
+        self.assertIn("- patchtst=[seasonality_visible]", prompt)
+        self.assertIn("- itransformer=[none]", prompt)
+        self.assertIn("- chronos2=[none]", prompt)
+        self.assertNotIn("### Historical Data", prompt)
+        self.assertNotIn("Median: 2.0000", prompt)
         self.assertNotIn("already present earlier in this conversation", prompt)
 
     def test_turn_two_prompt_uses_paper_routing_instruction(self) -> None:
@@ -48,13 +62,20 @@ class CompactProtocolTests(unittest.TestCase):
             prediction_results=None,
             available_feature_tools=["extract_basic_statistics"],
             completed_feature_tools=["extract_basic_statistics"],
+            routing_feature_payload={
+                "extract_basic_statistics": {
+                    "acf1": 0.91,
+                    "acf_seasonal": 0.12,
+                    "cusum_max": 42.0,
+                }
+            },
             turn_stage="routing",
         )
-        self.assertIn("Forecasting expert guidance", prompt)
-        self.assertIn("local temporal patterns with long-range dependencies", prompt)
-        self.assertIn("cross-channel dependencies or broader structural interactions", prompt)
-        self.assertIn("linear trends and stable seasonality", prompt)
-        self.assertIn("irregular, noisy, or zero-shot scenarios", prompt)
+        self.assertIn("### Routing Decision Guide", prompt)
+        self.assertIn("stable linear trend or seasonality", prompt)
+        self.assertIn("repeatable local motifs", prompt)
+        self.assertIn("broader structural drift", prompt)
+        self.assertIn("irregular, noisy, weakly structured, or zero-shot windows", prompt)
 
     def test_turn_three_prompt_omits_duplicate_predictions(self) -> None:
         prompt = build_runtime_user_prompt(
@@ -70,21 +91,24 @@ class CompactProtocolTests(unittest.TestCase):
             completed_feature_tools=["extract_basic_statistics"],
             turn_stage="refinement",
         )
+        self.assertIn("### Refinement Evidence Card", prompt)
+        self.assertIn("keep_support=[none]", prompt)
+        self.assertIn("support_signals=[evidence_consistent]", prompt)
+        self.assertIn("candidate_adjustments=[none]", prompt)
         self.assertIn("### Analysis Summary", prompt)
         self.assertIn("### Recent Historical Window", prompt)
         self.assertIn("### Prediction Tool Output", prompt)
         self.assertIn("2017-05-02 00:00:00 4.0000", prompt)
-        self.assertIn("canonical base forecast produced by the selected model", prompt)
-        self.assertIn("You must choose exactly one action", prompt)
-        self.assertIn("KEEP: copy the 96 forecast rows", prompt)
-        self.assertIn("LOCAL_REFINE", prompt)
-        self.assertIn("If unsure, choose KEEP", prompt)
+        self.assertIn("base forecast from the selected model", prompt)
+        self.assertIn("Make the refinement decision from the Refinement Evidence Card first", prompt)
+        self.assertIn("decision_options=[keep_baseline]", prompt)
+        self.assertIn("`keep_baseline` is always allowed", prompt)
+        self.assertIn("Only choose a local edit when that exact edit's `support=[...]` line clearly justifies", prompt)
         self.assertIn("No tool schema is available in this turn", prompt)
-        self.assertIn("Output ONLY one <think>...</think> block followed immediately by one <answer>...</answer> block", prompt)
-        self.assertIn("must use `YYYY-MM-DD HH:MM:SS value`", prompt)
-        self.assertIn("Never synthesize timestamps such as `24:00:00` or `25:00:00`", prompt)
-        self.assertIn("exact row-for-row copy of \"Prediction Tool Output\"", prompt)
-        self.assertIn("Your reply must start with <think>", prompt)
+        self.assertIn("exactly one `<think>...</think>` block followed immediately by one `<answer>...</answer>` block", prompt)
+        self.assertIn("must contain exactly one non-empty line in the form `decision=<name>`", prompt)
+        self.assertNotIn("Reuse the provided timestamps and row order exactly", prompt)
+        self.assertIn("Stop immediately after `</answer>`", prompt)
         self.assertNotIn("already present earlier in this conversation", prompt)
         self.assertNotIn("[Brief reflection", prompt)
         self.assertNotIn("[Final prediction", prompt)
@@ -289,10 +313,11 @@ class CompactProtocolTests(unittest.TestCase):
             ground_truth=ground_truth,
             allow_recovery=True,
         )
-        self.assertEqual(result["format_failure_reason"], "ok")
+        self.assertEqual(result["format_failure_reason"], "missing_think_block")
         self.assertEqual(result["format_parse_mode"], "recovered_missing_think_block_answer_block")
         self.assertTrue(result["was_recovered"])
-        self.assertAlmostEqual(result["score"], 0.7, places=6)
+        self.assertAlmostEqual(result["recovery_penalty"], 0.05, places=6)
+        self.assertAlmostEqual(result["score"], 0.65, places=6)
 
     def test_reward_default_strict_mode_rejects_answer_only_protocol(self) -> None:
         ground_truth = (
@@ -320,12 +345,13 @@ class CompactProtocolTests(unittest.TestCase):
             ground_truth=ground_truth,
             allow_recovery=True,
         )
-        self.assertEqual(result["format_failure_reason"], "ok")
+        self.assertEqual(result["format_failure_reason"], "missing_answer_close_tag")
         self.assertEqual(result["format_parse_mode"], "recovered_missing_answer_close_tag_answer_block")
         self.assertTrue(result["was_recovered"])
         self.assertTrue(result["missing_answer_close_tag"])
         self.assertTrue(result["was_clipped"])
-        self.assertAlmostEqual(result["score"], 0.7, places=6)
+        self.assertAlmostEqual(result["recovery_penalty"], 0.03, places=6)
+        self.assertAlmostEqual(result["score"], 0.67, places=6)
 
     def test_reward_recovers_overlong_answer_by_canonicalizing_to_ground_truth_length(self) -> None:
         ground_truth = (
@@ -340,9 +366,112 @@ class CompactProtocolTests(unittest.TestCase):
             ground_truth=ground_truth,
             allow_recovery=True,
         )
-        self.assertEqual(result["format_failure_reason"], "ok")
+        self.assertEqual(result["format_failure_reason"], "missing_think_block")
         self.assertEqual(result["format_parse_mode"], "recovered_missing_think_block_answer_block")
         self.assertTrue(result["was_recovered"])
+        self.assertAlmostEqual(result["recovery_penalty"], 0.05, places=6)
+        self.assertAlmostEqual(result["score"], 0.65, places=6)
+
+    def test_reward_strictly_scores_clamped_turn3_horizon_answers(self) -> None:
+        ground_truth = (
+            "2017-05-02 00:00:00 12.3450\n"
+            "2017-05-02 01:00:00 12.6780\n"
+            "2017-05-02 02:00:00 13.0010"
+        )
+        solution = (
+            "<think>x</think><answer>\n"
+            "2017-05-02 00:00:00 12.3450\n"
+            "2017-05-02 01:00:00 12.6780\n"
+            "2017-05-02 02:00:00 13.0010\n"
+            "2017-05-02 03:00:00 14.0000\n"
+            "2017-05-02 04:00:00 15.0000\n"
+        )
+        result = compute_score(
+            data_source="time_series",
+            solution_str=solution,
+            ground_truth=ground_truth,
+            allow_recovery=False,
+            extra_info={"validate": True},
+        )
+
+        self.assertTrue(result["turn3_horizon_clamped"])
+        self.assertEqual(result["turn3_horizon_clamp_reason"], "truncate_after_expected_timestamp_rows")
+        self.assertEqual(result["turn3_horizon_clamp_discarded_lines"], 2)
+        self.assertEqual(result["turn3_horizon_clamp_valid_prefix_lines"], 5)
+        self.assertEqual(result["turn3_horizon_clamp_raw_answer_lines"], 5)
+        self.assertEqual(result["answer_line_count"], 3)
+        self.assertEqual(result["raw_response_answer_line_count"], 5)
+        self.assertEqual(result["expected_answer_line_count"], 3)
+        self.assertEqual(result["format_parse_mode"], "strict_protocol")
+        self.assertAlmostEqual(result["raw_overrun_penalty"], compute_length_penalty(5, 3), places=6)
+        self.assertAlmostEqual(result["score"], 0.7 - compute_length_penalty(5, 3), places=6)
+
+    def test_reward_clamps_etth1_turn3_horizon_answers(self) -> None:
+        ground_truth = (
+            "2017-05-02 00:00:00 12.3450\n"
+            "2017-05-02 01:00:00 12.6780\n"
+            "2017-05-02 02:00:00 13.0010"
+        )
+        solution = (
+            "<think>x</think><answer>\n"
+            "2017-05-02 00:00:00 12.3450\n"
+            "2017-05-02 01:00:00 12.6780\n"
+            "2017-05-02 02:00:00 13.0010\n"
+            "2017-05-02 03:00:00 14.0000\n"
+            "2017-05-02 04:00:00 15.0000\n"
+        )
+        result = compute_score(
+            data_source="ETTh1",
+            solution_str=solution,
+            ground_truth=ground_truth,
+            allow_recovery=False,
+            extra_info={"validate": True},
+        )
+
+        self.assertTrue(result["turn3_horizon_clamped"])
+        self.assertEqual(result["turn3_horizon_clamp_reason"], "truncate_after_expected_timestamp_rows")
+        self.assertEqual(result["turn3_horizon_clamp_discarded_lines"], 2)
+        self.assertEqual(result["turn3_horizon_clamp_valid_prefix_lines"], 5)
+        self.assertEqual(result["turn3_horizon_clamp_raw_answer_lines"], 5)
+        self.assertEqual(result["answer_line_count"], 3)
+        self.assertEqual(result["raw_response_answer_line_count"], 5)
+        self.assertEqual(result["expected_answer_line_count"], 3)
+        self.assertEqual(result["format_parse_mode"], "strict_protocol")
+        self.assertAlmostEqual(result["raw_overrun_penalty"], compute_length_penalty(5, 3), places=6)
+        self.assertAlmostEqual(result["score"], 0.7 - compute_length_penalty(5, 3), places=6)
+
+    def test_reward_uses_materialized_solution_from_reward_extra_info(self) -> None:
+        ground_truth = (
+            "2017-05-02 00:00:00 12.3450\n"
+            "2017-05-02 01:00:00 12.6780\n"
+            "2017-05-02 02:00:00 13.0010"
+        )
+        raw_solution = "<think>x</think><answer>\ndecision=keep_baseline\n</answer>"
+        materialized_solution = (
+            "<think>x</think><answer>\n"
+            "2017-05-02 00:00:00 12.3450\n"
+            "2017-05-02 01:00:00 12.6780\n"
+            "2017-05-02 02:00:00 13.0010\n"
+            "</answer>"
+        )
+
+        result = compute_score(
+            data_source="time_series",
+            solution_str=raw_solution,
+            ground_truth=ground_truth,
+            allow_recovery=False,
+            extra_info={
+                "validate": True,
+                "reward_extra_info": {
+                    "materialized_solution_str": materialized_solution,
+                },
+            },
+        )
+
+        self.assertTrue(result["used_materialized_solution"])
+        self.assertEqual(result["format_parse_mode"], "strict_protocol")
+        self.assertEqual(result["answer_line_count"], 3)
+        self.assertEqual(result["raw_response_answer_line_count"], 1)
         self.assertAlmostEqual(result["score"], 0.7, places=6)
 
     def test_reward_passthroughs_runtime_tool_debug_fields(self) -> None:

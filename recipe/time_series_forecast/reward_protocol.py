@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import os
 import re
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from verl.utils.chain_debug import append_chain_debug, short_text
 
@@ -200,6 +200,12 @@ def recover_protocol_answer(
             continue
         seen_sources.add(normalized_source)
 
+        lines = normalized_nonempty_lines(normalized_source)
+        if len(lines) >= expected_len and _infer_answer_line_format(lines) == "timestamp_value":
+            canonical_answer = "\n".join(lines[:expected_len])
+            if looks_like_forecast_answer(canonical_answer, expected_len):
+                return canonical_answer, f"recovered_{reject_reason}_{source_name}"
+
         values = extract_values_from_time_series_string(normalized_source)
         if len(values) < expected_len:
             continue
@@ -230,6 +236,93 @@ def parse_final_answer_protocol(
             return recovered_answer, parse_mode, reject_reason
 
     return None, f"rejected_{reject_reason}", reject_reason
+
+
+def _leading_timestamp_value_lines(text: str) -> List[str]:
+    lines: List[str] = []
+    for line in normalized_nonempty_lines(text):
+        if not _is_timestamp_value_line(line):
+            break
+        lines.append(line)
+    return lines
+
+
+def clamp_turn3_answer_horizon(
+    solution_str: Optional[str],
+    expected_len: int,
+) -> Tuple[Optional[str], dict[str, Any]]:
+    info: dict[str, Any] = {
+        "applied": False,
+        "reason": "",
+        "raw_answer_line_count": 0,
+        "valid_prefix_line_count": 0,
+        "discarded_line_count": 0,
+    }
+    if solution_str is None:
+        info["reason"] = "empty_solution"
+        return None, info
+    if expected_len <= 0:
+        info["reason"] = "non_positive_expected_len"
+        return str(solution_str), info
+
+    raw_text = str(solution_str)
+    if "<tool_call>" in raw_text or "</tool_call>" in raw_text:
+        info["reason"] = "tool_call_payload"
+        return raw_text, info
+
+    prefix_match = re.fullmatch(
+        r"\s*<think>(.*?)</think>\s*<answer>(.*)",
+        raw_text,
+        re.DOTALL,
+    )
+    if prefix_match is None:
+        info["reason"] = "missing_think_answer_prefix"
+        return raw_text, info
+
+    think_text = prefix_match.group(1).strip()
+    answer_with_tail = prefix_match.group(2)
+    answer_body = answer_with_tail
+    trailing_after_close = ""
+    if "</answer>" in answer_with_tail:
+        answer_body, trailing_after_close = answer_with_tail.split("</answer>", 1)
+    trailing_after_close = trailing_after_close.strip()
+    if trailing_after_close not in {"", "<|im_end|>"}:
+        info["reason"] = "unexpected_trailing_text"
+        return raw_text, info
+
+    raw_answer_lines = normalized_nonempty_lines(answer_body)
+    info["raw_answer_line_count"] = int(len(raw_answer_lines))
+    valid_prefix_lines = _leading_timestamp_value_lines(answer_body)
+    info["valid_prefix_line_count"] = int(len(valid_prefix_lines))
+
+    if len(valid_prefix_lines) < expected_len:
+        info["reason"] = "insufficient_valid_timestamp_prefix"
+        return raw_text, info
+
+    exact_lines = valid_prefix_lines[:expected_len]
+    already_exact = (
+        len(valid_prefix_lines) == expected_len
+        and len(raw_answer_lines) == expected_len
+        and "</answer>" in raw_text
+        and raw_text.strip().endswith("</answer>")
+    )
+    if already_exact:
+        info["reason"] = "already_exact"
+        return raw_text, info
+
+    rebuilt = (
+        f"<think>{think_text}</think>\n\n<answer>\n"
+        + "\n".join(exact_lines)
+        + "\n</answer>"
+    )
+    info.update(
+        {
+            "applied": True,
+            "reason": "truncate_after_expected_timestamp_rows",
+            "discarded_line_count": int(max(len(valid_prefix_lines) - expected_len, 0)),
+        }
+    )
+    return rebuilt, info
 
 
 def extract_tail_lines(text: Optional[str], max_lines: int = 10) -> List[str]:
@@ -382,6 +475,7 @@ def extract_ground_truth_values(text: str) -> List[float]:
 
 __all__ = [
     "canonicalize_forecast_values",
+    "clamp_turn3_answer_horizon",
     "count_numeric_only_lines",
     "detect_suffix_repetition",
     "extract_answer",

@@ -167,6 +167,23 @@ def compute_length_penalty(pred_len: int, gt_len: int) -> float:
     return float(penalty)
 
 
+def compute_recovery_penalty(reject_reason: str, pred_len: int, gt_len: int) -> float:
+    reason = str(reject_reason or "").strip()
+    if not reason:
+        return 0.0
+    if reason == "missing_answer_close_tag":
+        return 0.03
+    if reason in {"missing_think_block", "missing_think_open_tag", "missing_think_close_tag"}:
+        return 0.05
+    if reason in {"missing_answer_block", "missing_answer_open_tag", "extra_text_outside_tags"}:
+        return 0.06
+    if reason.startswith("invalid_answer_shape"):
+        if gt_len > 0 and pred_len > 0:
+            return max(0.06, compute_length_penalty(pred_len, gt_len))
+        return 0.06
+    return 0.05
+
+
 def compute_mse_score(solution_str: str, ground_truth: str) -> float:
     gt_values = extract_ground_truth_values(ground_truth)
     pred_values = extract_values_from_time_series_string(solution_str)
@@ -282,6 +299,7 @@ __all__ = [
     "compute_change_point_score",
     "compute_format_score",
     "compute_length_penalty",
+    "compute_recovery_penalty",
     "compute_length_score",
     "compute_mse_score",
     "compute_season_trend_score",

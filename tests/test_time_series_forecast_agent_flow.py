@@ -10,6 +10,7 @@ from arft.agent_flow.agent_flow import (
     AgentFlowWorkerBase,
     _InternalAgentFlowStep,
 )
+from recipe.time_series_forecast.reward import compute_score
 from recipe.time_series_forecast.time_series_forecast_agent_flow import TimeSeriesForecastAgentFlow
 
 
@@ -206,14 +207,16 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
 
         prompt = flow._build_user_prompt()
 
-        self.assertIn("### Final Allowed Forecast Timestamp: 2024-01-02 01:00:00", prompt)
+        self.assertIn("### Refinement Evidence Card", prompt)
+        self.assertIn("support_signals=[", prompt)
         self.assertIn("### Prediction Tool Output", prompt)
         self.assertIn("2024-01-02 00:00:00 3.1000", prompt)
         self.assertIn("2024-01-02 01:00:00 3.2000", prompt)
         self.assertIn("### Selected Forecast Model: arima", prompt)
         self.assertNotIn("Forecast Values:", prompt)
-        self.assertIn("must use `YYYY-MM-DD HH:MM:SS value`", prompt)
-        self.assertIn("Do NOT emit any later timestamp", prompt)
+        self.assertIn("decision_options=[keep_baseline]", prompt)
+        self.assertIn("must contain exactly one non-empty line in the form `decision=<name>`", prompt)
+        self.assertIn("Stop immediately after `</answer>`", prompt)
 
     def test_current_turn_stage_moves_to_routing_after_any_diagnostic_analysis(self) -> None:
         flow = self._make_flow()
@@ -230,6 +233,36 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(params["temperature"], 1.0)
         self.assertEqual(params["top_p"], 0.95)
         self.assertIn("</answer>", params["stop"])
+
+    def test_apply_turn3_horizon_clamp_tracks_discarded_rows(self) -> None:
+        flow = self._make_flow()
+        timestamp_lines = "\n".join(
+            f"2026-03-{1 + (idx // 24):02d} {idx % 24:02d}:00:00 {30.0 + idx / 1000:.4f}"
+            for idx in range(100)
+        )
+        response_text = f"<think>x</think><answer>\n{timestamp_lines}"
+
+        clamped = flow._apply_turn3_horizon_clamp(response_text, turn_stage="refinement")
+
+        self.assertTrue(flow.turn3_horizon_clamped)
+        self.assertEqual(flow.turn3_horizon_clamp_discarded_lines, 4)
+        self.assertEqual(flow.turn3_horizon_clamp_valid_prefix_lines, 100)
+        self.assertEqual(flow.turn3_horizon_clamp_raw_answer_lines, 100)
+        self.assertIn("</answer>", clamped)
+
+    def test_apply_turn3_horizon_clamp_is_noop_for_short_answers(self) -> None:
+        flow = self._make_flow()
+        timestamp_lines = "\n".join(
+            f"2026-03-{1 + (idx // 24):02d} {idx % 24:02d}:00:00 {30.0 + idx / 1000:.4f}"
+            for idx in range(95)
+        )
+        response_text = f"<think>x</think><answer>\n{timestamp_lines}"
+
+        clamped = flow._apply_turn3_horizon_clamp(response_text, turn_stage="refinement")
+
+        self.assertFalse(flow.turn3_horizon_clamped)
+        self.assertEqual(flow.turn3_horizon_clamp_discarded_lines, 0)
+        self.assertEqual(clamped, response_text)
 
     def test_append_turn_debug_records_sample_uid(self) -> None:
         flow = self._make_flow()
@@ -263,6 +296,37 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["required_feature_tool_count"], 1)
         self.assertEqual(payload["required_feature_tool_signature"], "extract_basic_statistics")
         self.assertEqual(payload["final_answer_step_index"], 3)
+
+    def test_final_reward_uses_same_strict_protocol_as_validation(self) -> None:
+        flow = self._make_flow()
+        ground_truth = "2024-01-02 00:00:00 3.1000\n2024-01-02 01:00:00 3.2000"
+        malformed_final = (
+            "<think>\n"
+            "I keep the selected forecast because it already matches the diagnostics.\n"
+            "</think>\n\n"
+            "<answer>\n"
+            "2024-01-02 00:00:00 3.1000\n"
+            "2024-01-02 01:00:00 3.2000"
+        )
+
+        recovered = compute_score(
+            data_source="time_series",
+            solution_str=malformed_final,
+            ground_truth=ground_truth,
+            allow_recovery=True,
+        )
+        strict = compute_score(
+            data_source="time_series",
+            solution_str=malformed_final,
+            ground_truth=ground_truth,
+            allow_recovery=False,
+        )
+
+        self.assertGreater(float(recovered["score"]), -1.0)
+        self.assertGreater(float(strict["score"]), -1.0)
+        self.assertTrue(strict["turn3_horizon_clamped"])
+        self.assertEqual(strict["turn3_horizon_clamp_discarded_lines"], 0)
+        self.assertEqual(flow._compute_final_reward(malformed_final, ground_truth), float(strict["score"]))
 
     def test_agent_flow_worker_postprocess_preserves_explicit_group_uid(self) -> None:
         worker = AgentFlowWorkerBase.__new__(AgentFlowWorkerBase)

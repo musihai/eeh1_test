@@ -35,6 +35,12 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 - 当前仓库不再内置一个保证存在的 RL warm start checkpoint。
 - 运行 RL 前，必须显式提供 `RL_MODEL_PATH`，指向一个真实存在的 HuggingFace 格式目录，例如：
   `artifacts/checkpoints/sft/<your_sft_run>/global_step_xx/huggingface`
+- 正式 step-wise SFT 只接受这一组 metadata 约束：
+  `sft_stage_mode=full`、`turn3_target_mode=paper_strict`、`routing_label_source=reference_teacher`
+- `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_refinement_decision_*`
+  和
+  `artifacts/checkpoints/sft/qwen3-1.7b-etth1-refinement-decision-*`
+  都是实验分支，不作为正式 RL warm start 输入
 
 ## 3. 一次性准备
 
@@ -53,7 +59,7 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 ### 4.1 构建 RL base dataset
 
 ```bash
-python recipe/time_series_forecast/build_etth1_rl_dataset.py \
+python -m recipe.time_series_forecast.build_etth1_rl_dataset \
   --output-dir dataset/ett_rl_etth1_paper_same2
 ```
 
@@ -70,7 +76,7 @@ python recipe/time_series_forecast/build_etth1_rl_dataset.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=3 \
-python recipe/time_series_forecast/build_etth1_high_quality_sft.py \
+python -m recipe.time_series_forecast.build_etth1_high_quality_sft \
   --train-jsonl dataset/ett_rl_etth1_paper_same2/train.jsonl \
   --val-jsonl dataset/ett_rl_etth1_paper_same2/val.jsonl \
   --test-jsonl dataset/ett_rl_etth1_paper_same2/test.jsonl \
@@ -89,10 +95,11 @@ python recipe/time_series_forecast/build_etth1_high_quality_sft.py \
 ### 4.3 构建 step-wise SFT dataset
 
 ```bash
-python recipe/time_series_forecast/build_etth1_sft_dataset.py \
+python -m recipe.time_series_forecast.build_etth1_sft_dataset \
   --train-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/train_curated.jsonl \
   --val-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/val_curated.jsonl \
   --test-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/test_curated.jsonl \
+  --routing-label-source reference_teacher \
   --output-dir dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise
 ```
 
@@ -101,10 +108,40 @@ python recipe/time_series_forecast/build_etth1_sft_dataset.py \
 - `train.parquet / val.parquet / test.parquet`
 - `metadata.json`
 
+正式链路要求：
+
+- `--routing-label-source` 必须是 `reference_teacher`
+- 产物 `metadata.json` 必须满足：
+  `sft_stage_mode=full`、`turn3_target_mode=paper_strict`、`routing_label_source=reference_teacher`
+
+建议构建后立即检查：
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+meta = json.loads(
+    Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise/metadata.json").read_text()
+)
+for key in ("sft_stage_mode", "turn3_target_mode", "routing_label_source"):
+    print(f"{key}={meta.get(key)}")
+PY
+```
+
+预期输出：
+
+- `sft_stage_mode=full`
+- `turn3_target_mode=paper_strict`
+- `routing_label_source=reference_teacher`
+
+如果这个目录是旧版本构建出来的，重新执行 4.3 后再检查一次 `metadata.json`；
+只要其中还出现 `routing_label_source=heuristic`，就不要继续拿它训 formal SFT / RL。
+
 ### 4.4 构建 curriculum RL dataset
 
 ```bash
-python recipe/time_series_forecast/build_etth1_rl_dataset.py \
+python -m recipe.time_series_forecast.build_etth1_rl_dataset \
   --output-dir dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2 \
   --train-teacher-metadata-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/train_teacher_eval.jsonl \
   --val-teacher-metadata-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/val_teacher_eval.jsonl \
@@ -205,7 +242,8 @@ RUN_TAG=$(date +%Y%m%d_%H%M%S)
 SFT_RUN_NAME=qwen3-1.7b-etth1-sft-paper-$RUN_TAG
 RL_RUN_NAME=etth1_ot_qwen3_1_7b_rl_paper_$RUN_TAG
 
-SFT_SAVE_DIR=$PROJECT_DIR/artifacts/checkpoints/sft/$SFT_RUN_NAME
+SFT_SMOKE_SAVE_DIR=$PROJECT_DIR/artifacts/checkpoints/sft/${SFT_RUN_NAME}_smoke
+SFT_FORMAL_SAVE_DIR=$PROJECT_DIR/artifacts/checkpoints/sft/$SFT_RUN_NAME
 RL_TRAINER_LOCAL_DIR=$PROJECT_DIR/artifacts/checkpoints/rl/$RL_RUN_NAME
 SWANLAB_LOG_DIR=$PROJECT_DIR/swanlog/$RUN_TAG
 ```
@@ -213,11 +251,18 @@ SWANLAB_LOG_DIR=$PROJECT_DIR/swanlog/$RUN_TAG
 说明：
 
 - `BASE_MODEL_PATH`：Qwen3-1.7B 基座模型
-- `SFT_DATASET_DIR`：step-wise SFT parquet 目录
+- `SFT_DATASET_DIR`：正式 step-wise SFT parquet 目录
+  即 4.3 重新构建后的
+  `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise`
 - `RL_CURRICULUM_DATASET_DIR`：curriculum RL jsonl 目录
-- `SFT_SAVE_DIR`：SFT 输出目录
+- `SFT_SMOKE_SAVE_DIR`：SFT smoke 输出目录
+- `SFT_FORMAL_SAVE_DIR`：正式 SFT 输出目录
 - `RL_TRAINER_LOCAL_DIR`：RL 输出目录
 - `SWANLAB_LOG_DIR`：当前实验的 SwanLab 本地日志目录
+
+不要把 `SFT_DATASET_DIR` 指到任何
+`dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_refinement_decision_*`
+目录；这些是实验型数据集，不是正式链路输入。
 
 ### 6.3 训练前只打印命令
 
@@ -266,7 +311,7 @@ PROFILE_PATH=$PROFILE_PATH \
 RUN_MODE=smoke \
 SFT_MODEL_PATH=$BASE_MODEL_PATH \
 SFT_DATASET_DIR=$SFT_DATASET_DIR \
-SFT_SAVE_DIR=$SFT_SAVE_DIR \
+SFT_SAVE_DIR=$SFT_SMOKE_SAVE_DIR \
 SFT_EXPERIMENT_NAME=${SFT_RUN_NAME}_smoke \
 SFT_LOGGER='["console","swanlab"]' \
 SWANLAB_LOG_DIR=$SWANLAB_LOG_DIR \
@@ -279,12 +324,19 @@ bash examples/time_series_forecast/run_qwen3-1.7B_sft.sh
 PROFILE_PATH=$PROFILE_PATH \
 SFT_MODEL_PATH=$BASE_MODEL_PATH \
 SFT_DATASET_DIR=$SFT_DATASET_DIR \
-SFT_SAVE_DIR=$SFT_SAVE_DIR \
+SFT_SAVE_DIR=$SFT_FORMAL_SAVE_DIR \
 SFT_EXPERIMENT_NAME=$SFT_RUN_NAME \
 SFT_LOGGER='["console","swanlab"]' \
 SWANLAB_LOG_DIR=$SWANLAB_LOG_DIR \
 bash examples/time_series_forecast/run_qwen3-1.7B_sft.sh
 ```
+
+说明：
+
+- 不要让 smoke 和正式 SFT 共用同一个 `SFT_SAVE_DIR`
+- `verl` 的 SFT trainer 默认 `resume_mode=auto`，如果目录里已经有 `global_step_*`，正式训练会自动从 smoke checkpoint 继续
+- 如果你必须复用一个旧目录，请显式追加：
+  `trainer.resume_mode=disable`
 
 SFT 在 SwanLab 里建议重点看：
 
@@ -293,14 +345,12 @@ SFT 在 SwanLab 里建议重点看：
 - `train/grad_norm`
 - `train/lr`
 
-### 6.5 从 SFT 输出里取 RL warm start
+### 6.5 从 Formal SFT 输出里取 RL warm start
 
 SFT 完成后，执行：
 
 ```bash
-SFT_SAVE_DIR=/data/linyujie/Cast-R1-TS-main/Cast-R1-TS-main/artifacts/checkpoints/sft/qwen3-1.7b-etth1-sft-paper-20260326_231520 
-
-RL_MODEL_PATH=$(find "$SFT_SAVE_DIR" -maxdepth 2 -type d -path "*/global_step_*/huggingface" | sort -V | tail -1)
+RL_MODEL_PATH=$(find "$SFT_FORMAL_SAVE_DIR" -maxdepth 2 -type d -path "*/global_step_*/huggingface" | sort -V | tail -1)
 echo "$RL_MODEL_PATH"
 ```
 
@@ -308,6 +358,26 @@ echo "$RL_MODEL_PATH"
 
 - `RL_MODEL_PATH` 不能为空
 - `RL_MODEL_PATH` 必须指向真实存在的 `global_step_*/huggingface`
+- `RL_MODEL_PATH` 必须来自 6.4 这一步正式 SFT 的输出
+- 不要再使用任何实验型 checkpoint 作为 warm start，例如：
+  `qwen3-1.7b-etth1-refinement-decision-*`
+  `*keepok*`
+  `*fixgating*`
+  `*supportcard*`
+
+如果你想再确认一次 warm start 来源，可以检查：
+
+```bash
+python - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["RL_MODEL_PATH"])
+print(path)
+print("exists=", path.exists())
+print("is_hf_dir=", (path / "config.json").exists() and (path / "tokenizer_config.json").exists())
+PY
+```
 
 ### 6.6 跑 RL
 

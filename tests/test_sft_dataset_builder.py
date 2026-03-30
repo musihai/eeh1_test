@@ -6,10 +6,12 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
 import pandas as pd
 
 from recipe.time_series_forecast.build_etth1_sft_dataset import (
     DEFAULT_BALANCE_TRAIN_ROUTING_MODELS,
+    DEFAULT_ROUTING_LABEL_SOURCE,
     DEFAULT_SFT_STAGE_MODE,
     DEFAULT_TRAIN_LOCAL_REFINE_REFINEMENT_REPEAT_FACTOR,
     DEFAULT_TRAIN_TURN3_REBALANCE_MODE,
@@ -20,15 +22,18 @@ from recipe.time_series_forecast.build_etth1_sft_dataset import (
     TURN3_TARGET_MODE_ENGINEERING_REFINE,
     TURN3_TARGET_MODE_PAPER_STRICT,
     _build_turn3_target,
+    _summarize_paper_turn3_protocol,
     _resolve_prediction_text,
     _resolve_reference_teacher_model,
     _select_model_from_scores,
     _select_prediction_model_by_heuristic,
     convert_jsonl_to_sft_parquet,
+    filter_train_routing_records_by_confidence,
     parse_args,
     rebalance_refinement_stage_targets,
     rebalance_train_routing_model_records,
     rebalance_train_stage_records,
+    repeat_high_confidence_routing_rows,
     rebalance_train_turn3_targets,
     repeat_local_refine_refinement_rows,
     repeat_priority_validated_keep_refinement_rows,
@@ -40,17 +45,103 @@ from recipe.time_series_forecast.diagnostic_policy import (
     plan_diagnostic_tool_batches,
     select_feature_tool_names,
 )
+from recipe.time_series_forecast.refinement_support import (
+    build_refinement_candidate_prediction_text_map,
+    build_refinement_support_payload,
+    filter_refinement_candidates_for_model,
+)
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
 from recipe.time_series_forecast.utils import parse_time_series_string
 
 
 class TestETTh1SFTDatasetBuilder(unittest.TestCase):
+    def test_default_routing_label_source_uses_reference_teacher(self):
+        self.assertEqual(DEFAULT_ROUTING_LABEL_SOURCE, "reference_teacher")
+
+    def test_refinement_candidate_filter_applies_model_aware_gating(self):
+        base_prediction_text = "\n".join(
+            f"2026-03-01 {hour:02d}:00:00 {30.0 + hour / 1000:.4f}" for hour in range(24)
+        )
+        history_values = [30.0 + hour / 1000 for hour in range(24)]
+        base_values = [30.0 + hour / 1000 for hour in range(24)]
+        candidate_refinements = [
+            ([value + 0.2 for value in base_values], ["local_level_adjust"]),
+            ([value + 0.3 for value in base_values], ["isolated_spike_smoothing"]),
+            ([value + 0.4 for value in base_values], ["local_slope_adjust"]),
+        ]
+
+        arima_filtered = filter_refinement_candidates_for_model(candidate_refinements, prediction_model_used="arima")
+        self.assertNotIn("local_level_adjust", [ops[0] for _vals, ops in arima_filtered])
+        itransformer_filtered = filter_refinement_candidates_for_model(
+            candidate_refinements,
+            prediction_model_used="itransformer",
+        )
+        self.assertNotIn("local_level_adjust", [ops[0] for _vals, ops in itransformer_filtered])
+
+        arima_payload = build_refinement_support_payload(
+            base_values=base_values,
+            history_values=history_values,
+            selected_feature_tools=["extract_within_channel_dynamics"],
+            candidate_refinements=candidate_refinements,
+            prediction_model_used="arima",
+        )
+        self.assertNotIn("local_level_adjust", arima_payload["candidate_adjustments"])
+
+        arima_map = build_refinement_candidate_prediction_text_map(
+            base_prediction_text=base_prediction_text,
+            candidate_refinements=candidate_refinements,
+            prediction_model_used="arima",
+        )
+        self.assertNotIn("local_level_adjust", arima_map)
+        self.assertIn("isolated_spike_smoothing", arima_map)
+        self.assertIn("local_slope_adjust", arima_map)
+
+    def test_build_turn3_target_uses_filtered_refinement_candidates(self):
+        base_prediction_text = "\n".join(
+            f"2026-03-01 {hour:02d}:00:00 {30.0 + hour / 1000:.4f}" for hour in range(24)
+        )
+        history_values = [30.0 + hour / 1000 for hour in range(24)]
+        base_values = [30.0 + hour / 1000 for hour in range(24)]
+        sample = {
+            "reward_model": {
+                "ground_truth": "\n".join(
+                    f"2026-03-01 {hour:02d}:00:00 {30.2 + hour / 1000:.4f}" for hour in range(24)
+                )
+            }
+        }
+        candidate_refinements = [
+            ([value + 0.2 for value in base_values], ["local_level_adjust"]),
+            ([value + 0.4 for value in base_values], ["local_slope_adjust"]),
+        ]
+
+        with mock.patch(
+            "recipe.time_series_forecast.build_etth1_sft_dataset.generate_local_refinement_candidates",
+            return_value=candidate_refinements,
+        ):
+            turn3_target = _build_turn3_target(
+                sample=sample,
+                historical_data=base_prediction_text,
+                history_values=history_values,
+                base_prediction_text=base_prediction_text,
+                forecast_horizon=24,
+                model_name="arima",
+                selected_feature_tools=["extract_forecast_residuals"],
+                turn3_target_mode=TURN3_TARGET_MODE_ENGINEERING_REFINE,
+            )
+
+        self.assertNotEqual(turn3_target["refinement_decision_name"], "local_level_adjust")
+        self.assertNotIn("local_level_adjust", turn3_target["refinement_candidate_adjustments"])
+
     def _heuristic_model_for_sample(self, sample: dict) -> str:
         raw_prompt = sample["raw_prompt"][0]["content"]
         task_spec = parse_task_prompt(raw_prompt, data_source=sample.get("data_source"))
         historical_data = task_spec.historical_data or raw_prompt
         _, history_values = parse_time_series_string(historical_data, target_column=task_spec.target_column or "OT")
-        model_name, _feature_snapshot, _reason = _select_prediction_model_by_heuristic(history_values)
+        selected_feature_tools = self._selected_feature_tools_for_sample(sample)
+        model_name, _feature_snapshot, _reason = _select_prediction_model_by_heuristic(
+            history_values,
+            selected_feature_tools=selected_feature_tools,
+        )
         return model_name
 
     def _selected_feature_tools_for_sample(self, sample: dict) -> list[str]:
@@ -126,7 +217,7 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
         sample = self._load_base_sample()
         sample_b = copy.deepcopy(sample)
         sample_b["index"] = int(sample.get("index", 0)) + 1
-        expected_model = self._heuristic_model_for_sample(sample)
+        expected_model = str(sample["reference_teacher_model"])
 
         async def fake_predict_with_runtime_tools(**kwargs):
             self.assertIn(kwargs["model_name"], SUPPORTED_PREDICTION_MODELS)
@@ -198,18 +289,24 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                 self.assertEqual([msg["role"] for msg in routing_messages], ["system", "user", "assistant"])
                 self.assertEqual(str(routing_messages[-1]["content"]), "")
                 self.assertTrue(str(routing_messages[-1]["reasoning_content"]).strip())
-                self.assertIn("Observed diagnostics:", routing_messages[-1]["reasoning_content"])
-                self.assertIn("ACF(1)=", routing_messages[-1]["reasoning_content"])
-                self.assertIn("Decision:", routing_messages[-1]["reasoning_content"])
-                self.assertEqual(routing_messages[-1]["tool_calls"][0]["function"]["name"], "predict_time_series")
+                self.assertIn("RouteDecision(", routing_messages[-1]["reasoning_content"])
                 self.assertIn(frame.iloc[-2]["selected_prediction_model"], routing_messages[-1]["reasoning_content"])
-                self.assertIn("predict_time_series", routing_messages[-1]["reasoning_content"])
-                self.assertIn("### Analysis Summary", routing_messages[1]["content"])
+                self.assertIn("reason_codes=[", routing_messages[-1]["reasoning_content"])
+                self.assertEqual(routing_messages[-1]["tool_calls"][0]["function"]["name"], "predict_time_series")
+                self.assertIn("### Routing Evidence Card", routing_messages[1]["content"])
+                self.assertIn("expert_support_signals:", routing_messages[1]["content"])
+                self.assertIn("- arima=[", routing_messages[1]["content"])
+                self.assertIn("- patchtst=[", routing_messages[1]["content"])
+                self.assertIn("### Routing Decision Guide", routing_messages[1]["content"])
                 routing_tools = list(frame.iloc[-2]["tools"])
                 self.assertEqual([tool["function"]["name"] for tool in routing_tools], ["predict_time_series"])
 
                 refinement_messages = frame.iloc[-1]["messages"]
                 self.assertEqual([msg["role"] for msg in refinement_messages], ["system", "user", "assistant"])
+                self.assertIn("### Refinement Evidence Card", refinement_messages[1]["content"])
+                self.assertIn("keep_support=[", refinement_messages[1]["content"])
+                self.assertIn("support_signals=[", refinement_messages[1]["content"])
+                self.assertIn("edit_support:", refinement_messages[1]["content"])
                 self.assertIn("### Prediction Tool Output", refinement_messages[1]["content"])
                 self.assertRegex(
                     refinement_messages[1]["content"],
@@ -230,6 +327,13 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             self.assertIn("selected_feature_tool_count", loaded.columns)
             self.assertIn("selected_feature_tool_signature", loaded.columns)
             self.assertIn("turn3_trigger_reason", loaded.columns)
+            self.assertIn("refinement_support_signals", loaded.columns)
+            self.assertIn("refinement_support_signal_signature", loaded.columns)
+            self.assertIn("refinement_keep_support_signals", loaded.columns)
+            self.assertIn("refinement_keep_support_signal_signature", loaded.columns)
+            self.assertIn("refinement_edit_support_signals", loaded.columns)
+            self.assertIn("refinement_candidate_adjustments", loaded.columns)
+            self.assertIn("refinement_candidate_adjustment_signature", loaded.columns)
             self.assertIn("refine_ops_signature", loaded.columns)
             self.assertIn("refine_changed_value_count", loaded.columns)
             self.assertIn("refine_first_changed_index", loaded.columns)
@@ -250,12 +354,8 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             )
             refinement_row = grouped[int(sample["index"])].iloc[-1]
             self.assertEqual(refinement_row["selected_prediction_model"], expected_model)
-            self.assertEqual(refinement_row["routing_policy_source"], "heuristic_rule_based")
-            expected_prediction_source = (
-                "reference_teacher_cached"
-                if expected_model == str(sample["reference_teacher_model"])
-                else "reference_teacher_runtime"
-            )
+            self.assertEqual(refinement_row["routing_policy_source"], "reference_teacher_offline_best")
+            expected_prediction_source = "reference_teacher_cached"
             self.assertEqual(refinement_row["base_prediction_source"], expected_prediction_source)
             self.assertEqual(refinement_row["turn3_target_type"], "validated_keep")
             self.assertEqual(refinement_row["refine_ops_signature"], "none")
@@ -456,8 +556,9 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
 
         self.assertEqual(set(dataframe["reference_teacher_model"].astype(str)), {"itransformer"})
 
-    def test_convert_can_build_routing_only_records_with_reference_teacher_labels(self):
+    def test_convert_can_build_routing_only_records_with_heuristic_labels(self):
         sample = self._load_base_sample()
+        expected_model = self._heuristic_model_for_sample(sample)
 
         async def fake_predict_with_runtime_tools(**kwargs):
             self.assertIn(kwargs["model_name"], SUPPORTED_PREDICTION_MODELS)
@@ -482,16 +583,100 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
 
         self.assertEqual(set(dataframe["turn_stage"].astype(str)), {"routing"})
         self.assertEqual(set(dataframe["sft_stage_mode"].astype(str)), {SFT_STAGE_MODE_ROUTING_ONLY})
-        self.assertEqual(set(dataframe["routing_label_source"].astype(str)), {"reference_teacher"})
+        self.assertEqual(set(dataframe["routing_label_source"].astype(str)), {"heuristic"})
         self.assertEqual(
             set(dataframe["selected_prediction_model"].astype(str)),
-            {str(sample["reference_teacher_model"])},
+            {expected_model},
         )
-        self.assertEqual(set(dataframe["routing_policy_source"].astype(str)), {"reference_teacher_offline_best"})
+        self.assertEqual(set(dataframe["routing_policy_source"].astype(str)), {"heuristic_rule_based"})
         reasoning_content = str(dataframe.iloc[0]["messages"][-1]["reasoning_content"])
-        self.assertNotIn("heuristic guess", reasoning_content)
-        self.assertNotIn("patch-based temporal model", reasoning_content)
-        self.assertIn("inductive bias best matches", reasoning_content)
+        self.assertIn("RouteDecision(", reasoning_content)
+        self.assertIn(expected_model, reasoning_content)
+
+    def test_filter_train_routing_records_by_confidence_keeps_only_mid_and_high(self):
+        dataframe = pd.DataFrame(
+            [
+                {"sample_index": 0, "source_sample_index": 0, "turn_stage": "diagnostic", "turn_stage_order": 0},
+                {
+                    "sample_index": 1,
+                    "source_sample_index": 0,
+                    "turn_stage": "routing",
+                    "turn_stage_order": 1,
+                    "routing_label_source": "heuristic",
+                    "routing_confidence_tier": "low",
+                },
+                {
+                    "sample_index": 2,
+                    "source_sample_index": 1,
+                    "turn_stage": "routing",
+                    "turn_stage_order": 1,
+                    "routing_label_source": "heuristic",
+                    "routing_confidence_tier": "mid",
+                },
+                {
+                    "sample_index": 3,
+                    "source_sample_index": 2,
+                    "turn_stage": "routing",
+                    "turn_stage_order": 1,
+                    "routing_label_source": "heuristic",
+                    "routing_confidence_tier": "high",
+                },
+                {
+                    "sample_index": 4,
+                    "source_sample_index": 3,
+                    "turn_stage": "routing",
+                    "turn_stage_order": 1,
+                    "routing_label_source": "reference_teacher",
+                    "routing_confidence_tier": "low",
+                },
+            ]
+        )
+
+        filtered = filter_train_routing_records_by_confidence(dataframe, min_tier="mid")
+        self.assertEqual(
+            list(filtered.loc[filtered["turn_stage"] == "routing", "routing_confidence_tier"]),
+            ["mid", "high", "low"],
+        )
+        self.assertEqual(list(filtered["sample_index"]), list(range(len(filtered))))
+
+    def test_repeat_high_confidence_routing_rows_duplicates_only_high_conf_heuristic(self):
+        dataframe = pd.DataFrame(
+            [
+                {
+                    "sample_index": 0,
+                    "source_sample_index": 0,
+                    "turn_stage": "routing",
+                    "turn_stage_order": 1,
+                    "routing_label_source": "heuristic",
+                    "routing_confidence_tier": "high",
+                },
+                {
+                    "sample_index": 1,
+                    "source_sample_index": 1,
+                    "turn_stage": "routing",
+                    "turn_stage_order": 1,
+                    "routing_label_source": "heuristic",
+                    "routing_confidence_tier": "mid",
+                },
+                {
+                    "sample_index": 2,
+                    "source_sample_index": 2,
+                    "turn_stage": "routing",
+                    "turn_stage_order": 1,
+                    "routing_label_source": "reference_teacher",
+                    "routing_confidence_tier": "high",
+                },
+            ]
+        )
+
+        repeated = repeat_high_confidence_routing_rows(dataframe, repeat_factor=3)
+        self.assertEqual(len(repeated), 5)
+        high_conf_rows = repeated.loc[
+            (repeated["routing_label_source"] == "heuristic")
+            & (repeated["routing_confidence_tier"] == "high")
+        ]
+        self.assertEqual(len(high_conf_rows), 3)
+        self.assertEqual(list(repeated["sample_index"]), list(range(len(repeated))))
 
     def test_convert_can_build_refinement_only_records(self):
         sample = self._load_base_sample()
@@ -806,6 +991,38 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
         self.assertEqual(model_name, "chronos2")
         self.assertIn("irregular", routing_reason.lower())
 
+    def test_heuristic_does_not_use_hidden_quality_or_residual_signals(self):
+        feature_snapshot = {
+            "acf1": 0.83,
+            "acf_seasonal": 0.07,
+            "cusum_max": 44.0,
+            "changepoint_count": 2.0,
+            "peak_count": 3.0,
+            "peak_spacing_cv": 0.22,
+            "monotone_duration": 0.06,
+            "residual_exceed_ratio": 0.12,
+            "quality_quantization_score": 0.35,
+            "quality_saturation_ratio": 0.14,
+            "dominant_pattern": "oscillation",
+        }
+
+        with mock.patch(
+            "recipe.time_series_forecast.build_etth1_sft_dataset._compute_routing_feature_snapshot",
+            return_value=feature_snapshot,
+        ):
+            hidden_model, _snapshot, _reason = _select_prediction_model_by_heuristic([0.0, 1.0, 2.0])
+            visible_model, _snapshot, _reason = _select_prediction_model_by_heuristic(
+                [0.0, 1.0, 2.0],
+                selected_feature_tools=[
+                    "extract_basic_statistics",
+                    "extract_within_channel_dynamics",
+                    "extract_event_summary",
+                ],
+            )
+
+        self.assertEqual(hidden_model, "chronos2")
+        self.assertNotEqual(visible_model, "chronos2")
+
     def test_rebalance_keeps_complete_source_trajectories(self):
         dataframe = pd.DataFrame(
             [
@@ -957,6 +1174,33 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             repeated_refine["selected_prediction_model"].astype(str).value_counts().to_dict(),
             {"arima": 3, "patchtst": 1},
         )
+
+    def test_summarize_paper_turn3_protocol_accepts_numpy_messages(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "turn_stage": "refinement",
+                    "forecast_horizon": 96,
+                    "sample_index": 7,
+                    "messages": np.array(
+                        [
+                            {"role": "system", "content": "s"},
+                            {"role": "user", "content": "u"},
+                            {
+                                "role": "assistant",
+                                "content": "<think>reason</think>\n<answer>\ndecision=keep_baseline\n</answer>",
+                            },
+                        ],
+                        dtype=object,
+                    ),
+                }
+            ]
+        )
+
+        summary = _summarize_paper_turn3_protocol(frame)
+
+        self.assertEqual(summary["turn3_protocol_valid_count"], 1)
+        self.assertEqual(summary["turn3_protocol_invalid_count"], 0)
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@
 import asyncio
 import logging
 import os
+import re
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -45,6 +46,11 @@ from recipe.time_series_forecast.prompts import (
     build_runtime_user_prompt,
     build_timeseries_system_prompt,
 )
+from recipe.time_series_forecast.refinement_support import (
+    build_refinement_candidate_prediction_text_map,
+    build_refinement_support_payload,
+    materialize_refinement_decision,
+)
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
 from recipe.time_series_forecast.tool_call_protocol import (
     TimeSeriesToolCall,
@@ -66,7 +72,12 @@ from recipe.time_series_forecast.reward import (
     normalize_for_reward,
     parse_final_answer_protocol,
 )
-from recipe.time_series_forecast.reward_protocol import extract_forecast_block, normalized_nonempty_lines
+from recipe.time_series_forecast.reward_protocol import (
+    clamp_turn3_answer_horizon,
+    extract_answer_region,
+    extract_forecast_block,
+    normalized_nonempty_lines,
+)
 from recipe.time_series_forecast.diagnostic_policy import (
     FEATURE_TOOL_ORDER,
     build_diagnostic_plan,
@@ -122,6 +133,15 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.final_answer_parse_mode = None
         self.final_answer_step_index = None
         self.parse_error_message = None
+        self.current_global_step = -1
+        self.current_validate = False
+        self.current_run_name = ""
+        self.refinement_decision_name = ""
+        self.turn3_horizon_clamped = False
+        self.turn3_horizon_clamp_reason = ""
+        self.turn3_horizon_clamp_discarded_lines = 0
+        self.turn3_horizon_clamp_valid_prefix_lines = 0
+        self.turn3_horizon_clamp_raw_answer_lines = 0
         self._reset_prediction_state()
         self._reset_feature_state()
 
@@ -150,6 +170,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentFlowOutput:
         self._reset_episode_state()
+        self.current_global_step = int(kwargs.get("global_step", -1) or -1)
+        self.current_validate = bool(kwargs.get("validate", False))
+        self.current_run_name = str(kwargs.get("run_name") or getattr(self.config.trainer, "experiment_name", "") or "")
 
         raw_prompt = list(kwargs["raw_prompt"])
         self.raw_prompt_text = raw_prompt[0]["content"]
@@ -204,6 +227,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         generation_stop_reason = ""
         generation_finish_reason = ""
         io_records: list[dict[str, Any]] = []
+        final_reward_result: dict[str, Any] = {}
+        last_response_text = ""
+        last_raw_response_text = ""
 
         num_steps = 0
         configured_max_steps = int(self.max_steps or 0)
@@ -247,7 +273,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 generation_finish_reason = generation_stop_reason
             
             # Decode response to check for final answer
-            response_text = await self.loop.run_in_executor(None, self.tokenizer.decode, response_ids)
+            raw_response_text = await self.loop.run_in_executor(None, self.tokenizer.decode, response_ids)
+            response_text = self._apply_turn3_horizon_clamp(raw_response_text, turn_stage=turn_stage)
+            last_response_text = response_text
+            last_raw_response_text = raw_response_text
 
             # io_records.append(
             #     {
@@ -279,7 +308,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 tool_call_names = [tool_call.name for tool_call in tool_calls]
 
             if turn_stage == "refinement" or not tool_calls:
-                final_answer, format_penalty = self._extract_final_answer(response_text)
+                final_answer = self._extract_final_answer(
+                    response_text,
+                    allow_recovery=(turn_stage == "refinement"),
+                )
             else:
                 # On tool-use turns, prioritize structured tool execution over any
                 # trailing answer-like garbage that the model may append.
@@ -309,7 +341,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     # Workflow completed - compute reward based on prediction accuracy
                     self.final_answer = final_answer
                     self.final_answer_step_index = num_steps
-                    reward_score = self._compute_final_reward(response_text, ground_truth) + format_penalty
+                    final_reward_result = self._compute_final_reward_result(final_answer, ground_truth)
+                    reward_score = float(final_reward_result.get("score", -0.5))
                     logger.info(f"Final answer detected. Reward score: {reward_score}")
                     # if reward_score > 0.5:
                     #     for record in io_records:
@@ -359,6 +392,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             refinement_metrics = self._collect_refinement_metrics(ground_truth)
             reward_extra_info.update(
                 {
+                    **final_reward_result,
                     "MSE": orig_mse,
                     "MAE": orig_mae,
                     "orig_mse": orig_mse,
@@ -372,6 +406,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     "prediction_model_used": self.prediction_model_used,
                     "output_source": self.prediction_model_used,
                     "selected_model": selected_model,
+                    "refinement_decision_name": self.refinement_decision_name or "",
+                    "materialized_solution_str": final_answer or "",
                     "generation_stop_reason": generation_stop_reason,
                     "generation_finish_reason": generation_finish_reason,
                     **self._shared_reward_tracking_fields(sample_uid=kwargs.get("uid")),
@@ -385,8 +421,9 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     "workflow_violation_reason": workflow_message,
                     "required_step_budget": int(self._required_step_budget()),
                     "prompt_char_len": int(len(messages[1]["content"])),
-                    "response_char_len": int(len(response_text)),
+                    "response_char_len": int(len(raw_response_text)),
                     "response_token_len": int(len(response_ids)),
+                    **self._collect_turn3_output_shape_metrics(raw_response_text, expected_len=expected_len),
                     **refinement_metrics,
                 }
             )
@@ -399,7 +436,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 sample_uid=kwargs.get("uid"),
                 turn_stage=turn_stage,
                 prompt_text=messages[1]["content"],
-                response_text=response_text,
+                response_text=raw_response_text,
                 generation_stop_reason=generation_stop_reason,
                 generation_finish_reason=generation_finish_reason,
                 tool_call_names=tool_call_names,
@@ -462,6 +499,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 "generation_stop_reason": generation_stop_reason,
                 "generation_finish_reason": generation_finish_reason,
                 **self._shared_reward_tracking_fields(sample_uid=kwargs.get("uid")),
+                **self._collect_turn3_output_shape_metrics(last_raw_response_text, expected_len=expected_len),
                 **final_refinement_metrics,
             }
         )
@@ -583,7 +621,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         return feature_tool_signature(self.feature_tool_sequence)
 
     def _shared_reward_tracking_fields(self, *, sample_uid: Any) -> dict[str, Any]:
-        return shared_reward_tracking_fields(
+        fields = shared_reward_tracking_fields(
             sample_uid=sample_uid,
             prediction_attempt_count=int(self.prediction_attempt_count),
             prediction_call_count=int(self.prediction_call_count),
@@ -600,6 +638,63 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             history_analysis=list(self.history_analysis),
             required_step_budget=int(self._required_step_budget()),
         )
+        fields.update(
+            {
+                "global_step": int(getattr(self, "current_global_step", -1)),
+                "validate": bool(getattr(self, "current_validate", False)),
+                "run_name": str(getattr(self, "current_run_name", "") or ""),
+                "turn3_horizon_clamped": bool(getattr(self, "turn3_horizon_clamped", False)),
+                "turn3_horizon_clamp_reason": str(getattr(self, "turn3_horizon_clamp_reason", "") or ""),
+                "turn3_horizon_clamp_discarded_lines": int(
+                    getattr(self, "turn3_horizon_clamp_discarded_lines", 0) or 0
+                ),
+                "turn3_horizon_clamp_valid_prefix_lines": int(
+                    getattr(self, "turn3_horizon_clamp_valid_prefix_lines", 0) or 0
+                ),
+                "turn3_horizon_clamp_raw_answer_lines": int(
+                    getattr(self, "turn3_horizon_clamp_raw_answer_lines", 0) or 0
+                ),
+            }
+        )
+        return fields
+
+    def _apply_turn3_horizon_clamp(self, response_text: str, *, turn_stage: str) -> str:
+        self.turn3_horizon_clamped = False
+        self.turn3_horizon_clamp_reason = ""
+        self.turn3_horizon_clamp_discarded_lines = 0
+        self.turn3_horizon_clamp_valid_prefix_lines = 0
+        self.turn3_horizon_clamp_raw_answer_lines = 0
+
+        if turn_stage != "refinement":
+            return response_text
+
+        clamped_text, clamp_info = clamp_turn3_answer_horizon(
+            response_text,
+            self._expected_prediction_count(),
+        )
+        self.turn3_horizon_clamped = bool(clamp_info.get("applied", False))
+        self.turn3_horizon_clamp_reason = str(clamp_info.get("reason") or "")
+        self.turn3_horizon_clamp_discarded_lines = int(clamp_info.get("discarded_line_count") or 0)
+        self.turn3_horizon_clamp_valid_prefix_lines = int(clamp_info.get("valid_prefix_line_count") or 0)
+        self.turn3_horizon_clamp_raw_answer_lines = int(clamp_info.get("raw_answer_line_count") or 0)
+        return str(clamped_text or response_text)
+
+    def _collect_turn3_output_shape_metrics(self, response_text: str, *, expected_len: int) -> dict[str, Any]:
+        answer_region = extract_answer_region(response_text)
+        answer_lines = normalized_nonempty_lines(answer_region)
+        think_match = re.search(r"<think>(.*?)</think>", response_text or "", re.DOTALL)
+        think_text = think_match.group(1).strip() if think_match else ""
+
+        think_token_len = len(self.tokenizer.encode(think_text, add_special_tokens=False)) if think_text else 0
+        answer_token_len = len(self.tokenizer.encode(answer_region, add_special_tokens=False)) if answer_region else 0
+
+        return {
+            "answer_line_count": int(len(answer_lines)),
+            "expected_answer_line_count": int(expected_len or 0),
+            "wrote_expected_rows_before_stop": bool(expected_len > 0 and len(answer_lines) >= expected_len),
+            "think_token_len": int(think_token_len),
+            "answer_token_len": int(answer_token_len),
+        }
 
     def _append_turn_debug(
         self,
@@ -727,7 +822,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             return [PREDICT_TIMESERIES_TOOL_SCHEMA]
         return []
 
-    def _extract_final_answer(self, response_text: str) -> tuple[Optional[str], float]:
+    def _extract_final_answer(self, response_text: str, *, allow_recovery: bool = False) -> Optional[str]:
         """
         Extract final answer from response text.
 
@@ -735,26 +830,53 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             response_text: The model's response text
 
         Returns:
-            Tuple of (answer_text, format_penalty).
+            Parsed answer text if the response satisfies the final-answer protocol.
         """
         self.final_answer_reject_reason = None
         self.final_answer_parse_mode = None
+        self.refinement_decision_name = ""
+
+        if self._current_turn_stage() == "refinement":
+            # For decision-protocol Turn 3, materialization must use the
+            # canonical timestamped prediction text, not the compact tool
+            # rendering. Otherwise the final answer degrades into a single
+            # compact line and strict scoring rejects it.
+            prediction_payload = self.prediction_results or getattr(self, "prediction_tool_output", None)
+            if prediction_payload:
+                try:
+                    prediction_payload = self._canonical_answer_from_prediction_text(prediction_payload)
+                except Exception:
+                    prediction_payload = str(prediction_payload or "")
+                candidate_prediction_text_map = self._refinement_candidate_prediction_text_map(prediction_payload)
+                if candidate_prediction_text_map:
+                    rendered_answer, decision_name, parse_mode, reject_reason = materialize_refinement_decision(
+                        response_text=response_text,
+                        candidate_prediction_text_map=candidate_prediction_text_map,
+                    )
+                    if rendered_answer is not None:
+                        self.refinement_decision_name = str(decision_name or "")
+                        self.final_answer_parse_mode = parse_mode
+                        return rendered_answer
+                    if reject_reason and reject_reason != "missing_answer_block":
+                        self.final_answer_reject_reason = reject_reason
+                        self.final_answer_parse_mode = parse_mode or f"rejected_{reject_reason}"
+                        return None
 
         final_answer, parse_mode, reject_reason = parse_final_answer_protocol(
             response_text,
             self._expected_prediction_count(),
-            allow_recovery=False,
+            allow_recovery=allow_recovery,
         )
         if final_answer is not None:
             if parse_mode.startswith("recovered_"):
                 logger.info("Recovered malformed final answer via %s.", parse_mode)
             self.final_answer_parse_mode = parse_mode
-            return final_answer, 0.0
+            return final_answer
 
         reject_reason = reject_reason or "unknown_parse_failure"
         self.final_answer_reject_reason = reject_reason
         self.final_answer_parse_mode = parse_mode or f"rejected_{reject_reason}"
-        return None, 0.0
+        return None
 
     async def _build_parse_failure_output(self, system_prompt: str, **kwargs) -> AgentFlowOutput:
         user_prompt = self._build_user_prompt()
@@ -796,6 +918,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         return AgentFlowOutput(steps=[step], metrics={})
 
     def _compute_final_reward(self, final_response: str, ground_truth: str) -> float:
+        result = self._compute_final_reward_result(final_response, ground_truth)
+        return float(result.get("score", -0.5))
+
+    def _compute_final_reward_result(self, final_response: str, ground_truth: str) -> dict[str, Any]:
         """
         Compute reward score based on final prediction and ground truth.
         
@@ -807,19 +933,27 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             Reward score
         """
         if not ground_truth:
-            return 0.0
+            return {"score": 0.0}
         
         try:
             result = compute_score(
                 data_source="time_series",
                 solution_str=final_response,
                 ground_truth=ground_truth,
+                extra_info={
+                    "global_step": int(getattr(self, "current_global_step", -1)),
+                    "validate": bool(getattr(self, "current_validate", False)),
+                    "run_name": str(getattr(self, "current_run_name", "") or ""),
+                },
+                # Keep RL optimization aligned with validation and deployment:
+                # a recoverable-but-malformed final answer should not receive
+                # a better training target than the one used for evaluation.
                 allow_recovery=False,
             )
-            return float(result["score"] if isinstance(result, dict) else result)
+            return result if isinstance(result, dict) else {"score": float(result)}
         except Exception as e:
             logger.error(f"Error computing final reward: {e}")
-            return -0.5
+            return {"score": -0.5}
 
     def _canonical_answer_from_prediction_text(self, prediction_text: str) -> str:
         expected = self._expected_prediction_count()
@@ -896,6 +1030,64 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
 
         await self.loop.run_in_executor(None, _write_records)
 
+    def _routing_feature_payload(self) -> dict[str, dict[str, Any]]:
+        payload: dict[str, dict[str, Any]] = {}
+        for tool_name, spec in FEATURE_TOOL_SPECS.items():
+            features = getattr(self, spec.state_attr, None)
+            if isinstance(features, dict) and features:
+                payload[tool_name] = dict(features)
+        return payload
+
+    def _refinement_feature_payload(self, prediction_payload: str | None) -> dict[str, Any] | None:
+        if not prediction_payload:
+            return None
+        target_column = getattr(self, "target_column", None)
+        time_series_data = getattr(self, "time_series_data", None)
+        try:
+            _timestamps, history_values = parse_time_series_string(time_series_data, target_column=target_column)
+            _pred_timestamps, base_values = parse_time_series_string(prediction_payload, target_column=target_column)
+        except Exception:
+            return None
+        if not history_values or not base_values:
+            return None
+        return build_refinement_support_payload(
+            base_values=base_values,
+            history_values=history_values,
+            selected_feature_tools=self._executed_feature_tool_names(),
+            prediction_model_used=getattr(self, "prediction_model_used", None),
+        )
+
+    def _refinement_candidate_prediction_text_map(self, prediction_payload: str | None) -> dict[str, str] | None:
+        if not prediction_payload:
+            return None
+        target_column = getattr(self, "target_column", None)
+        time_series_data = getattr(self, "time_series_data", None)
+        base_values: list[float] | None = None
+        try:
+            _timestamps, history_values = parse_time_series_string(time_series_data, target_column=target_column)
+            _pred_timestamps, base_values = parse_time_series_string(prediction_payload, target_column=target_column)
+        except Exception:
+            history_values = []
+            try:
+                _pred_timestamps, base_values = parse_time_series_string(prediction_payload, target_column=target_column)
+            except Exception:
+                base_values = []
+        if not base_values:
+            return None
+        candidate_refinements = []
+        if history_values:
+            from recipe.time_series_forecast.refinement_support import generate_local_refinement_candidates
+
+            candidate_refinements = generate_local_refinement_candidates(base_values, history_values)
+        try:
+            return build_refinement_candidate_prediction_text_map(
+                base_prediction_text=prediction_payload,
+                candidate_refinements=candidate_refinements,
+                prediction_model_used=getattr(self, "prediction_model_used", None),
+            )
+        except Exception:
+            return None
+
     def _build_user_prompt(self) -> str:
         turn_stage = self._current_turn_stage()
         prediction_payload = getattr(self, "prediction_tool_output", None) or self.prediction_results
@@ -919,6 +1111,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             prediction_model_used=getattr(self, "prediction_model_used", None),
             available_feature_tools=self._available_diagnostic_tool_names(),
             completed_feature_tools=self._executed_feature_tool_names(),
+            routing_feature_payload=self._routing_feature_payload(),
+            refinement_feature_payload=self._refinement_feature_payload(prediction_payload),
             turn_stage=turn_stage,
         )
 
