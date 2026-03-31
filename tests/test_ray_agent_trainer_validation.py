@@ -351,6 +351,8 @@ class TestValidationRewardManager(unittest.TestCase):
         self.assertIn("data.filter_overlong_prompts=False", result.stdout)
         self.assertIn("actor_rollout_ref.actor.ppo_mini_batch_size=3", result.stdout)
         self.assertIn("actor_rollout_ref.actor.kl_loss_coef=0.01", result.stdout)
+        self.assertIn("actor_rollout_ref.actor.entropy_coeff=0.001", result.stdout)
+        self.assertIn("actor_rollout_ref.rollout.temperature=0.9", result.stdout)
         self.assertIn("algorithm.norm_adv_by_std_in_grpo=False", result.stdout)
 
     def test_curriculum_rl_launcher_respects_smoke_run_mode(self) -> None:

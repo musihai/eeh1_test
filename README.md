@@ -294,6 +294,9 @@ SFT_SMOKE_SAVE_DIR=$PROJECT_DIR/artifacts/checkpoints/sft/${SFT_RUN_NAME}_smoke
 SFT_FORMAL_SAVE_DIR=$PROJECT_DIR/artifacts/checkpoints/sft/$SFT_RUN_NAME
 RL_TRAINER_LOCAL_DIR=$PROJECT_DIR/artifacts/checkpoints/rl/$RL_RUN_NAME
 SWANLAB_LOG_DIR=$PROJECT_DIR/swanlog/$RUN_TAG
+RL_DEBUG_DIR=$PROJECT_DIR/logs/debug/$RUN_TAG
+TS_CHAIN_DEBUG_FILE=$RL_DEBUG_DIR/ts_chain_debug.jsonl
+TS_MIN_DEBUG_DIR=$RL_DEBUG_DIR
 ```
 
 说明：
@@ -307,6 +310,8 @@ SWANLAB_LOG_DIR=$PROJECT_DIR/swanlog/$RUN_TAG
 - `SFT_FORMAL_SAVE_DIR`：正式 SFT 输出目录
 - `RL_TRAINER_LOCAL_DIR`：RL 输出目录
 - `SWANLAB_LOG_DIR`：当前实验的 SwanLab 本地日志目录
+- `RL_DEBUG_DIR`：当前 RL run 的独立调试目录
+- `TS_CHAIN_DEBUG_FILE` / `TS_MIN_DEBUG_DIR`：当前 RL run 的链路调试输出
 
 不要把 `SFT_DATASET_DIR` 指到任何
 `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_refinement_decision_*`
@@ -429,10 +434,24 @@ PY
 
 ### 6.6 跑 RL
 
+如果要重新起一轮 RL，不要复用旧的 `RUN_TAG / RL_RUN_NAME / RL_TRAINER_LOCAL_DIR`。
+先刷新一遍：
+
+```bash
+RUN_TAG=$(date +%Y%m%d_%H%M%S)
+RL_RUN_NAME=etth1_ot_qwen3_1_7b_rl_paper_$RUN_TAG
+RL_TRAINER_LOCAL_DIR=$PROJECT_DIR/artifacts/checkpoints/rl/$RL_RUN_NAME
+SWANLAB_LOG_DIR=$PROJECT_DIR/swanlog/$RUN_TAG
+RL_DEBUG_DIR=$PROJECT_DIR/logs/debug/$RUN_TAG
+TS_CHAIN_DEBUG_FILE=$RL_DEBUG_DIR/ts_chain_debug.jsonl
+TS_MIN_DEBUG_DIR=$RL_DEBUG_DIR
+```
+
 RL val-only：
 
 ```bash
 PROFILE_PATH=$PROFILE_PATH \
+DEBUG_CHAIN=1 \
 RUN_MODE=val_only \
 RL_CURRICULUM_PHASE=stage123 \
 RL_CURRICULUM_DATASET_DIR=$RL_CURRICULUM_DATASET_DIR \
@@ -441,13 +460,17 @@ RL_TRAINER_LOCAL_DIR=$RL_TRAINER_LOCAL_DIR \
 RL_EXP_NAME=${RL_RUN_NAME}_valonly \
 RL_LOGGER='["console","swanlab"]' \
 SWANLAB_LOG_DIR=$SWANLAB_LOG_DIR \
-bash examples/time_series_forecast/run_qwen3-1.7B.sh
+TS_CHAIN_DEBUG_FILE=$TS_CHAIN_DEBUG_FILE \
+TS_MIN_DEBUG_DIR=$TS_MIN_DEBUG_DIR \
+bash examples/time_series_forecast/run_qwen3-1.7B.sh \
+  trainer.resume_mode=disable
 ```
 
 RL smoke：
 
 ```bash
 PROFILE_PATH=$PROFILE_PATH \
+DEBUG_CHAIN=1 \
 RUN_MODE=smoke \
 RL_CURRICULUM_PHASE=stage1 \
 RL_CURRICULUM_DATASET_DIR=$RL_CURRICULUM_DATASET_DIR \
@@ -456,7 +479,10 @@ RL_TRAINER_LOCAL_DIR=$RL_TRAINER_LOCAL_DIR \
 RL_EXP_NAME=${RL_RUN_NAME}_smoke \
 RL_LOGGER='["console","swanlab"]' \
 SWANLAB_LOG_DIR=$SWANLAB_LOG_DIR \
-bash examples/time_series_forecast/run_qwen3-1.7B.sh
+TS_CHAIN_DEBUG_FILE=$TS_CHAIN_DEBUG_FILE \
+TS_MIN_DEBUG_DIR=$TS_MIN_DEBUG_DIR \
+bash examples/time_series_forecast/run_qwen3-1.7B.sh \
+  trainer.resume_mode=disable
 ```
 
 正式 curriculum RL：
@@ -464,16 +490,18 @@ bash examples/time_series_forecast/run_qwen3-1.7B.sh
 ```bash
 conda run -n cast-r1-ts ray stop --force
 
-
-
 PROFILE_PATH=$PROFILE_PATH \
+DEBUG_CHAIN=1 \
 RL_CURRICULUM_DATASET_DIR=$RL_CURRICULUM_DATASET_DIR \
 RL_MODEL_PATH=$RL_MODEL_PATH \
 RL_TRAINER_LOCAL_DIR=$RL_TRAINER_LOCAL_DIR \
 RL_EXP_NAME=$RL_RUN_NAME \
 RL_LOGGER='["console","swanlab"]' \
 SWANLAB_LOG_DIR=$SWANLAB_LOG_DIR \
-bash examples/time_series_forecast/run_qwen3-1.7B_curriculum.sh
+TS_CHAIN_DEBUG_FILE=$TS_CHAIN_DEBUG_FILE \
+TS_MIN_DEBUG_DIR=$TS_MIN_DEBUG_DIR \
+bash examples/time_series_forecast/run_qwen3-1.7B_curriculum.sh \
+  trainer.resume_mode=disable
 ```
 
 说明：
@@ -482,6 +510,8 @@ bash examples/time_series_forecast/run_qwen3-1.7B_curriculum.sh
 - 每个命令里显式传入的环境变量都会覆盖 profile 默认值
 - formal RL 当前默认每 `8` 个 step 做一次验证
 - RL 真正开始前，不要再使用 `RL_MODEL_PATH=$BASE_MODEL_PATH`
+- 重新起 RL 时一定换新的 `RUN_TAG`，否则 checkpoint、SwanLab 和 debug 文件很容易和旧 run 混在一起
+- `trainer.resume_mode=disable` 是为了避免误接上旧 smoke 或旧 formal 目录
 
 RL 在 SwanLab 里建议分两组看。
 

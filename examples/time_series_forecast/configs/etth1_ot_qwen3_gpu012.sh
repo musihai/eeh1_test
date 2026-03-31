@@ -99,10 +99,12 @@ export RL_LR="${RL_LR:-1e-6}"
 export RL_LR_SCHEDULER_TYPE="${RL_LR_SCHEDULER_TYPE:-cosine}"
 # actor PPO loss 的 KL 系数。
 export RL_KL_LOSS_COEF="${RL_KL_LOSS_COEF:-0.01}"
+# actor PPO 的熵正则系数。
+export RL_ENTROPY_COEFF="${RL_ENTROPY_COEFF:-0.001}"
 # 是否在 GRPO 中按组内标准差归一化 advantage。
 export RL_NORM_ADV_BY_STD_IN_GRPO="${RL_NORM_ADV_BY_STD_IN_GRPO:-False}"
 # 训练采样阶段的温度。
-export RL_TEMPERATURE="${RL_TEMPERATURE:-1.0}"
+export RL_TEMPERATURE="${RL_TEMPERATURE:-0.9}"
 # 验证采样阶段的温度。
 export RL_VAL_TEMPERATURE="${RL_VAL_TEMPERATURE:-0.0}"
 # RL 数据加载时的输入提示最大长度。

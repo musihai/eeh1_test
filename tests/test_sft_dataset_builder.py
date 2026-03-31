@@ -15,6 +15,7 @@ from recipe.time_series_forecast.build_etth1_sft_dataset import (
     DEFAULT_SFT_STAGE_MODE,
     DEFAULT_TRAIN_LOCAL_REFINE_REFINEMENT_REPEAT_FACTOR,
     DEFAULT_TRAIN_TURN3_REBALANCE_MODE,
+    DEFAULT_TURN3_TARGET_MODE,
     FEATURE_TOOL_BUILDERS,
     SFT_STAGE_MODE_REFINEMENT_ONLY,
     SFT_STAGE_MODE_ROUTING_ONLY,
@@ -55,6 +56,9 @@ from recipe.time_series_forecast.utils import parse_time_series_string
 
 
 class TestETTh1SFTDatasetBuilder(unittest.TestCase):
+    def test_default_turn3_target_mode_uses_engineering_refine(self):
+        self.assertEqual(DEFAULT_TURN3_TARGET_MODE, TURN3_TARGET_MODE_ENGINEERING_REFINE)
+
     def test_default_routing_label_source_uses_reference_teacher(self):
         self.assertEqual(DEFAULT_ROUTING_LABEL_SOURCE, "reference_teacher")
 
@@ -289,15 +293,21 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                 self.assertEqual([msg["role"] for msg in routing_messages], ["system", "user", "assistant"])
                 self.assertEqual(str(routing_messages[-1]["content"]), "")
                 self.assertTrue(str(routing_messages[-1]["reasoning_content"]).strip())
-                self.assertIn("RouteDecision(", routing_messages[-1]["reasoning_content"])
-                self.assertIn(frame.iloc[-2]["selected_prediction_model"], routing_messages[-1]["reasoning_content"])
-                self.assertIn("reason_codes=[", routing_messages[-1]["reasoning_content"])
+                self.assertEqual(
+                    str(routing_messages[-1]["reasoning_content"]).strip(),
+                    "Use the diagnostic evidence to choose one forecasting model.",
+                )
+                self.assertNotIn("RouteDecision(", routing_messages[-1]["reasoning_content"])
+                self.assertNotIn("reason_codes=[", routing_messages[-1]["reasoning_content"])
+                self.assertNotIn("RouteSummary:", routing_messages[-1]["reasoning_content"])
                 self.assertEqual(routing_messages[-1]["tool_calls"][0]["function"]["name"], "predict_time_series")
                 self.assertIn("### Routing Evidence Card", routing_messages[1]["content"])
-                self.assertIn("expert_support_signals:", routing_messages[1]["content"])
-                self.assertIn("- arima=[", routing_messages[1]["content"])
-                self.assertIn("- patchtst=[", routing_messages[1]["content"])
-                self.assertIn("### Routing Decision Guide", routing_messages[1]["content"])
+                self.assertIn("tool_fields:", routing_messages[1]["content"])
+                self.assertIn("extract_basic_statistics", routing_messages[1]["content"])
+                self.assertIn("missing_tool_groups=[", routing_messages[1]["content"])
+                self.assertIn("### Analysis Summary", routing_messages[1]["content"])
+                self.assertNotIn("expert_support_signals:", routing_messages[1]["content"])
+                self.assertNotIn("### Routing Decision Guide", routing_messages[1]["content"])
                 routing_tools = list(frame.iloc[-2]["tools"])
                 self.assertEqual([tool["function"]["name"] for tool in routing_tools], ["predict_time_series"])
 
@@ -314,13 +324,10 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
                 )
                 self.assertIn("<think>", refinement_messages[-1]["content"])
                 self.assertIn("<answer>", refinement_messages[-1]["content"])
-                self.assertRegex(
-                    refinement_messages[-1]["content"],
-                    r"<answer>\n\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -?\d+(?:\.\d+)?",
-                )
+                self.assertIn("<answer>\ndecision=", refinement_messages[-1]["content"])
                 self.assertIsNone(frame.iloc[-1]["tools"])
                 self.assertEqual(frame.iloc[-1]["turn3_target_type"], "validated_keep")
-                self.assertEqual(frame.iloc[-1]["turn3_target_mode"], TURN3_TARGET_MODE_PAPER_STRICT)
+                self.assertEqual(frame.iloc[-1]["turn3_target_mode"], TURN3_TARGET_MODE_ENGINEERING_REFINE)
                 self.assertEqual(int(frame.iloc[-1]["source_sample_index"]), source_idx)
                 self.assertIsInstance(list(frame.iloc[-1]["selected_feature_tools"]), list)
 
@@ -459,6 +466,7 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
             args = parse_args()
         self.assertEqual(bool(args.balance_train_routing_models), DEFAULT_BALANCE_TRAIN_ROUTING_MODELS)
         self.assertEqual(str(args.sft_stage_mode), DEFAULT_SFT_STAGE_MODE)
+        self.assertEqual(str(args.turn3_target_mode), DEFAULT_TURN3_TARGET_MODE)
         self.assertEqual(str(args.train_turn3_rebalance_mode), DEFAULT_TRAIN_TURN3_REBALANCE_MODE)
         self.assertEqual(
             int(args.train_local_refine_refinement_repeat_factor),
@@ -590,8 +598,9 @@ class TestETTh1SFTDatasetBuilder(unittest.TestCase):
         )
         self.assertEqual(set(dataframe["routing_policy_source"].astype(str)), {"heuristic_rule_based"})
         reasoning_content = str(dataframe.iloc[0]["messages"][-1]["reasoning_content"])
-        self.assertIn("RouteDecision(", reasoning_content)
-        self.assertIn(expected_model, reasoning_content)
+        self.assertEqual(reasoning_content.strip(), "Use the diagnostic evidence to choose one forecasting model.")
+        self.assertNotIn("RouteDecision(", reasoning_content)
+        self.assertNotIn(expected_model, reasoning_content)
 
     def test_filter_train_routing_records_by_confidence_keeps_only_mid_and_high(self):
         dataframe = pd.DataFrame(

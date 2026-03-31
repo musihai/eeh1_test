@@ -17,6 +17,10 @@ from recipe.time_series_forecast.time_series_forecast_agent_flow import TimeSeri
 class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
     def _make_flow(self) -> TimeSeriesForecastAgentFlow:
         flow = TimeSeriesForecastAgentFlow.__new__(TimeSeriesForecastAgentFlow)
+        flow.route_default_expert = "itransformer"
+        flow.route_decision = None
+        flow.route_override_model = None
+        flow.route_resolved_model = None
         flow.prediction_results = None
         flow.prediction_requested_model = None
         flow.prediction_model_defaulted = False
@@ -176,8 +180,22 @@ class TestTimeSeriesForecastAgentFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("extract_basic_statistics", diagnostic_names)
         self.assertIn("extract_event_summary", diagnostic_names)
         self.assertNotIn("predict_time_series", diagnostic_names)
-        self.assertEqual(routing_names, ["predict_time_series"])
+        self.assertEqual(routing_names, ["route_time_series"])
         self.assertEqual(refinement_names, [])
+
+    async def test_route_time_series_keep_default_resolves_default_expert(self) -> None:
+        flow = self._make_flow()
+        flow.basic_statistics = {}
+        tool_call = SimpleNamespace(name="route_time_series", arguments={"decision": "keep_default"})
+        flow._run_prediction_tool = AsyncMock(return_value="Forecast Values:\n1.0000\n2.0000\n3.0000")
+
+        output = await flow._execute_tool_call(tool_call, turn_stage="routing")
+
+        self.assertIsNotNone(output)
+        self.assertEqual(flow.route_decision, "keep_default")
+        self.assertEqual(flow.prediction_requested_model, "itransformer")
+        self.assertEqual(flow.route_resolved_model, "itransformer")
+        flow._run_prediction_tool.assert_awaited_once_with(model_name="itransformer")
 
     def test_build_user_prompt_uses_policy_owned_diagnostic_stage(self) -> None:
         flow = self._make_flow()

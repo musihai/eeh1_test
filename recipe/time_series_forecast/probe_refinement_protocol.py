@@ -14,6 +14,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from recipe.time_series_forecast.build_etth1_sft_dataset import build_sft_records
 from recipe.time_series_forecast.dataset_file_utils import load_jsonl_records
+from recipe.time_series_forecast.refinement_support import materialize_refinement_decision
 from recipe.time_series_forecast.reward_protocol import (
     clamp_turn3_answer_horizon,
     normalized_nonempty_lines,
@@ -28,6 +29,7 @@ class ProbeExample:
     prompt_messages: list[dict[str, Any]]
     forecast_horizon: int
     prompt_hash: str
+    candidate_prediction_text_map: dict[str, str]
 
 
 def _stable_prompt_hash(messages: Iterable[dict[str, Any]]) -> str:
@@ -41,6 +43,26 @@ def _stable_prompt_hash(messages: Iterable[dict[str, Any]]) -> str:
         )
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha1(serialized).hexdigest()
+
+
+def _coerce_candidate_prediction_text_map(value: Any) -> dict[str, str]:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return {}
+        try:
+            value = json.loads(text)
+        except Exception:
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    output: dict[str, str] = {}
+    for key, item in value.items():
+        normalized_key = str(key or "").strip()
+        normalized_value = str(item or "").strip()
+        if normalized_key and normalized_value:
+            output[normalized_key] = normalized_value
+    return output
 
 
 def _iter_refinement_rows(stepwise_parquet: Path) -> list[dict[str, Any]]:
@@ -68,6 +90,9 @@ def _gate_a_examples(stepwise_parquet: Path) -> list[ProbeExample]:
                 prompt_messages=prompt_messages,
                 forecast_horizon=int(row.get("forecast_horizon") or 96),
                 prompt_hash=_stable_prompt_hash(prompt_messages),
+                candidate_prediction_text_map=_coerce_candidate_prediction_text_map(
+                    row.get("refinement_candidate_prediction_text_map")
+                ),
             )
         )
     return examples
@@ -129,20 +154,51 @@ def _gate_b_examples(stepwise_parquet: Path, source_jsonl: Path) -> list[ProbeEx
                 prompt_messages=prompt_messages,
                 forecast_horizon=int(refinement_record.get("forecast_horizon") or 96),
                 prompt_hash=_stable_prompt_hash(prompt_messages),
+                candidate_prediction_text_map=_coerce_candidate_prediction_text_map(
+                    refinement_record.get("refinement_candidate_prediction_text_map")
+                ),
             )
         )
         seen_source_indexes.add(source_sample_index)
     return examples
 
 
-def _parse_generated_answer(text: str, forecast_horizon: int) -> dict[str, Any]:
+def _parse_generated_answer(
+    text: str,
+    forecast_horizon: int,
+    *,
+    candidate_prediction_text_map: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    candidate_prediction_text_map = candidate_prediction_text_map or {}
+    decision_name = ""
+    materialized_answer = text
+    parse_mode = ""
+    reject_reason = None
+    if candidate_prediction_text_map:
+        rendered_answer, decision_name, parse_mode, reject_reason = materialize_refinement_decision(
+            response_text=text,
+            candidate_prediction_text_map=candidate_prediction_text_map,
+        )
+        if rendered_answer is None:
+            return {
+                "strict_ok": False,
+                "parse_mode": parse_mode,
+                "reject_reason": reject_reason,
+                "answer_line_count": 0,
+                "has_close_tag": bool("</answer>" in text),
+                "exact_96_lines": False,
+                "decision_name": decision_name or "",
+                "materialized": False,
+            }
+        materialized_answer = rendered_answer
+
     parsed_answer, parse_mode, reject_reason = parse_final_answer_protocol(
-        text,
+        materialized_answer,
         forecast_horizon,
         allow_recovery=False,
     )
     line_count = len(normalized_nonempty_lines(parsed_answer or ""))
-    has_close = "</answer>" in text
+    has_close = "</answer>" in materialized_answer
     return {
         "strict_ok": parsed_answer is not None,
         "parse_mode": parse_mode,
@@ -150,6 +206,8 @@ def _parse_generated_answer(text: str, forecast_horizon: int) -> dict[str, Any]:
         "answer_line_count": int(line_count),
         "has_close_tag": bool(has_close),
         "exact_96_lines": bool(line_count == forecast_horizon),
+        "decision_name": decision_name or "",
+        "materialized": bool(candidate_prediction_text_map),
     }
 
 
@@ -306,12 +364,28 @@ def main() -> None:
                     do_sample=do_sample,
                     temperature=temperature,
                 )
-                raw_parsed = _parse_generated_answer(raw_generated_text, example.forecast_horizon)
-                generated_text, clamp_info = clamp_turn3_answer_horizon(
-                    raw_generated_text,
-                    example.forecast_horizon,
-                )
-                parsed = _parse_generated_answer(str(generated_text or ""), example.forecast_horizon)
+                if example.candidate_prediction_text_map:
+                    raw_parsed = _parse_generated_answer(
+                        raw_generated_text,
+                        example.forecast_horizon,
+                        candidate_prediction_text_map=example.candidate_prediction_text_map,
+                    )
+                    generated_text = raw_generated_text
+                    clamp_info = {
+                        "applied": False,
+                        "reason": "decision_materialization",
+                        "discarded_line_count": 0,
+                        "valid_prefix_line_count": 0,
+                        "raw_answer_line_count": 0,
+                    }
+                    parsed = dict(raw_parsed)
+                else:
+                    raw_parsed = _parse_generated_answer(raw_generated_text, example.forecast_horizon)
+                    generated_text, clamp_info = clamp_turn3_answer_horizon(
+                        raw_generated_text,
+                        example.forecast_horizon,
+                    )
+                    parsed = _parse_generated_answer(str(generated_text or ""), example.forecast_horizon)
                 result = {
                     "gate_name": gate_name,
                     "mode": mode,

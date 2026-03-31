@@ -112,13 +112,6 @@ ROUTING_TOOL_FIELD_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("extract_event_summary", ("dominant_pattern",)),
 )
 
-ROUTING_REASON_GUIDE = """### Routing Decision Guide
-- `arima`: stable linear trend or seasonality, high acf, few changepoints, low residual excursions.
-- `patchtst`: repeatable local motifs, regular peaks, moderate seasonal structure.
-- `itransformer`: broader structural drift, multiple changepoints, long monotone segments.
-- `chronos2`: irregular, noisy, weakly structured, or zero-shot windows."""
-
-
 def _format_routing_field_value(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -139,73 +132,6 @@ def _routing_tool_payload(
     return value if isinstance(value, Mapping) else None
 
 
-def _routing_signal_value(condition: bool | None) -> str:
-    if condition is None:
-        return "unknown"
-    return "yes" if bool(condition) else "no"
-
-
-def _routing_support_codes_from_payload(
-    payload: Mapping[str, Mapping[str, Any]],
-) -> dict[str, list[str]]:
-    basic = _routing_tool_payload(payload, "extract_basic_statistics")
-    dynamics = _routing_tool_payload(payload, "extract_within_channel_dynamics")
-    residuals = _routing_tool_payload(payload, "extract_forecast_residuals")
-    quality = _routing_tool_payload(payload, "extract_data_quality")
-    events = _routing_tool_payload(payload, "extract_event_summary")
-
-    acf1 = float(basic.get("acf1", 0.0)) if basic else 0.0
-    acf_seasonal = float(basic.get("acf_seasonal", 0.0)) if basic else 0.0
-    cusum_max = float(basic.get("cusum_max", 0.0)) if basic else 0.0
-    changepoint_count = float(dynamics.get("changepoint_count", 0.0)) if dynamics else 0.0
-    peak_count = float(dynamics.get("peak_count", 0.0)) if dynamics else 0.0
-    peak_spacing_cv = float(dynamics.get("peak_spacing_cv", 0.0)) if dynamics else 0.0
-    monotone_duration = float(dynamics.get("monotone_duration", 0.0)) if dynamics else 0.0
-    residual_exceed_ratio = float(residuals.get("residual_exceed_ratio", 0.0)) if residuals else 0.0
-    quality_quantization_score = float(quality.get("quality_quantization_score", 0.0)) if quality else 0.0
-    quality_saturation_ratio = float(quality.get("quality_saturation_ratio", 0.0)) if quality else 0.0
-    dominant_pattern = str(events.get("dominant_pattern", "unknown")) if events else "unknown"
-
-    supports = {
-        "arima": [],
-        "patchtst": [],
-        "itransformer": [],
-        "chronos2": [],
-    }
-
-    if basic and acf1 >= 0.93:
-        supports["arima"].append("acf1_high")
-    if basic and acf_seasonal >= 0.05:
-        supports["arima"].append("seasonality_visible")
-        supports["patchtst"].append("seasonality_visible")
-    if dynamics and changepoint_count <= 1.0:
-        supports["arima"].append("few_breaks")
-    if residuals and residual_exceed_ratio <= 0.05:
-        supports["arima"].append("residual_low")
-
-    if dynamics and 2.0 <= peak_count <= 5.0:
-        supports["patchtst"].append("repeatable_peaks")
-    if dynamics and peak_spacing_cv <= 0.30:
-        supports["patchtst"].append("peak_spacing_regular")
-    if events and dominant_pattern == "oscillation":
-        supports["patchtst"].append("oscillation")
-
-    if dynamics and changepoint_count >= 3.0:
-        supports["itransformer"].append("multi_breaks")
-    if basic and cusum_max >= 70.0:
-        supports["itransformer"].append("drift_high")
-    if dynamics and monotone_duration >= 0.10:
-        supports["itransformer"].append("long_monotone_segment")
-
-    if residuals and residual_exceed_ratio >= 0.08:
-        supports["chronos2"].append("residual_high")
-    if quality and (quality_saturation_ratio >= 0.08 or quality_quantization_score >= 0.24):
-        supports["chronos2"].append("quality_stress")
-    if dynamics and peak_count >= 6.0 and peak_spacing_cv >= 0.35:
-        supports["chronos2"].append("irregular_local_dynamics")
-    return supports
-
-
 def build_routing_evidence_card(
     *,
     routing_feature_payload: Mapping[str, Mapping[str, Any]] | None,
@@ -216,15 +142,23 @@ def build_routing_evidence_card(
     lines: list[str] = []
     lines.append("### Routing Evidence Card")
     lines.append(f"observed_tools=[{', '.join(completed) if completed else 'none'}]")
-    lines.append("expert_support_signals:")
-    supports = _routing_support_codes_from_payload(payload)
-    for model_name in ("arima", "patchtst", "itransformer", "chronos2"):
-        values = supports[model_name]
-        lines.append(f"- {model_name}=[{', '.join(values) if values else 'none'}]")
-
+    lines.append("tool_fields:")
+    for tool_name, field_names in ROUTING_TOOL_FIELD_GROUPS:
+        tool_payload = _routing_tool_payload(payload, tool_name)
+        if tool_payload is None:
+            continue
+        field_values: list[str] = []
+        for field_name in field_names:
+            if field_name not in tool_payload:
+                continue
+            display_name = next(
+                (display for internal_name, display in ROUTING_EVIDENCE_FIELDS if internal_name == field_name),
+                field_name,
+            )
+            field_values.append(f"{display_name}={_format_routing_field_value(tool_payload[field_name])}")
+        lines.append(f"- {tool_name}: {', '.join(field_values) if field_values else 'no_named_fields'}")
     missing_tools = [tool_name for tool_name, _field_names in ROUTING_TOOL_FIELD_GROUPS if tool_name not in payload]
     lines.append(f"missing_tool_groups=[{', '.join(missing_tools) if missing_tools else 'none'}]")
-    lines.append(ROUTING_REASON_GUIDE)
     return "\n".join(lines)
 
 
@@ -252,7 +186,7 @@ def build_refinement_evidence_card(
     lines.append(f"observed_tools=[{', '.join(observed_tools) if observed_tools else 'none'}]")
     lines.append(f"keep_support=[{', '.join(keep_support_signals) if keep_support_signals else 'none'}]")
     lines.append(f"support_signals=[{', '.join(support_signals) if support_signals else 'evidence_consistent'}]")
-    decision_options = ["keep_baseline"]
+    decision_options: list[str] = []
     if candidate_adjustments and candidate_adjustments != ["none"]:
         lines.append("edit_support:")
         for adjustment in candidate_adjustments:
@@ -262,6 +196,8 @@ def build_refinement_evidence_card(
             decision_options.append(adjustment)
     else:
         lines.append("candidate_adjustments=[none]")
+    if keep_baseline_allowed:
+        decision_options.append("keep_baseline")
     lines.append(f"decision_options=[{', '.join(decision_options)}]")
     lines.append(f"keep_baseline_allowed={'yes' if keep_baseline_allowed else 'no'}")
     return "\n".join(lines)
@@ -272,6 +208,7 @@ def get_runtime_turn_info(
     prediction_results: Optional[str],
     forecast_horizon: int = 96,
     turn_stage: Optional[str] = None,
+    route_default_expert: Optional[str] = None,
 ) -> tuple[str, str]:
     stage = _normalize_turn_stage(turn_stage)
     if not stage:
@@ -291,6 +228,11 @@ def get_runtime_turn_info(
             "Do NOT call predict_time_series yet."
         )
     if stage == "routing":
+        if route_default_expert:
+            return "Routing", (
+                "Decide whether to keep the default forecasting expert or override it once, "
+                "then call route_time_series exactly once."
+            )
         return "Routing", "Choose one forecasting expert from the current analysis state and call predict_time_series exactly once."
     return "Refinement", (
         "Review the selected model forecast against the diagnostics, then produce the final forecast. "
@@ -314,6 +256,7 @@ def build_runtime_user_prompt(
     routing_feature_payload: Mapping[str, Mapping[str, Any]] | None = None,
     refinement_feature_payload: Mapping[str, Any] | None = None,
     turn_stage: Optional[str] = None,
+    route_default_expert: Optional[str] = None,
 ) -> str:
     history_records = list(history_analysis or [])
     available_diagnostic_tools = [str(name) for name in (available_feature_tools or []) if str(name).strip()]
@@ -328,6 +271,7 @@ def build_runtime_user_prompt(
         prediction_results,
         forecast_horizon=forecast_horizon,
         turn_stage=turn_stage,
+        route_default_expert=route_default_expert,
     )
     normalized_stage = _normalize_turn_stage(turn_stage) or stage_name.lower()
 
@@ -361,7 +305,7 @@ def build_runtime_user_prompt(
 3. Make the refinement decision from the Refinement Evidence Card first, then verify it against the recent historical window.
 4. Choose exactly one decision from `decision_options`.
 5. Use `keep_support` to decide whether the selected forecast already matches the evidence card.
-6. `keep_baseline` is always allowed when the selected forecast already matches the evidence card.
+6. Choose `keep_baseline` only when no listed adjustment is directly supported by the evidence.
 7. Only choose a local edit when that exact edit's `support=[...]` line clearly justifies changing the selected forecast.
 8. Output exactly one `<think>...</think>` block followed immediately by one `<answer>...</answer>` block.
 9. `<think>` should briefly explain whether the selected forecast already matches the evidence card or why one local edit is needed.
@@ -398,14 +342,50 @@ def build_runtime_user_prompt(
             routing_feature_payload=routing_feature_payload,
             completed_feature_tools=completed_tools,
         )
+        default_expert = str(route_default_expert or "").strip().lower()
+        if default_expert:
+            override_models = [name for name in ("patchtst", "itransformer", "arima", "chronos2") if name != default_expert]
+            return f"""**[Stage: {stage_name}] Action: {action}**
+### Lookback Window: {lookback_window} rows
+### Forecast Horizon: {forecast_horizon} rows
+### Default Expert: {default_expert}
+{evidence_card}
+
+### Analysis Summary
+{history_text}
+
+**Instructions**:
+- Do NOT call feature extraction tools again.
+- Decide between `keep_default` and `override` using only the listed evidence.
+- `keep_default` keeps the default path with `{default_expert}`.
+- `override` proposes one alternative expert path for downstream comparison.
+- If you choose `override`, set `model_name` to exactly one of `{", ".join(override_models)}`.
+- Do NOT override back to the default expert.
+- Do NOT rely on hidden heuristics or template rules that are not supported by the listed evidence.
+- The `route_time_series` call must be emitted as strict JSON inside `<tool_call>...</tool_call>`.
+- Use the exact function name `route_time_series`. Never emit placeholders such as `tool_name`.
+- Call route_time_series exactly once.
+- Valid keep example:
+<tool_call>
+{{"name":"route_time_series","arguments":{{"decision":"keep_default"}}}}
+</tool_call>
+- Valid override example:
+<tool_call>
+{{"name":"route_time_series","arguments":{{"decision":"override","model_name":"patchtst"}}}}
+</tool_call>
+"""
         return f"""**[Stage: {stage_name}] Action: {action}**
 ### Lookback Window: {lookback_window} rows
 ### Forecast Horizon: {forecast_horizon} rows
 {evidence_card}
 
+### Analysis Summary
+{history_text}
+
 **Instructions**:
 - Do NOT call feature extraction tools again.
-- Make the routing decision from the structured evidence card only.
+- Use the observed tool statistics and analysis summary to choose one expert.
+- Do NOT rely on hidden heuristics or template rules that are not supported by the listed evidence.
 - Do NOT restate the evidence in long prose.
 - The `predict_time_series` call must be emitted as strict JSON inside `<tool_call>...</tool_call>`.
 - Use the exact function name `predict_time_series`. Never emit placeholders such as `tool_name`.
@@ -441,6 +421,34 @@ PREDICT_TIMESERIES_TOOL_SCHEMA = {
                 }
             },
             "required": ["model_name"],
+        },
+    },
+}
+
+ROUTE_TIMESERIES_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "route_time_series",
+        "description": (
+            "Call this only in the routing turn after completing diagnostic analysis. "
+            "Use decision='keep_default' to keep the default forecasting expert, or "
+            "decision='override' together with model_name to override to another expert."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "description": "Whether to keep the default expert or override it.",
+                    "enum": ["keep_default", "override"],
+                },
+                "model_name": {
+                    "type": "string",
+                    "description": "Required only when decision='override'. Forecasting expert to override to.",
+                    "enum": ["patchtst", "itransformer", "arima", "chronos2"],
+                },
+            },
+            "required": ["decision"],
         },
     },
 }
@@ -530,6 +538,7 @@ TIMESERIES_TOOL_SCHEMAS = [
     EXTRACT_FORECAST_RESIDUALS_SCHEMA,
     EXTRACT_DATA_QUALITY_SCHEMA,
     EXTRACT_EVENT_SUMMARY_SCHEMA,
+    ROUTE_TIMESERIES_TOOL_SCHEMA,
     PREDICT_TIMESERIES_TOOL_SCHEMA,
 ]
 

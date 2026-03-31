@@ -2,7 +2,11 @@ import unittest
 
 import pandas as pd
 
-from recipe.time_series_forecast.prompts import build_runtime_user_prompt, build_timeseries_system_prompt
+from recipe.time_series_forecast.prompts import (
+    build_refinement_evidence_card,
+    build_runtime_user_prompt,
+    build_timeseries_system_prompt,
+)
 from recipe.time_series_forecast.reward import (
     ENABLE_CHANGE_POINT_SCORE,
     ENABLE_SEASON_TREND_SCORE,
@@ -21,7 +25,7 @@ from recipe.time_series_forecast.utils import compact_prediction_tool_output_fro
 
 
 class CompactProtocolTests(unittest.TestCase):
-    def test_turn_two_prompt_omits_duplicate_analysis_history(self) -> None:
+    def test_turn_two_prompt_keeps_analysis_summary_and_raw_statistics(self) -> None:
         prompt = build_runtime_user_prompt(
             data_source="ETTh1",
             target_column="OT",
@@ -43,16 +47,15 @@ class CompactProtocolTests(unittest.TestCase):
         )
         self.assertIn("### Routing Evidence Card", prompt)
         self.assertIn("observed_tools=[extract_basic_statistics]", prompt)
-        self.assertIn("expert_support_signals:", prompt)
-        self.assertIn("- arima=[seasonality_visible]", prompt)
-        self.assertIn("- patchtst=[seasonality_visible]", prompt)
-        self.assertIn("- itransformer=[none]", prompt)
-        self.assertIn("- chronos2=[none]", prompt)
+        self.assertIn("tool_fields:", prompt)
+        self.assertIn("- extract_basic_statistics: acf1=0.9100, acf_seasonal=0.1200, cusum_max=42.0000", prompt)
+        self.assertIn("### Analysis Summary", prompt)
+        self.assertIn("Median: 2.0000", prompt)
         self.assertNotIn("### Historical Data", prompt)
-        self.assertNotIn("Median: 2.0000", prompt)
+        self.assertNotIn("expert_support_signals:", prompt)
         self.assertNotIn("already present earlier in this conversation", prompt)
 
-    def test_turn_two_prompt_uses_paper_routing_instruction(self) -> None:
+    def test_turn_two_prompt_omits_routing_decision_guide(self) -> None:
         prompt = build_runtime_user_prompt(
             data_source="ETTh1",
             target_column="OT",
@@ -72,11 +75,10 @@ class CompactProtocolTests(unittest.TestCase):
             },
             turn_stage="routing",
         )
-        self.assertIn("### Routing Decision Guide", prompt)
-        self.assertIn("stable linear trend or seasonality", prompt)
-        self.assertIn("repeatable local motifs", prompt)
-        self.assertIn("broader structural drift", prompt)
-        self.assertIn("irregular, noisy, weakly structured, or zero-shot windows", prompt)
+        self.assertNotIn("### Routing Decision Guide", prompt)
+        self.assertNotIn("stable linear trend or seasonality", prompt)
+        self.assertIn("Use the observed tool statistics and analysis summary to choose one expert.", prompt)
+        self.assertIn("Do NOT rely on hidden heuristics or template rules", prompt)
 
     def test_routing_prompt_warns_against_placeholder_tool_names(self) -> None:
         prompt = build_runtime_user_prompt(
@@ -100,6 +102,33 @@ class CompactProtocolTests(unittest.TestCase):
         )
         self.assertIn("Use the exact function name `predict_time_series`.", prompt)
         self.assertIn('{"name":"predict_time_series","arguments":{"model_name":"arima"}}', prompt)
+
+    def test_routing_prompt_supports_default_override_route_schema(self) -> None:
+        prompt = build_runtime_user_prompt(
+            data_source="ETTh1",
+            target_column="OT",
+            lookback_window=96,
+            forecast_horizon=96,
+            time_series_data="1.0000\n2.0000\n3.0000",
+            history_analysis=["Basic Statistics:\n  Median: 2.0000"],
+            prediction_results=None,
+            available_feature_tools=["extract_basic_statistics"],
+            completed_feature_tools=["extract_basic_statistics"],
+            routing_feature_payload={
+                "extract_basic_statistics": {
+                    "acf1": 0.91,
+                    "acf_seasonal": 0.12,
+                    "cusum_max": 42.0,
+                }
+            },
+            turn_stage="routing",
+            route_default_expert="itransformer",
+        )
+        self.assertIn("### Default Expert: itransformer", prompt)
+        self.assertIn("route_time_series", prompt)
+        self.assertIn('{"name":"route_time_series","arguments":{"decision":"keep_default"}}', prompt)
+        self.assertIn('{"name":"route_time_series","arguments":{"decision":"override","model_name":"patchtst"}}', prompt)
+        self.assertIn("Do NOT override back to the default expert.", prompt)
 
     def test_turn_three_prompt_omits_duplicate_predictions(self) -> None:
         prompt = build_runtime_user_prompt(
@@ -126,7 +155,7 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertIn("base forecast from the selected model", prompt)
         self.assertIn("Make the refinement decision from the Refinement Evidence Card first", prompt)
         self.assertIn("decision_options=[keep_baseline]", prompt)
-        self.assertIn("`keep_baseline` is always allowed", prompt)
+        self.assertIn("Choose `keep_baseline` only when no listed adjustment is directly supported", prompt)
         self.assertIn("Only choose a local edit when that exact edit's `support=[...]` line clearly justifies", prompt)
         self.assertIn("No tool schema is available in this turn", prompt)
         self.assertIn("exactly one `<think>...</think>` block followed immediately by one `<answer>...</answer>` block", prompt)
@@ -136,6 +165,24 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertNotIn("already present earlier in this conversation", prompt)
         self.assertNotIn("[Brief reflection", prompt)
         self.assertNotIn("[Final prediction", prompt)
+
+    def test_refinement_evidence_card_puts_keep_after_adjustments(self) -> None:
+        card = build_refinement_evidence_card(
+            refinement_feature_payload={
+                "observed_tools": ["extract_forecast_residuals"],
+                "support_signals": ["residual_mismatch"],
+                "keep_support_signals": [],
+                "candidate_adjustments": ["local_level_adjust", "local_slope_adjust"],
+                "edit_support_signals": {
+                    "local_level_adjust": ["level_shift_detected"],
+                    "local_slope_adjust": ["slope_drift_detected"],
+                },
+                "keep_baseline_allowed": True,
+            },
+            prediction_model_used="patchtst",
+        )
+
+        self.assertIn("decision_options=[local_level_adjust, local_slope_adjust, keep_baseline]", card)
 
     def test_turn_one_prompt_lists_available_diagnostic_tools(self) -> None:
         prompt = build_runtime_user_prompt(

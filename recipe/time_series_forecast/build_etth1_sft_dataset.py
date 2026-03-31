@@ -21,6 +21,7 @@ from recipe.time_series_forecast.config_utils import (
 from recipe.time_series_forecast.prompts import (
     FEATURE_TOOL_SCHEMAS,
     PREDICT_TIMESERIES_TOOL_SCHEMA,
+    ROUTE_TIMESERIES_TOOL_SCHEMA,
     build_routing_evidence_card,
     build_runtime_user_prompt,
     build_timeseries_system_prompt,
@@ -69,10 +70,17 @@ from recipe.time_series_forecast.utils import (
 
 
 SUPPORTED_PREDICTION_MODELS = {"patchtst", "itransformer", "arima", "chronos2"}
+ROUTE_DECISION_KEEP_DEFAULT = "keep_default"
+ROUTE_DECISION_OVERRIDE = "override"
+SUPPORTED_ROUTE_DECISIONS = {
+    ROUTE_DECISION_KEEP_DEFAULT,
+    ROUTE_DECISION_OVERRIDE,
+}
 TURN3_TARGET_MODE_PAPER_STRICT = "paper_strict"
 TURN3_TARGET_MODE_ENGINEERING_REFINE = "engineering_refine"
 ROUTING_LABEL_SOURCE_HEURISTIC = "heuristic"
 ROUTING_LABEL_SOURCE_REFERENCE_TEACHER = "reference_teacher"
+ROUTING_LABEL_SOURCE_DEFAULT_OVERRIDE = "default_override"
 SFT_STAGE_MODE_FULL = "full"
 SFT_STAGE_MODE_ROUTING_ONLY = "routing_only"
 SFT_STAGE_MODE_REFINEMENT_ONLY = "refinement_only"
@@ -83,6 +91,7 @@ SUPPORTED_TURN3_TARGET_MODES = {
 SUPPORTED_ROUTING_LABEL_SOURCES = {
     ROUTING_LABEL_SOURCE_HEURISTIC,
     ROUTING_LABEL_SOURCE_REFERENCE_TEACHER,
+    ROUTING_LABEL_SOURCE_DEFAULT_OVERRIDE,
 }
 SUPPORTED_SFT_STAGE_MODES = {
     SFT_STAGE_MODE_FULL,
@@ -95,7 +104,7 @@ SUPPORTED_TRAIN_TURN3_REBALANCE_MODES = {
     TRAIN_TURN3_REBALANCE_MODE_DOWNSAMPLE_KEEP,
     TRAIN_TURN3_REBALANCE_MODE_OVERSAMPLE_LOCAL_REFINE,
 }
-DEFAULT_TURN3_TARGET_MODE = TURN3_TARGET_MODE_PAPER_STRICT
+DEFAULT_TURN3_TARGET_MODE = TURN3_TARGET_MODE_ENGINEERING_REFINE
 # Formal step-wise SFT should imitate the offline reference teacher route by
 # default; the heuristic router remains available only for ablations/debugging.
 DEFAULT_ROUTING_LABEL_SOURCE = ROUTING_LABEL_SOURCE_REFERENCE_TEACHER
@@ -425,6 +434,70 @@ def _validate_paper_turn3_protocol(
 def _normalize_teacher_model(model_name: Any) -> str:
     model = str(model_name or "patchtst").strip().lower()
     return model if model in SUPPORTED_PREDICTION_MODELS else "patchtst"
+
+
+def _normalize_supported_model_or_empty(model_name: Any) -> str:
+    model = str(model_name or "").strip().lower()
+    return model if model in SUPPORTED_PREDICTION_MODELS else ""
+
+
+def _normalize_route_decision(decision: Any) -> str:
+    normalized = str(decision or "").strip().lower()
+    return normalized if normalized in SUPPORTED_ROUTE_DECISIONS else ""
+
+
+def _normalize_route_label(route_label: Any) -> str:
+    normalized = str(route_label or "").strip().lower()
+    if normalized == ROUTE_DECISION_KEEP_DEFAULT:
+        return ROUTE_DECISION_KEEP_DEFAULT
+    if normalized.startswith("override_to_"):
+        override_model = _normalize_supported_model_or_empty(normalized.split("override_to_", 1)[1])
+        if not override_model:
+            return ""
+        return f"override_to_{override_model}"
+    return ""
+
+
+def _resolve_route_override_target(sample: dict[str, Any]) -> dict[str, Any] | None:
+    default_expert = _normalize_supported_model_or_empty(sample.get("default_expert") or sample.get("route_default_expert"))
+    route_label = _normalize_route_label(sample.get("route_label"))
+    route_decision = _normalize_route_decision(sample.get("route_decision"))
+    override_model = _normalize_supported_model_or_empty(sample.get("route_override_model"))
+
+    if not default_expert or not route_label:
+        return None
+
+    if route_label == ROUTE_DECISION_KEEP_DEFAULT:
+        return {
+            "default_expert": default_expert,
+            "route_label": ROUTE_DECISION_KEEP_DEFAULT,
+            "route_decision": ROUTE_DECISION_KEEP_DEFAULT,
+            "override_model": "",
+            "resolved_model": default_expert,
+            "tool_arguments": {"decision": ROUTE_DECISION_KEEP_DEFAULT},
+        }
+
+    if not route_decision:
+        route_decision = ROUTE_DECISION_OVERRIDE
+    if route_decision != ROUTE_DECISION_OVERRIDE:
+        return None
+
+    if not override_model:
+        override_model = _normalize_supported_model_or_empty(route_label.split("override_to_", 1)[1])
+    if not override_model or override_model == default_expert:
+        return None
+
+    return {
+        "default_expert": default_expert,
+        "route_label": route_label,
+        "route_decision": ROUTE_DECISION_OVERRIDE,
+        "override_model": override_model,
+        "resolved_model": override_model,
+        "tool_arguments": {
+            "decision": ROUTE_DECISION_OVERRIDE,
+            "model_name": override_model,
+        },
+    }
 
 
 def _normalize_routing_label_source(routing_label_source: str | None) -> str:
@@ -1084,145 +1157,6 @@ def _build_routing_feature_payload(
     return payload
 
 
-def _build_routing_reason_codes(
-    *,
-    model_name: str,
-    history_values: Sequence[float],
-    selected_feature_tools: Sequence[str],
-) -> list[str]:
-    snapshot = _compute_routing_feature_snapshot(history_values)
-    selected = set(selected_feature_tools or [])
-    codes: list[str] = []
-
-    if model_name == "arima":
-        if "extract_basic_statistics" in selected and float(snapshot.get("acf1", 0.0)) >= 0.88:
-            codes.append("acf1_high")
-        if "extract_basic_statistics" in selected and float(snapshot.get("acf_seasonal", 0.0)) >= 0.05:
-            codes.append("seasonality_visible")
-        if "extract_within_channel_dynamics" in selected and float(snapshot.get("changepoint_count", 0.0)) <= 1.0:
-            codes.append("few_breaks")
-        if "extract_forecast_residuals" in selected and float(snapshot.get("residual_exceed_ratio", 0.0)) <= 0.05:
-            codes.append("residual_low")
-    elif model_name == "patchtst":
-        if "extract_within_channel_dynamics" in selected and 2.0 <= float(snapshot.get("peak_count", 0.0)) <= 5.0:
-            codes.append("repeatable_peaks")
-        if "extract_within_channel_dynamics" in selected and float(snapshot.get("peak_spacing_cv", 0.0)) <= 0.30:
-            codes.append("peak_spacing_regular")
-        if "extract_event_summary" in selected and str(snapshot.get("dominant_pattern", "") or "") == "oscillation":
-            codes.append("oscillation")
-    elif model_name == "itransformer":
-        if "extract_within_channel_dynamics" in selected and float(snapshot.get("changepoint_count", 0.0)) >= 2.0:
-            codes.append("multi_breaks")
-        if "extract_basic_statistics" in selected and float(snapshot.get("cusum_max", 0.0)) >= 70.0:
-            codes.append("drift_high")
-        if "extract_within_channel_dynamics" in selected and float(snapshot.get("monotone_duration", 0.0)) >= 0.10:
-            codes.append("long_monotone_segment")
-    else:
-        if "extract_forecast_residuals" in selected and float(snapshot.get("residual_exceed_ratio", 0.0)) >= 0.08:
-            codes.append("residual_high")
-        if "extract_data_quality" in selected and (
-            float(snapshot.get("quality_quantization_score", 0.0)) >= 0.24
-            or float(snapshot.get("quality_saturation_ratio", 0.0)) >= 0.08
-        ):
-            codes.append("quality_stress")
-        if "extract_within_channel_dynamics" in selected and (
-            float(snapshot.get("peak_count", 0.0)) >= 6.0
-            and float(snapshot.get("peak_spacing_cv", 0.0)) >= 0.35
-        ):
-            codes.append("irregular_local_dynamics")
-
-    if not codes:
-        codes.append("evidence_match")
-    return codes
-
-
-def _build_snapshot_grounded_routing_reason(
-    *,
-    model_name: str,
-    feature_snapshot: dict[str, Any],
-    selected_feature_tools: Sequence[str],
-) -> str:
-    selected = set(selected_feature_tools or [])
-    evidence_phrases: list[str] = []
-
-    acf1 = float(feature_snapshot.get("acf1", 0.0))
-    acf_seasonal = float(feature_snapshot.get("acf_seasonal", 0.0))
-    cusum_max = float(feature_snapshot.get("cusum_max", 0.0))
-    changepoint_count = float(feature_snapshot.get("changepoint_count", 0.0))
-    peak_count = float(feature_snapshot.get("peak_count", 0.0))
-    peak_spacing_cv = float(feature_snapshot.get("peak_spacing_cv", 0.0))
-    monotone_duration = float(feature_snapshot.get("monotone_duration", 0.0))
-    residual_exceed_ratio = float(feature_snapshot.get("residual_exceed_ratio", 0.0))
-    quality_quantization_score = float(feature_snapshot.get("quality_quantization_score", 0.0))
-    quality_saturation_ratio = float(feature_snapshot.get("quality_saturation_ratio", 0.0))
-    dominant_pattern = str(feature_snapshot.get("dominant_pattern", "") or "")
-
-    if model_name == "arima":
-        if "extract_basic_statistics" in selected and acf1 >= 0.88:
-            evidence_phrases.append("high short-lag autocorrelation")
-        if "extract_within_channel_dynamics" in selected and changepoint_count <= 1.0:
-            evidence_phrases.append("few structural breaks")
-        if "extract_forecast_residuals" in selected and residual_exceed_ratio <= 0.05:
-            evidence_phrases.append("small residual exceed ratio")
-        if not evidence_phrases:
-            evidence_phrases.append("stable and locally predictable dynamics")
-        evidence_text = _format_phrase_list(evidence_phrases)
-        return (
-            f"The diagnostics indicate {evidence_text}. The selected routing label follows the expert whose "
-            "inductive bias best matches this window."
-        )
-
-    if model_name == "patchtst":
-        if "extract_within_channel_dynamics" in selected and 2.0 <= peak_count <= 5.0:
-            evidence_phrases.append("repeatable local peaks")
-        if "extract_within_channel_dynamics" in selected and peak_spacing_cv <= 0.30:
-            evidence_phrases.append("regular peak spacing")
-        if "extract_basic_statistics" in selected and acf_seasonal >= 0.05:
-            evidence_phrases.append("seasonal correlation")
-        if dominant_pattern == "oscillation":
-            evidence_phrases.append("oscillatory local motifs")
-        if not evidence_phrases:
-            evidence_phrases.append("repeatable local motifs")
-        evidence_text = _format_phrase_list(evidence_phrases)
-        return (
-            f"The diagnostics indicate {evidence_text}. The selected routing label follows the expert whose "
-            "inductive bias best matches this window."
-        )
-
-    if model_name == "itransformer":
-        if "extract_within_channel_dynamics" in selected and changepoint_count >= 2.0:
-            evidence_phrases.append("multiple changepoints")
-        if "extract_basic_statistics" in selected and cusum_max >= 70.0:
-            evidence_phrases.append("large cumulative drift")
-        if "extract_within_channel_dynamics" in selected and monotone_duration >= 0.10:
-            evidence_phrases.append("persistent directional segments")
-        if dominant_pattern in {"rise", "fall"}:
-            evidence_phrases.append("broader regime movement")
-        if not evidence_phrases:
-            evidence_phrases.append("broader structural drift")
-        evidence_text = _format_phrase_list(evidence_phrases)
-        return (
-            f"The diagnostics indicate {evidence_text}. The selected routing label follows the expert whose "
-            "inductive bias best matches this window."
-        )
-
-    if "extract_forecast_residuals" in selected and residual_exceed_ratio >= 0.08:
-        evidence_phrases.append("large residual excursions")
-    if "extract_data_quality" in selected and (
-        quality_quantization_score >= 0.24 or quality_saturation_ratio >= 0.08
-    ):
-        evidence_phrases.append("data-quality stress")
-    if "extract_within_channel_dynamics" in selected and peak_count >= 6.0 and peak_spacing_cv >= 0.35:
-        evidence_phrases.append("highly irregular local dynamics")
-    if not evidence_phrases:
-        evidence_phrases.append("irregular or noisy behavior")
-    evidence_text = _format_phrase_list(evidence_phrases)
-    return (
-        f"The diagnostics indicate {evidence_text}. The selected routing label follows the expert whose "
-        "inductive bias best matches this window."
-    )
-
-
 def build_routing_reflection(
     *,
     model_name: str,
@@ -1230,20 +1164,17 @@ def build_routing_reflection(
     selected_feature_tools: Sequence[str],
     decision_reason: str = "",
     include_heuristic_comparison: bool = True,
+    route_default_expert: str = "",
+    route_decision: str = "",
 ) -> str:
+    del model_name
+    del history_values
+    del selected_feature_tools
+    del decision_reason
     del include_heuristic_comparison
-    reason_codes = _build_routing_reason_codes(
-        model_name=model_name,
-        history_values=history_values,
-        selected_feature_tools=selected_feature_tools,
-    )
-    reason_text = str(decision_reason or "").strip()
-    lines = [
-        f'RouteDecision(model_name="{model_name}", reason_codes=[{", ".join(reason_codes)}])',
-    ]
-    if reason_text:
-        lines.append(f"RouteSummary: {reason_text}")
-    return "\n".join(lines)
+    if str(route_default_expert or "").strip() and str(route_decision or "").strip():
+        return "Use the diagnostic evidence to decide whether the default forecaster should be kept or overridden."
+    return "Use the diagnostic evidence to choose one forecasting model."
 
 
 def build_final_answer(
@@ -1365,7 +1296,8 @@ def build_sft_records(
 
     reference_teacher_model = _resolve_reference_teacher_model(sample)
     second_teacher_model = _normalize_teacher_model(sample.get("teacher_eval_second_best_model"))
-    heuristic_selected_prediction_model, routing_feature_snapshot, heuristic_routing_policy_reason = _select_prediction_model_by_heuristic(
+    route_override_target = _resolve_route_override_target(sample)
+    heuristic_selected_prediction_model, _routing_feature_snapshot, _heuristic_routing_policy_reason = _select_prediction_model_by_heuristic(
         history_values,
         selected_feature_tools=selected_feature_tools,
     )
@@ -1376,79 +1308,109 @@ def build_sft_records(
         teacher_eval_score_margin=sample.get("teacher_eval_score_margin"),
     )
     selected_prediction_model = heuristic_selected_prediction_model
-    routing_policy_reason = heuristic_routing_policy_reason
+    routing_policy_reason = ""
     routing_policy_source = "heuristic_rule_based"
-    if (
+    effective_routing_label_source = routing_label_source
+    route_default_expert = ""
+    route_decision = ""
+    route_override_model = ""
+    route_tool_name = "predict_time_series"
+    route_tool_arguments: dict[str, Any] = {}
+
+    if route_override_target is not None:
+        selected_prediction_model = str(route_override_target["resolved_model"])
+        effective_routing_label_source = ROUTING_LABEL_SOURCE_DEFAULT_OVERRIDE
+        route_default_expert = str(route_override_target["default_expert"])
+        route_decision = str(route_override_target["route_decision"])
+        route_override_model = str(route_override_target["override_model"])
+        route_tool_name = "route_time_series"
+        route_tool_arguments = dict(route_override_target["tool_arguments"])
+        routing_policy_source = "route_override_bootstrap"
+        routing_policy_reason = str(route_override_target["route_label"])
+        routing_confidence_tier = str(
+            sample.get("route_label_confidence")
+            or sample.get("route_bootstrap_confidence_tier")
+            or "mid"
+        ).strip().lower()
+    elif (
         routing_label_source == ROUTING_LABEL_SOURCE_REFERENCE_TEACHER
         and _sample_has_reference_teacher_model(sample)
     ):
         selected_prediction_model = reference_teacher_model
         routing_policy_source = "reference_teacher_offline_best"
-        routing_policy_reason = _build_snapshot_grounded_routing_reason(
-            model_name=selected_prediction_model,
-            feature_snapshot=routing_feature_snapshot,
-            selected_feature_tools=selected_feature_tools,
-        )
 
-    def _resolve_selected_prediction(model_name: str) -> tuple[str, str]:
-        return _resolve_prediction_text(
+    routing_only_mode = sft_stage_mode == SFT_STAGE_MODE_ROUTING_ONLY
+    base_prediction_source = "route_label_only" if routing_only_mode else ""
+    turn3_target: dict[str, Any] | None = None
+    turn3_base_prediction_text = ""
+    if not routing_only_mode:
+        def _resolve_selected_prediction(model_name: str) -> tuple[str, str]:
+            return _resolve_prediction_text(
+                sample=sample,
+                historical_data=historical_data,
+                data_source=data_source,
+                target_column=target_column,
+                forecast_horizon=forecast_horizon,
+                model_name=model_name,
+                allow_cached_reference=(model_name == reference_teacher_model),
+            )
+
+        try:
+            base_prediction_text, base_prediction_source = _resolve_selected_prediction(selected_prediction_model)
+        except Exception as primary_exc:
+            fallback_models: list[str] = []
+            for fallback_model in [reference_teacher_model, second_teacher_model]:
+                fallback_model = _normalize_teacher_model(fallback_model)
+                if fallback_model == selected_prediction_model or fallback_model in fallback_models:
+                    continue
+                fallback_models.append(fallback_model)
+
+            for fallback_model in fallback_models:
+                try:
+                    base_prediction_text, base_prediction_source = _resolve_selected_prediction(fallback_model)
+                    selected_prediction_model = fallback_model
+                    if route_override_target is not None:
+                        route_tool_name = "route_time_series"
+                        route_decision = ROUTE_DECISION_OVERRIDE if fallback_model != route_default_expert else ROUTE_DECISION_KEEP_DEFAULT
+                        route_override_model = fallback_model if route_decision == ROUTE_DECISION_OVERRIDE else ""
+                        route_tool_arguments = (
+                            {"decision": ROUTE_DECISION_KEEP_DEFAULT}
+                            if route_decision == ROUTE_DECISION_KEEP_DEFAULT
+                            else {"decision": ROUTE_DECISION_OVERRIDE, "model_name": fallback_model}
+                        )
+                        routing_policy_source = "route_override_bootstrap_fallback"
+                    else:
+                        routing_policy_source = "heuristic_rule_based_fallback"
+                    routing_policy_reason = f"fallback_to={fallback_model}"
+                    break
+                except Exception:
+                    continue
+            else:
+                raise primary_exc
+
+        turn3_target = _build_turn3_target(
             sample=sample,
             historical_data=historical_data,
-            data_source=data_source,
-            target_column=target_column,
+            history_values=history_values,
+            base_prediction_text=base_prediction_text,
             forecast_horizon=forecast_horizon,
-            model_name=model_name,
-            allow_cached_reference=(model_name == reference_teacher_model),
+            model_name=selected_prediction_model,
+            selected_feature_tools=selected_feature_tools,
+            turn3_target_mode=turn3_target_mode,
+        )
+        _require_prediction_values(
+            turn3_target["refined_prediction_text"],
+            forecast_horizon,
+            source_name="turn3_target",
+        )
+        turn3_base_prediction_text = _canonical_prediction_text(
+            base_prediction_text,
+            forecast_horizon,
+            history_text=historical_data,
         )
 
-    try:
-        base_prediction_text, base_prediction_source = _resolve_selected_prediction(selected_prediction_model)
-    except Exception as primary_exc:
-        fallback_models: list[str] = []
-        for fallback_model in [reference_teacher_model, second_teacher_model]:
-            fallback_model = _normalize_teacher_model(fallback_model)
-            if fallback_model == selected_prediction_model or fallback_model in fallback_models:
-                continue
-            fallback_models.append(fallback_model)
-
-        for fallback_model in fallback_models:
-            try:
-                base_prediction_text, base_prediction_source = _resolve_selected_prediction(fallback_model)
-                selected_prediction_model = fallback_model
-                routing_policy_source = "heuristic_rule_based_fallback"
-                routing_policy_reason = (
-                    f"{routing_policy_reason} The planned model was unavailable during dataset construction, "
-                    f"so I fallback to {fallback_model}."
-                ).strip()
-                break
-            except Exception:
-                continue
-        else:
-            raise primary_exc
-
-    turn3_target = _build_turn3_target(
-        sample=sample,
-        historical_data=historical_data,
-        history_values=history_values,
-        base_prediction_text=base_prediction_text,
-        forecast_horizon=forecast_horizon,
-        model_name=selected_prediction_model,
-        selected_feature_tools=selected_feature_tools,
-        turn3_target_mode=turn3_target_mode,
-    )
-    _require_prediction_values(
-        turn3_target["refined_prediction_text"],
-        forecast_horizon,
-        source_name="turn3_target",
-    )
-    turn3_base_prediction_text = _canonical_prediction_text(
-        base_prediction_text,
-        forecast_horizon,
-        history_text=historical_data,
-    )
-
     system_prompt = build_timeseries_system_prompt(data_source=data_source, target_column=target_column)
-    trajectory_turn_count = len(diagnostic_tool_batches) + 2
+    trajectory_turn_count = len(diagnostic_tool_batches) + (1 if routing_only_mode else 2)
     source_sample_index = int(sample.get("index", -1))
     shared_fields = {
         "source_sample_index": source_sample_index,
@@ -1465,7 +1427,7 @@ def build_sft_records(
             == str(reference_teacher_model or "").strip().lower()
         ),
         "selected_prediction_model": selected_prediction_model,
-        "routing_label_source": routing_label_source,
+        "routing_label_source": effective_routing_label_source,
         "diagnostic_plan_reason": diagnostic_plan.rationale,
         "diagnostic_primary_model": diagnostic_plan.primary_model,
         "diagnostic_runner_up_model": diagnostic_plan.runner_up_model,
@@ -1473,39 +1435,73 @@ def build_sft_records(
         "routing_confidence_tier": routing_confidence_tier,
         "routing_policy_source": routing_policy_source,
         "routing_policy_reason": routing_policy_reason,
+        "route_default_expert": route_default_expert or sample.get("route_default_expert") or sample.get("default_expert"),
+        "route_decision": route_decision or sample.get("route_decision"),
+        "route_override_model": route_override_model or sample.get("route_override_model"),
+        "route_label": (
+            ROUTE_DECISION_KEEP_DEFAULT
+            if route_decision == ROUTE_DECISION_KEEP_DEFAULT
+            else (f"override_to_{route_override_model}" if route_decision == ROUTE_DECISION_OVERRIDE and route_override_model else sample.get("route_label"))
+        ),
+        "route_label_confidence": sample.get("route_label_confidence"),
+        "default_expert": sample.get("default_expert"),
+        "default_error": sample.get("default_error"),
+        "best_model": sample.get("best_model"),
+        "best_error": sample.get("best_error"),
+        "improvement_vs_default": sample.get("improvement_vs_default"),
+        "improvement_vs_default_rel": sample.get("improvement_vs_default_rel"),
         "base_prediction_source": base_prediction_source,
         "selected_feature_tools": list(selected_feature_tools),
         "selected_feature_tool_count": len(selected_feature_tools),
         "selected_feature_tool_signature": _feature_tool_signature(selected_feature_tools),
         "turn3_target_mode": turn3_target_mode,
-        "turn3_target_type": turn3_target["turn3_target_type"],
-        "turn3_trigger_reason": turn3_target["turn3_trigger_reason"],
-        "refinement_support_signals": turn3_target["refinement_support_signals"],
-        "refinement_support_signal_signature": turn3_target["refinement_support_signal_signature"],
-        "refinement_keep_support_signals": turn3_target["refinement_keep_support_signals"],
-        "refinement_keep_support_signal_signature": turn3_target["refinement_keep_support_signal_signature"],
-        "refinement_edit_support_signals": turn3_target["refinement_edit_support_signals"],
-        "refinement_candidate_adjustments": turn3_target["refinement_candidate_adjustments"],
-        "refinement_candidate_adjustment_signature": turn3_target["refinement_candidate_adjustment_signature"],
-        "refinement_decision_name": turn3_target["refinement_decision_name"],
-        "refinement_candidate_prediction_text_map": turn3_target["refinement_candidate_prediction_text_map"],
-        "refine_ops": turn3_target["refine_ops"],
-        "refine_ops_signature": turn3_target["refine_ops_signature"],
-        "refine_gain_mse": turn3_target["refine_gain_mse"],
-        "refine_gain_mae": turn3_target["refine_gain_mae"],
-        "refine_changed_value_count": turn3_target["refine_changed_value_count"],
-        "refine_first_changed_index": turn3_target["refine_first_changed_index"],
-        "refine_last_changed_index": turn3_target["refine_last_changed_index"],
-        "refine_changed_span": turn3_target["refine_changed_span"],
-        "refine_mean_abs_delta": turn3_target["refine_mean_abs_delta"],
-        "refine_max_abs_delta": turn3_target["refine_max_abs_delta"],
-        "base_teacher_prediction_text": turn3_target["base_teacher_prediction_text"],
-        "refined_prediction_text": turn3_target["refined_prediction_text"],
+        "turn3_target_type": turn3_target["turn3_target_type"] if turn3_target else "",
+        "turn3_trigger_reason": turn3_target["turn3_trigger_reason"] if turn3_target else "",
+        "refinement_support_signals": turn3_target["refinement_support_signals"] if turn3_target else [],
+        "refinement_support_signal_signature": turn3_target["refinement_support_signal_signature"] if turn3_target else "",
+        "refinement_keep_support_signals": turn3_target["refinement_keep_support_signals"] if turn3_target else [],
+        "refinement_keep_support_signal_signature": (
+            turn3_target["refinement_keep_support_signal_signature"] if turn3_target else ""
+        ),
+        "refinement_edit_support_signals": (
+            turn3_target["refinement_edit_support_signals"] if turn3_target else {"__routing_only__": []}
+        ),
+        "refinement_candidate_adjustments": turn3_target["refinement_candidate_adjustments"] if turn3_target else [],
+        "refinement_candidate_adjustment_signature": (
+            turn3_target["refinement_candidate_adjustment_signature"] if turn3_target else ""
+        ),
+        "refinement_decision_name": turn3_target["refinement_decision_name"] if turn3_target else "",
+        "refinement_candidate_prediction_text_map": (
+            turn3_target["refinement_candidate_prediction_text_map"]
+            if turn3_target
+            else {"__routing_only__": ""}
+        ),
+        "refine_ops": turn3_target["refine_ops"] if turn3_target else [],
+        "refine_ops_signature": turn3_target["refine_ops_signature"] if turn3_target else "",
+        "refine_gain_mse": turn3_target["refine_gain_mse"] if turn3_target else 0.0,
+        "refine_gain_mae": turn3_target["refine_gain_mae"] if turn3_target else 0.0,
+        "refine_changed_value_count": turn3_target["refine_changed_value_count"] if turn3_target else 0,
+        "refine_first_changed_index": turn3_target["refine_first_changed_index"] if turn3_target else -1,
+        "refine_last_changed_index": turn3_target["refine_last_changed_index"] if turn3_target else -1,
+        "refine_changed_span": turn3_target["refine_changed_span"] if turn3_target else 0,
+        "refine_mean_abs_delta": turn3_target["refine_mean_abs_delta"] if turn3_target else 0.0,
+        "refine_max_abs_delta": turn3_target["refine_max_abs_delta"] if turn3_target else 0.0,
+        "base_teacher_prediction_text": turn3_target["base_teacher_prediction_text"] if turn3_target else "",
+        "refined_prediction_text": turn3_target["refined_prediction_text"] if turn3_target else "",
         "teacher_eval_best_score": sample.get("teacher_eval_best_score"),
         "teacher_eval_second_best_model": sample.get("teacher_eval_second_best_model"),
         "teacher_eval_second_best_score": sample.get("teacher_eval_second_best_score"),
         "teacher_eval_score_margin": sample.get("teacher_eval_score_margin"),
         "teacher_eval_scores": sample.get("teacher_eval_scores"),
+        "teacher_eval_score_details": sample.get("teacher_eval_score_details"),
+        "route_best_model": sample.get("route_best_model"),
+        "route_second_best_model": sample.get("route_second_best_model"),
+        "route_best_error": sample.get("route_best_error"),
+        "route_second_best_error": sample.get("route_second_best_error"),
+        "route_margin_abs": sample.get("route_margin_abs"),
+        "route_margin_rel": sample.get("route_margin_rel"),
+        "route_top2_models": sample.get("route_top2_models"),
+        "route_bootstrap_confidence_tier": sample.get("route_bootstrap_confidence_tier"),
     }
 
     records: list[dict[str, Any]] = []
@@ -1582,7 +1578,52 @@ def build_sft_records(
             selected_feature_tools=selected_feature_tools,
         ),
         turn_stage="routing",
+        route_default_expert=route_default_expert or None,
     )
+    route_tool_call = _make_tool_call(
+        tool_name=route_tool_name,
+        arguments=route_tool_arguments or {"model_name": selected_prediction_model},
+        call_id=f"call_{route_tool_name}",
+    )
+    records.append(
+        _make_stage_record(
+            shared_fields=shared_fields,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": routing_prompt},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": build_routing_reflection(
+                        model_name=selected_prediction_model,
+                        history_values=history_values,
+                        selected_feature_tools=selected_feature_tools,
+                        decision_reason=routing_policy_reason,
+                        include_heuristic_comparison=False,
+                        route_default_expert=route_default_expert,
+                        route_decision=route_decision,
+                    ),
+                    "tool_calls": [route_tool_call],
+                },
+            ],
+            tools=[
+                copy.deepcopy(
+                    ROUTE_TIMESERIES_TOOL_SCHEMA if route_tool_name == "route_time_series" else PREDICT_TIMESERIES_TOOL_SCHEMA
+                )
+            ],
+            turn_stage="routing",
+            turn_stage_order=turn_stage_order,
+            trajectory_turn_count=trajectory_turn_count,
+            current_required_feature_tools=list(selected_feature_tools),
+            completed_feature_tools_before_turn=list(selected_feature_tools),
+            history_analysis_count_before_turn=len(history_analysis),
+            paper_turn3_required=False,
+        )
+    )
+    turn_stage_order += 1
+    if routing_only_mode:
+        return _filter_records_for_stage_mode(records, sft_stage_mode=sft_stage_mode)
+
     turn_3_prompt = build_runtime_user_prompt(
         data_source=data_source,
         target_column=target_column,
@@ -1606,42 +1647,6 @@ def build_sft_records(
         ),
         turn_stage="refinement",
     )
-
-    prediction_tool_call = _make_tool_call(
-        tool_name="predict_time_series",
-        arguments={"model_name": selected_prediction_model},
-        call_id="call_predict_time_series",
-    )
-    records.append(
-        _make_stage_record(
-            shared_fields=shared_fields,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": routing_prompt},
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "reasoning_content": build_routing_reflection(
-                        model_name=selected_prediction_model,
-                        history_values=history_values,
-                        selected_feature_tools=selected_feature_tools,
-                        decision_reason=routing_policy_reason,
-                        include_heuristic_comparison=False,
-                    ),
-                    "tool_calls": [prediction_tool_call],
-                },
-            ],
-            tools=[copy.deepcopy(PREDICT_TIMESERIES_TOOL_SCHEMA)],
-            turn_stage="routing",
-            turn_stage_order=turn_stage_order,
-            trajectory_turn_count=trajectory_turn_count,
-            current_required_feature_tools=list(selected_feature_tools),
-            completed_feature_tools_before_turn=list(selected_feature_tools),
-            history_analysis_count_before_turn=len(history_analysis),
-            paper_turn3_required=False,
-        )
-    )
-    turn_stage_order += 1
     records.append(
         _make_stage_record(
             shared_fields=shared_fields,
@@ -2271,7 +2276,12 @@ def parse_args() -> argparse.Namespace:
         "--turn3-target-mode",
         choices=sorted(SUPPORTED_TURN3_TARGET_MODES),
         default=DEFAULT_TURN3_TARGET_MODE,
-        help="Turn-3 target generation mode. `paper_strict` keeps the strict <think><answer> protocol but still allows local refinement supervision when evidence supports it.",
+        help=(
+            "Turn-3 target generation mode. `engineering_refine` is the formal default and keeps the "
+            "outer <think><answer> XML shell while constraining <answer> to a single structured "
+            "`decision=<name>` line. `paper_strict` keeps the strict full-forecast answer target "
+            "for ablations/debugging."
+        ),
     )
     parser.add_argument(
         "--routing-label-source",
@@ -2507,6 +2517,22 @@ def main() -> None:
     train_protocol_summary = _summarize_paper_turn3_protocol(train_df)
     val_protocol_summary = _summarize_paper_turn3_protocol(val_df)
     test_protocol_summary = _summarize_paper_turn3_protocol(test_df) if test_df is not None and len(test_df) > 0 else {}
+    observed_routing_label_sources: set[str] = set()
+    for frame in (train_df, val_df, test_df):
+        if frame is None or frame.empty or "routing_label_source" not in frame.columns:
+            continue
+        observed_routing_label_sources.update(
+            {
+                str(value).strip().lower()
+                for value in frame["routing_label_source"].dropna().tolist()
+                if str(value).strip()
+            }
+        )
+    effective_metadata_routing_label_source = (
+        sorted(observed_routing_label_sources)[0]
+        if len(observed_routing_label_sources) == 1
+        else routing_label_source
+    )
 
     metadata_kwargs = dict(
         dataset_kind=DATASET_KIND_RUNTIME_SFT_PARQUET,
@@ -2522,7 +2548,7 @@ def main() -> None:
         sft_stage_mode=sft_stage_mode,
         turn3_protocol="paper_think_answer_xml",
         turn3_target_mode=turn3_target_mode,
-        routing_label_source=routing_label_source,
+        routing_label_source=effective_metadata_routing_label_source,
         train_samples_before_balance=len(train_df_raw),
         train_samples=len(train_df),
         train_source_samples_before_balance=_source_sample_unique_count(train_df_raw),

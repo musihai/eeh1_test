@@ -43,6 +43,7 @@ from recipe.time_series_forecast.agent_flow_support import (
 from recipe.time_series_forecast.prompts import (
     FEATURE_TOOL_SCHEMAS,
     PREDICT_TIMESERIES_TOOL_SCHEMA,
+    ROUTE_TIMESERIES_TOOL_SCHEMA,
     TIMESERIES_TOOL_SCHEMAS,
     build_runtime_user_prompt,
     build_timeseries_system_prompt,
@@ -117,6 +118,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         self.prediction_call_count = 0
         self.illegal_turn3_tool_call_count = 0
         self.feature_tool_sequence = []
+        self.route_default_expert = getattr(self, "route_default_expert", "itransformer") or "itransformer"
+        self.route_decision = None
+        self.route_override_model = None
+        self.route_resolved_model = None
 
     def _reset_feature_state(self) -> None:
         self.basic_statistics = None
@@ -161,6 +166,11 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         cls.max_parallel_calls = kwargs.get("max_parallel_calls", 5)
         cls.lookback_window = kwargs.get("lookback_window", 96)
         cls.forecast_horizon = kwargs.get("forecast_horizon", 96)
+        cls.route_default_expert = (
+            kwargs.get("route_default_expert")
+            or os.getenv("TS_ROUTE_DEFAULT_EXPERT", "itransformer")
+            or "itransformer"
+        )
         cls.tokenizer.chat_template = load_time_series_chat_template()
         if cls.processor is not None and hasattr(cls.processor, "chat_template"):
             cls.processor.chat_template = cls.tokenizer.chat_template
@@ -540,23 +550,23 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         if not self._has_diagnostic_analysis():
             return False, -0.5, "At least one diagnostic feature tool must be executed before routing."
         
-        # Check 2: Must have called predict_time_series
+        # Check 2: Must have called the routing forecasting tool.
         if self.prediction_results is None:
-            return False, -0.5, "predict_time_series was not called. You must get model predictions first."
+            return False, -0.5, "The routing forecasting tool was not called. You must resolve a forecast route first."
 
         # Check 3: Routing must contain exactly one forecasting-tool invocation.
         if self.prediction_call_count != 1:
             return (
                 False,
                 -0.5,
-                f"predict_time_series must be called exactly once before final output. Got {self.prediction_call_count}.",
+                f"The routing forecasting tool must be called exactly once before final output. Got {self.prediction_call_count}.",
             )
 
         if str(self.prediction_turn_stage or "").strip().lower() != "routing":
             return (
                 False,
                 -0.5,
-                "predict_time_series must be called during the routing stage after diagnostics are complete.",
+                "The routing forecasting tool must be called during the routing stage after diagnostics are complete.",
             )
 
         # Check 4: Refinement must not invoke any tools after prediction.
@@ -675,6 +685,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 "turn3_horizon_clamp_raw_answer_lines": int(
                     getattr(self, "turn3_horizon_clamp_raw_answer_lines", 0) or 0
                 ),
+                "route_default_expert": str(getattr(self, "route_default_expert", "") or ""),
+                "route_decision": str(getattr(self, "route_decision", "") or ""),
+                "route_override_model": str(getattr(self, "route_override_model", "") or ""),
+                "route_resolved_model": str(getattr(self, "route_resolved_model", "") or ""),
             }
         )
         return fields
@@ -840,7 +854,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
         if turn_stage == "diagnostic":
             return list(FEATURE_TOOL_SCHEMAS)
         if turn_stage == "routing":
-            return [PREDICT_TIMESERIES_TOOL_SCHEMA]
+            return [ROUTE_TIMESERIES_TOOL_SCHEMA]
         return []
 
     def _extract_final_answer(self, response_text: str, *, allow_recovery: bool = False) -> Optional[str]:
@@ -1135,6 +1149,7 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             routing_feature_payload=self._routing_feature_payload(),
             refinement_feature_payload=self._refinement_feature_payload(prediction_payload),
             turn_stage=turn_stage,
+            route_default_expert=getattr(self, "route_default_expert", None),
         )
 
     async def _execute_tool_call(self, tool_call: TimeSeriesToolCall, **kwargs) -> Optional[str]:
@@ -1144,32 +1159,58 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             logger.warning("Tool call %s attempted after prediction stage; rejected.", tool_call.name)
             return None
 
-        if tool_call.name == "predict_time_series":
+        if tool_call.name in {"predict_time_series", "route_time_series"}:
             requested_model_name = "__missing__"
             args = tool_call.arguments if isinstance(getattr(tool_call, "arguments", None), dict) else {}
-            if args:
-                requested_model_name = str(args.get("model_name") or "__missing__").strip().lower()
-
-            self.prediction_requested_model = requested_model_name
+            valid_model_names = {"chronos2", "arima", "patchtst", "itransformer"}
             if turn_stage == "diagnostic":
-                logger.warning("predict_time_series called during diagnostic turn, rejected until next turn")
+                logger.warning("%s called during diagnostic turn, rejected until next turn", tool_call.name)
                 return None
 
             if not self._has_diagnostic_analysis():
                 logger.warning(
-                    "predict_time_series called before any diagnostic feature tool was completed",
+                    "%s called before any diagnostic feature tool was completed",
+                    tool_call.name,
                 )
                 return None
 
+            if tool_call.name == "route_time_series":
+                decision = str(args.get("decision") or "").strip().lower()
+                self.route_decision = decision
+                if decision == "keep_default":
+                    requested_model_name = str(getattr(self, "route_default_expert", "") or "").strip().lower()
+                    self.route_override_model = ""
+                elif decision == "override":
+                    requested_model_name = str(args.get("model_name") or "__missing__").strip().lower()
+                    self.route_override_model = requested_model_name
+                else:
+                    self.prediction_requested_model = ""
+                    self.route_resolved_model = ""
+                    self.prediction_tool_error = (
+                        f"Invalid route decision: {decision or '__missing__'}. "
+                        "Supported decisions: ['keep_default', 'override']"
+                    )
+                    logger.warning("route_time_series called with invalid decision=%s", decision or "__missing__")
+                    return None
+            else:
+                requested_model_name = str(args.get("model_name") or "__missing__").strip().lower()
+                self.route_decision = (
+                    "keep_default"
+                    if requested_model_name == str(getattr(self, "route_default_expert", "") or "").strip().lower()
+                    else "override"
+                )
+                self.route_override_model = requested_model_name if self.route_decision == "override" else ""
+
+            self.prediction_requested_model = requested_model_name
+            self.route_resolved_model = requested_model_name
             model_name = requested_model_name
-            valid_model_names = {"chronos2", "arima", "patchtst", "itransformer"}
             if model_name not in valid_model_names:
                 self.prediction_model_defaulted = False
                 self.prediction_tool_error = (
                     f"Invalid model_name: {requested_model_name}. "
                     f"Supported models: {sorted(valid_model_names)}"
                 )
-                logger.warning("predict_time_series called with invalid model_name=%s", requested_model_name)
+                logger.warning("%s called with invalid model_name=%s", tool_call.name, requested_model_name)
                 append_chain_debug(
                     "prediction_tool_result",
                     build_prediction_tool_debug_payload(
@@ -1192,7 +1233,8 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             self.prediction_model_defaulted = False
             if int(self.prediction_attempt_count) >= self._max_prediction_attempts():
                 logger.warning(
-                    "predict_time_series attempted after retry budget exhausted; max_prediction_attempts=%s",
+                    "%s attempted after retry budget exhausted; max_prediction_attempts=%s",
+                    tool_call.name,
                     self._max_prediction_attempts(),
                 )
                 return None
@@ -1209,7 +1251,10 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             return tool_output
 
         if turn_stage == "routing":
-            logger.warning("Feature tool %s attempted during routing turn; predict_time_series required instead.", tool_call.name)
+            logger.warning(
+                "Feature tool %s attempted during routing turn; route_time_series is required instead.",
+                tool_call.name,
+            )
             return None
 
         if self._feature_tool_already_executed(tool_call.name):
