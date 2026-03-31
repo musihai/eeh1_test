@@ -203,6 +203,43 @@ def compact_prediction_tool_output_from_string(
     return "\n".join(lines)
 
 
+def compact_prediction_selection_preview_from_string(
+    prediction_text: str,
+    *,
+    model_name: Optional[str] = None,
+    freq_hours: int = 1,
+    head_values: int = 6,
+    tail_values: int = 6,
+) -> str:
+    """Render a short candidate preview for Turn-3 final selection prompts."""
+    timestamps, values = parse_time_series_string(prediction_text)
+    if not values:
+        return prediction_text
+
+    array = np.asarray(values, dtype=float)
+    start_timestamp = next((ts for ts in timestamps if ts), None)
+    head = ", ".join(f"{float(value):.4f}" for value in array[:head_values])
+    tail = ", ".join(f"{float(value):.4f}" for value in array[-tail_values:])
+    mean_abs_step = float(np.mean(np.abs(np.diff(array)))) if len(array) >= 2 else 0.0
+
+    lines: list[str] = []
+    if model_name:
+        lines.append(f"Model: {model_name}")
+    if start_timestamp:
+        lines.append(f"Start Timestamp: {start_timestamp}")
+    lines.append(f"Frequency Hours: {freq_hours}")
+    lines.append(f"Count: {len(array)}")
+    lines.append(
+        "Summary: "
+        f"mean={float(array.mean()):.4f}, std={float(array.std()):.4f}, "
+        f"min={float(array.min()):.4f}, max={float(array.max()):.4f}, "
+        f"net_change={float(array[-1] - array[0]):.4f}, mean_abs_step={mean_abs_step:.4f}"
+    )
+    lines.append(f"Head Values: {head}")
+    lines.append(f"Tail Values: {tail}")
+    return "\n".join(lines)
+
+
 def compact_historical_data_for_prompt(
     historical_text: str,
     *,
@@ -238,6 +275,50 @@ def compact_historical_data_for_prompt(
     return compact_text
 
 
+def compact_historical_selection_context(
+    historical_text: str,
+    *,
+    target_column: Optional[str] = None,
+    default_freq: str = "1h",
+    recent_rows: int = 24,
+) -> str:
+    """Build a short target-focused history summary for v19 final selection."""
+    raw_text = str(historical_text or "").strip()
+    if not raw_text:
+        return raw_text
+
+    try:
+        frame = parse_time_series_to_dataframe(
+            raw_text,
+            target_column=target_column,
+            default_freq=default_freq,
+            include_covariates=True,
+        )
+    except Exception:
+        return raw_text
+
+    target_name = target_column or frame.attrs.get("target_column") or "target"
+    if target_name not in frame.columns:
+        target_name = "target"
+
+    target_values = frame[target_name].astype(float).to_numpy()
+    recent = frame.tail(max(1, int(recent_rows)))
+
+    rows = ["timestamp,target"]
+    for _, row in recent.iterrows():
+        timestamp = pd.to_datetime(row["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+        rows.append(f"{timestamp},{float(row[target_name]):.4f}")
+
+    mean_abs_step = float(np.mean(np.abs(np.diff(target_values)))) if len(target_values) >= 2 else 0.0
+    summary = (
+        "Target Summary: "
+        f"count={len(target_values)}, mean={float(target_values.mean()):.4f}, std={float(target_values.std()):.4f}, "
+        f"min={float(target_values.min()):.4f}, max={float(target_values.max()):.4f}, "
+        f"net_change={float(target_values[-1] - target_values[0]):.4f}, mean_abs_step={mean_abs_step:.4f}"
+    )
+    return f"{summary}\nRecent Target Rows (last {len(recent)}):\n" + "\n".join(rows)
+
+
 def format_prediction_tool_output(
     pred_df: pd.DataFrame,
     last_timestamp: str = None,
@@ -267,7 +348,9 @@ def get_last_timestamp(data_str: str) -> Optional[str]:
 
 
 __all__ = [
+    "compact_historical_selection_context",
     "compact_historical_data_for_prompt",
+    "compact_prediction_selection_preview_from_string",
     "DEFAULT_FORECAST_HORIZON",
     "DEFAULT_LOOKBACK_WINDOW",
     "SYNTHETIC_TIMESTAMP_ANCHOR",

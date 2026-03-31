@@ -359,8 +359,10 @@ def _paper_turn3_protocol_reason(content: str, expected_len: int) -> str:
     answer_text = match.group(2).strip()
     lines = [line.strip() for line in answer_text.splitlines() if line.strip()]
     if len(lines) == 1:
-        decision_line = lines[0]
-        if decision_line.lower().startswith("decision=") and decision_line.split("=", 1)[1].strip():
+        single_line = lines[0]
+        if single_line.lower().startswith("decision=") and single_line.split("=", 1)[1].strip():
+            return "ok"
+        if single_line.lower().startswith("candidate_id=") and single_line.split("=", 1)[1].strip():
             return "ok"
     values = _extract_prediction_values(answer_text)
     if len(lines) != expected_len:

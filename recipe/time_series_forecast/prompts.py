@@ -16,7 +16,13 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Optional, Sequence
 
-from recipe.time_series_forecast.time_series_io import compact_historical_data_for_prompt
+from recipe.time_series_forecast.candidate_selection_support import compute_candidate_visible_metrics
+from recipe.time_series_forecast.time_series_io import (
+    compact_historical_selection_context,
+    compact_historical_data_for_prompt,
+    compact_prediction_selection_preview_from_string,
+    compact_prediction_tool_output_from_string,
+)
 from recipe.time_series_forecast.refinement_support import REFINEMENT_OP_DESCRIPTIONS
 
 def _build_dataset_description(
@@ -201,6 +207,176 @@ def build_refinement_evidence_card(
     lines.append(f"decision_options=[{', '.join(decision_options)}]")
     lines.append(f"keep_baseline_allowed={'yes' if keep_baseline_allowed else 'no'}")
     return "\n".join(lines)
+
+
+def build_v19_risk_gate_prompt(
+    *,
+    data_source: str,
+    target_column: str,
+    lookback_window: int,
+    forecast_horizon: int,
+    time_series_data: str,
+    history_analysis: Sequence[str] | None = None,
+    default_expert: str,
+    fixed_expand: bool = False,
+) -> str:
+    history_records = list(history_analysis or [])
+    history_text = "\n".join(history_records) if history_records else "No previous analysis performed."
+    compact_history = compact_historical_data_for_prompt(
+        time_series_data,
+        target_column=target_column,
+    )
+    decision_text = "default_risky" if fixed_expand else "default_ok/default_risky"
+    fixed_line = (
+        "- This dataset is configured in fixed-expand mode. Emit `default_risky` so the next turn can compare "
+        "the default path against alternative candidates.\n"
+        if fixed_expand
+        else ""
+    )
+    return f"""**[Stage: Proposal / Risk Gate] Action: decide whether the default path is enough**
+### Lookback Window: {lookback_window} rows
+### Forecast Horizon: {forecast_horizon} rows
+### Default Expert: {default_expert}
+### Historical Data
+{compact_history}
+
+### Analysis Summary
+{history_text}
+
+**Instructions**:
+- This turn does NOT choose the final expert.
+- This turn only decides whether the default expert path is already safe enough.
+- Valid decisions are `{decision_text}`.
+{fixed_line}- If you emit `default_risky`, the system will expand alternative candidates in the next turn.
+- Emit exactly one `<tool_call>...</tool_call>` block with strict JSON.
+- Use the exact function name `route_time_series`.
+- Valid example:
+<tool_call>
+{{"name":"route_time_series","arguments":{{"decision":"default_risky"}}}}
+</tool_call>
+"""
+
+
+def _format_v19_candidate_block(
+    candidate: Mapping[str, Any],
+    *,
+    visible_metrics: Mapping[str, Any] | None = None,
+) -> str:
+    candidate_id = str(candidate.get("candidate_id") or "").strip()
+    model_name = str(candidate.get("model_name") or "").strip()
+    path_type = str(candidate.get("path_type") or "").strip()
+    candidate_kind = str(candidate.get("candidate_kind") or "").strip()
+    preview_source = str(candidate.get("prediction_text") or candidate.get("compact_prediction_text") or "").strip()
+    preview_text = compact_prediction_selection_preview_from_string(
+        preview_source,
+        model_name=candidate_id or model_name or None,
+    )
+    lines = [
+        f"[candidate_id={candidate_id}]",
+        f"path_type={path_type or 'unknown'}",
+        f"model_name={model_name or 'unknown'}",
+        f"candidate_kind={candidate_kind or 'unknown'}",
+    ]
+    if visible_metrics:
+        lines.extend(
+            [
+                (
+                    "recent_match="
+                    f"level:{float(visible_metrics.get('level_gap', 0.0)):.2f} "
+                    f"mean:{float(visible_metrics.get('mean_gap', 0.0)):.2f} "
+                    f"trend:{float(visible_metrics.get('trend_gap', 0.0)):.2f} "
+                    f"step:{float(visible_metrics.get('step_gap', 0.0)):.2f} "
+                    f"vol:{float(visible_metrics.get('volatility_gap', 0.0)):.2f}"
+                ),
+                (
+                    "vs_default_gain="
+                    f"level:{float(visible_metrics.get('level_gain_vs_default', 0.0)):+.2f} "
+                    f"mean:{float(visible_metrics.get('mean_gain_vs_default', 0.0)):+.2f} "
+                    f"trend:{float(visible_metrics.get('trend_gain_vs_default', 0.0)):+.2f} "
+                    f"step:{float(visible_metrics.get('step_gain_vs_default', 0.0)):+.2f} "
+                    f"vol:{float(visible_metrics.get('volatility_gain_vs_default', 0.0)):+.2f}"
+                ),
+                (
+                    "direction_check="
+                    f"candidate:{str(visible_metrics.get('candidate_direction') or 'unknown')} "
+                    f"recent:{str(visible_metrics.get('recent_direction') or 'unknown')} "
+                    f"match:{'yes' if bool(visible_metrics.get('direction_match')) else 'no'}"
+                ),
+            ]
+        )
+    lines.extend(
+        [
+        preview_text,
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_v19_final_select_prompt(
+    *,
+    data_source: str,
+    target_column: str,
+    lookback_window: int,
+    forecast_horizon: int,
+    time_series_data: str,
+    history_analysis: Sequence[str] | None = None,
+    default_expert: str,
+    default_candidate_id: str,
+    expanded: bool,
+    candidates: Sequence[Mapping[str, Any]],
+) -> str:
+    history_records = list(history_analysis or [])
+    history_text = "\n".join(history_records) if history_records else "No previous analysis performed."
+    compact_history = compact_historical_selection_context(
+        time_series_data,
+        target_column=target_column,
+    )
+    visible_feature_map = compute_candidate_visible_metrics(
+        historical_data=time_series_data,
+        target_column=target_column,
+        candidates=candidates,
+        default_candidate_id=default_candidate_id,
+    )
+    candidate_blocks = "\n\n".join(
+        _format_v19_candidate_block(
+            candidate,
+            visible_metrics=visible_feature_map.get(str(candidate.get("candidate_id") or "").strip()),
+        )
+        for candidate in candidates
+    )
+    visibility_text = (
+        "The candidate pool includes the default path and alternative expert baselines."
+        if expanded
+        else "The candidate pool includes only the default path candidates."
+    )
+    return f"""**[Stage: Final Selection] Action: choose the final candidate**
+### Lookback Window: {lookback_window} rows
+### Forecast Horizon: {forecast_horizon} rows
+### Default Expert: {default_expert}
+### Default Candidate: {default_candidate_id}
+### Candidate Expansion: {'expanded' if expanded else 'default_only'}
+
+### Recent Historical Window
+{compact_history}
+
+### Analysis Summary
+{history_text}
+
+### Candidate Pool
+{candidate_blocks}
+
+**Instructions**:
+- This is the final selection stage.
+- {visibility_text}
+- Use the structured `recent_match`, `vs_default_gain`, and `direction_check` fields to compare candidates.
+- Choose exactly one `candidate_id` from the Candidate Pool.
+- Do NOT call any tools in this turn.
+- Output exactly one `<think>...</think>` block followed immediately by one `<answer>...</answer>` block.
+- `<think>` should briefly compare the candidate behaviors against the historical evidence.
+- `<answer>` must contain exactly one non-empty line in the form `candidate_id=<name>`.
+- Do not output forecast rows, markdown, bullets, JSON, or extra commentary inside `<answer>`.
+- Stop immediately after `</answer>`.
+"""
 
 
 def get_runtime_turn_info(
@@ -453,6 +629,29 @@ ROUTE_TIMESERIES_TOOL_SCHEMA = {
     },
 }
 
+RISK_GATE_TIMESERIES_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "route_time_series",
+        "description": (
+            "Call this only in the v19 proposal / risk-gate turn. "
+            "Use decision='default_ok' when the default expert path appears sufficient, or "
+            "decision='default_risky' when the next turn should compare alternative candidates."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "description": "Whether to keep candidate expansion closed or open it for the next turn.",
+                    "enum": ["default_ok", "default_risky"],
+                },
+            },
+            "required": ["decision"],
+        },
+    },
+}
+
 EXTRACT_BASIC_STATISTICS_SCHEMA = {
     "type": "function",
     "function": {
@@ -539,6 +738,7 @@ TIMESERIES_TOOL_SCHEMAS = [
     EXTRACT_DATA_QUALITY_SCHEMA,
     EXTRACT_EVENT_SUMMARY_SCHEMA,
     ROUTE_TIMESERIES_TOOL_SCHEMA,
+    RISK_GATE_TIMESERIES_TOOL_SCHEMA,
     PREDICT_TIMESERIES_TOOL_SCHEMA,
 ]
 
