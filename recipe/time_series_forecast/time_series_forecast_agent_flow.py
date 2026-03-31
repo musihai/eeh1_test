@@ -35,6 +35,7 @@ from recipe.time_series_forecast.agent_flow_support import (
     current_turn_stage,
     expected_prediction_count,
     feature_tool_signature,
+    finite_or_nan,
     required_step_budget,
     sample_uid_text,
     shared_reward_tracking_fields,
@@ -54,7 +55,7 @@ from recipe.time_series_forecast.refinement_support import (
 from recipe.time_series_forecast.task_protocol import parse_task_prompt
 from recipe.time_series_forecast.tool_call_protocol import (
     TimeSeriesToolCall,
-    extract_tool_calls,
+    extract_tool_calls_with_debug,
     load_time_series_chat_template,
 )
 from recipe.time_series_forecast.utils import (
@@ -294,17 +295,27 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
             tool_calls: list[TimeSeriesToolCall] = []
             executed_tool_names: list[str] = []
             terminate_after_step = False
+            tool_call_debug_info: dict[str, Any] = {}
 
             should_parse_tool_calls = (
                 turn_stage != "refinement" or "<tool_call>" in response_text or "</tool_call>" in response_text
             )
             if should_parse_tool_calls:
                 allowed_tool_names = [schema["function"]["name"] for schema in tool_schemas]
-                _assistant_content, tool_calls = extract_tool_calls(
+                _assistant_content, tool_calls, tool_call_diagnostics = extract_tool_calls_with_debug(
                     response_text,
                     allowed_tool_names=allowed_tool_names,
                     max_calls=self.max_parallel_calls,
                 )
+                tool_call_debug_info = {
+                    "raw_tool_call_block_count": int(tool_call_diagnostics.raw_tool_call_block_count),
+                    "tool_call_json_decode_error_count": int(tool_call_diagnostics.tool_call_json_decode_error_count),
+                    "tool_call_missing_name_count": int(tool_call_diagnostics.tool_call_missing_name_count),
+                    "invalid_tool_call_name_count": int(tool_call_diagnostics.invalid_tool_call_name_count),
+                    "invalid_tool_call_arguments_count": int(tool_call_diagnostics.invalid_tool_call_arguments_count),
+                    "raw_tool_call_name_sequence": str(tool_call_diagnostics.raw_tool_call_name_sequence or ""),
+                    "invalid_tool_call_name_sequence": str(tool_call_diagnostics.invalid_tool_call_name_sequence or ""),
+                }
                 tool_call_names = [tool_call.name for tool_call in tool_calls]
 
             if turn_stage == "refinement" or not tool_calls:
@@ -425,6 +436,11 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                     "response_token_len": int(len(response_ids)),
                     **self._collect_turn3_output_shape_metrics(raw_response_text, expected_len=expected_len),
                     **refinement_metrics,
+                    "offline_best_model": str(kwargs.get("offline_best_model") or ""),
+                    "offline_margin": finite_or_nan(kwargs.get("offline_margin")),
+                    "reference_teacher_error": finite_or_nan(kwargs.get("reference_teacher_error")),
+                    "reference_teacher_error_band": str(kwargs.get("reference_teacher_error_band") or ""),
+                    **tool_call_debug_info,
                 }
             )
             step.extra_fields["reward_extra_info"] = reward_extra_info
@@ -501,6 +517,11 @@ class TimeSeriesForecastAgentFlow(AgentFlowBase):
                 **self._shared_reward_tracking_fields(sample_uid=kwargs.get("uid")),
                 **self._collect_turn3_output_shape_metrics(last_raw_response_text, expected_len=expected_len),
                 **final_refinement_metrics,
+                "offline_best_model": str(kwargs.get("offline_best_model") or ""),
+                "offline_margin": finite_or_nan(kwargs.get("offline_margin")),
+                "reference_teacher_error": finite_or_nan(kwargs.get("reference_teacher_error")),
+                "reference_teacher_error_band": str(kwargs.get("reference_teacher_error_band") or ""),
+                **tool_call_debug_info,
             }
         )
         self.steps[-1].extra_fields["reward_extra_info"] = final_reward_extra_info

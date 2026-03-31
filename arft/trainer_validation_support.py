@@ -162,7 +162,25 @@ def build_compact_validation_debug_summary(*, global_step: int, agg_row: dict[st
         "refinement_delta_orig_mse_mean",
     )
     summary = {"global_step": int(global_step)}
+    run_name = str(agg_row.get("run_name") or "").strip()
+    if run_name:
+        summary["run_name"] = run_name
     for key in summary_keys:
+        value = agg_row.get(key)
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            numeric = float(value)
+            if np.isfinite(numeric):
+                summary[key] = numeric
+
+    for key in (
+        "selected_model_offline_best_agreement_ratio",
+        "selected_vs_reference_teacher_orig_mse_regret_mean",
+        "selected_vs_reference_teacher_orig_mse_regret_p50",
+        "selected_vs_reference_teacher_orig_mse_regret_p90",
+        "final_vs_reference_teacher_orig_mse_regret_mean",
+        "invalid_tool_call_name_ratio",
+        "tool_call_json_decode_error_ratio",
+    ):
         value = agg_row.get(key)
         if isinstance(value, (int, float, np.integer, np.floating)):
             numeric = float(value)
@@ -176,6 +194,9 @@ def build_compact_validation_debug_summary(*, global_step: int, agg_row: dict[st
         "final_answer_reject_reason_distribution",
         "workflow_status_distribution",
         "selected_model_distribution",
+        "run_name_distribution",
+        "invalid_tool_call_name_distribution",
+        "refinement_decision_distribution",
     ):
         value = agg_row.get(key)
         if isinstance(value, dict) and value:
@@ -407,6 +428,45 @@ def write_min_eval_debug_files(
     prediction_tool_error = to_str_list(reward_extra_infos_dict.get("prediction_tool_error"), n)
     selected_forecast_preview = to_str_list(reward_extra_infos_dict.get("selected_forecast_preview"), n)
     final_answer_preview = to_str_list(reward_extra_infos_dict.get("final_answer_preview"), n)
+    offline_best_model = to_str_list(reward_extra_infos_dict.get("offline_best_model"), n)
+    offline_margin = to_float_list(reward_extra_infos_dict.get("offline_margin"), n, default=float("nan"))
+    reference_teacher_error = to_float_list(
+        reward_extra_infos_dict.get("reference_teacher_error"),
+        n,
+        default=float("nan"),
+    )
+    reference_teacher_error_band = to_str_list(reward_extra_infos_dict.get("reference_teacher_error_band"), n)
+    refinement_decision_name = to_str_list(reward_extra_infos_dict.get("refinement_decision_name"), n)
+    raw_tool_call_block_count = to_float_list(
+        reward_extra_infos_dict.get("raw_tool_call_block_count"),
+        n,
+        default=float("nan"),
+    )
+    raw_tool_call_name_sequence = to_str_list(
+        reward_extra_infos_dict.get("raw_tool_call_name_sequence"),
+        n,
+        default="none",
+    )
+    invalid_tool_call_name_count = to_float_list(
+        reward_extra_infos_dict.get("invalid_tool_call_name_count"),
+        n,
+        default=float("nan"),
+    )
+    invalid_tool_call_name_sequence = to_str_list(
+        reward_extra_infos_dict.get("invalid_tool_call_name_sequence"),
+        n,
+        default="none",
+    )
+    tool_call_json_decode_error_count = to_float_list(
+        reward_extra_infos_dict.get("tool_call_json_decode_error_count"),
+        n,
+        default=float("nan"),
+    )
+    tool_call_missing_name_count = to_float_list(
+        reward_extra_infos_dict.get("tool_call_missing_name_count"),
+        n,
+        default=float("nan"),
+    )
 
     pred_len_arr = np.asarray(pred_len, dtype=np.float64)
     expected_len_arr = np.asarray(expected_len, dtype=np.float64)
@@ -498,6 +558,22 @@ def write_min_eval_debug_files(
     illegal_turn3_tool_call_count_values = [
         float(v) for v in illegal_turn3_tool_call_count if np.isfinite(v)
     ]
+    raw_tool_call_block_count_values = [float(v) for v in raw_tool_call_block_count if np.isfinite(v)]
+    valid_teacher_agreement_values = [
+        float(str(selected_model[i]).strip().lower() == str(offline_best_model[i]).strip().lower())
+        for i in range(n)
+        if str(selected_model[i]).strip() and str(offline_best_model[i]).strip()
+    ]
+    selected_vs_reference_teacher_regret_values = [
+        float(selected_forecast_orig_mse[i] - reference_teacher_error[i])
+        for i in range(n)
+        if np.isfinite(selected_forecast_orig_mse[i]) and np.isfinite(reference_teacher_error[i])
+    ]
+    final_vs_reference_teacher_regret_values = [
+        float(orig_mse[i] - reference_teacher_error[i])
+        for i in range(n)
+        if np.isfinite(orig_mse[i]) and np.isfinite(reference_teacher_error[i])
+    ]
 
     debug_bucket: list[str] = []
     debug_reason: list[str] = []
@@ -531,7 +607,15 @@ def write_min_eval_debug_files(
     selected_model_counter = Counter(model for model in selected_model if model)
     workflow_status_counter = Counter(status for status in workflow_status if status)
     turn_stage_counter = Counter(stage for stage in turn_stage if stage)
+    run_name_counter = Counter(name for name in run_name if name)
+    refinement_decision_counter = Counter(name for name in refinement_decision_name if name)
     prediction_tool_error_count = int(sum(1 for value in prediction_tool_error if value))
+    invalid_tool_call_name_counter: Counter[str] = Counter()
+    for value in invalid_tool_call_name_sequence:
+        for name in str(value or "").split("->"):
+            normalized = str(name).strip()
+            if normalized and normalized != "none":
+                invalid_tool_call_name_counter[normalized] += 1
 
     format_failure_mask = np.asarray([bucket == "format_failure" for bucket in debug_bucket], dtype=bool)
     tool_error_mask = np.asarray([bucket == "tool_error" for bucket in debug_bucket], dtype=bool)
@@ -544,11 +628,22 @@ def write_min_eval_debug_files(
         [np.isfinite(value) and int(value) > 0 for value in missing_required_feature_tool_count],
         dtype=bool,
     )
+    invalid_tool_call_name_mask = np.asarray(
+        [np.isfinite(value) and int(value) > 0 for value in invalid_tool_call_name_count],
+        dtype=bool,
+    )
+    tool_call_json_decode_error_mask = np.asarray(
+        [np.isfinite(value) and int(value) > 0 for value in tool_call_json_decode_error_count],
+        dtype=bool,
+    )
+    unique_run_names = list(run_name_counter.keys())
+    aggregate_run_name = unique_run_names[0] if len(unique_run_names) == 1 else ""
 
     total = float(n)
     agg_row = {
         "step": int(global_steps),
         "total_samples": int(n),
+        "run_name": aggregate_run_name,
         "validation_reward_mean": float(np.mean(reward_values)) if reward_values else float("nan"),
         "validation_reward_min": float(np.min(reward_values)) if reward_values else float("nan"),
         "validation_reward_max": float(np.max(reward_values)) if reward_values else float("nan"),
@@ -560,6 +655,8 @@ def write_min_eval_debug_files(
         "tool_error_ratio": float(np.mean(tool_error_mask.astype(np.float64))),
         "prediction_call_not_once_ratio": float(np.mean(prediction_call_not_once_mask.astype(np.float64))),
         "missing_required_feature_tool_ratio": float(np.mean(missing_required_feature_tool_mask.astype(np.float64))),
+        "invalid_tool_call_name_ratio": float(np.mean(invalid_tool_call_name_mask.astype(np.float64))),
+        "tool_call_json_decode_error_ratio": float(np.mean(tool_call_json_decode_error_mask.astype(np.float64))),
         "illegal_turn3_tool_call_ratio": float(
             np.mean((np.asarray(illegal_turn3_tool_call_count_values, dtype=np.float64) > 0).astype(np.float64))
         )
@@ -585,6 +682,23 @@ def write_min_eval_debug_files(
         "trainer_seq_score_mean": float(np.mean(trainer_seq_values)) if trainer_seq_values else float("nan"),
         "selected_forecast_orig_mse_mean": float(np.mean(selected_forecast_orig_mse_values))
         if selected_forecast_orig_mse_values
+        else float("nan"),
+        "selected_model_offline_best_agreement_ratio": float(np.mean(valid_teacher_agreement_values))
+        if valid_teacher_agreement_values
+        else float("nan"),
+        "selected_vs_reference_teacher_orig_mse_regret_mean": float(np.mean(selected_vs_reference_teacher_regret_values))
+        if selected_vs_reference_teacher_regret_values
+        else float("nan"),
+        "selected_vs_reference_teacher_orig_mse_regret_p50": percentile(
+            selected_vs_reference_teacher_regret_values,
+            50,
+        ),
+        "selected_vs_reference_teacher_orig_mse_regret_p90": percentile(
+            selected_vs_reference_teacher_regret_values,
+            90,
+        ),
+        "final_vs_reference_teacher_orig_mse_regret_mean": float(np.mean(final_vs_reference_teacher_regret_values))
+        if final_vs_reference_teacher_regret_values
         else float("nan"),
         "final_vs_selected_mse_mean": float(np.mean(final_vs_selected_mse_values))
         if final_vs_selected_mse_values
@@ -627,6 +741,9 @@ def write_min_eval_debug_files(
         "prediction_call_count_mean": float(np.mean(prediction_call_count_values))
         if prediction_call_count_values
         else float("nan"),
+        "raw_tool_call_block_count_mean": float(np.mean(raw_tool_call_block_count_values))
+        if raw_tool_call_block_count_values
+        else float("nan"),
         "response_token_len_mean": float(np.mean(response_token_len_values))
         if response_token_len_values
         else float("nan"),
@@ -642,6 +759,9 @@ def write_min_eval_debug_files(
         "turn3_horizon_clamp_reason_distribution": top_counter_items(turn3_horizon_clamp_reason_counter, limit=6),
         "workflow_status_distribution": {str(k): int(v) for k, v in sorted(workflow_status_counter.items())},
         "turn_stage_distribution": {str(k): int(v) for k, v in sorted(turn_stage_counter.items())},
+        "run_name_distribution": {str(k): int(v) for k, v in sorted(run_name_counter.items())},
+        "invalid_tool_call_name_distribution": top_counter_items(invalid_tool_call_name_counter, limit=8),
+        "refinement_decision_distribution": {str(k): int(v) for k, v in sorted(refinement_decision_counter.items())},
         "patchtst_share": float(selected_model_counter.get("patchtst", 0) / total),
         "itransformer_share": float(selected_model_counter.get("itransformer", 0) / total),
         "arima_share": float(selected_model_counter.get("arima", 0) / total),
@@ -692,6 +812,25 @@ def write_min_eval_debug_files(
             "reward_score": _float_or_nan(score_arr[i]),
             "trainer_seq_score": _float_or_nan(trainer_seq_score[i]),
             "selected_model": selected_model[i],
+            "offline_best_model": offline_best_model[i] if offline_best_model[i] else "",
+            "offline_margin": _float_or_nan(offline_margin[i]),
+            "reference_teacher_error": _float_or_nan(reference_teacher_error[i]),
+            "reference_teacher_error_band": reference_teacher_error_band[i] if reference_teacher_error_band[i] else "",
+            "selected_model_matches_offline_best": bool(
+                str(selected_model[i]).strip()
+                and str(offline_best_model[i]).strip()
+                and str(selected_model[i]).strip().lower() == str(offline_best_model[i]).strip().lower()
+            ),
+            "selected_vs_reference_teacher_orig_mse_regret": (
+                _float_or_nan(selected_forecast_orig_mse[i] - reference_teacher_error[i])
+                if np.isfinite(selected_forecast_orig_mse[i]) and np.isfinite(reference_teacher_error[i])
+                else float("nan")
+            ),
+            "final_vs_reference_teacher_orig_mse_regret": (
+                _float_or_nan(orig_mse[i] - reference_teacher_error[i])
+                if np.isfinite(orig_mse[i]) and np.isfinite(reference_teacher_error[i])
+                else float("nan")
+            ),
             "prediction_requested_model": prediction_requested_model[i] if prediction_requested_model[i] else "",
             "prediction_model_defaulted": bool(prediction_model_defaulted[i]),
             "prediction_tool_error": prediction_tool_error[i] if prediction_tool_error[i] else "",
@@ -729,12 +868,21 @@ def write_min_eval_debug_files(
             "missing_required_feature_tool_count": _int_or_default(missing_required_feature_tool_count[i]),
             "analysis_coverage_ratio": _float_or_nan(analysis_coverage_ratio[i]),
             "prediction_call_count": _int_or_default(prediction_call_count[i]),
+            "raw_tool_call_block_count": _int_or_default(raw_tool_call_block_count[i]),
+            "raw_tool_call_name_sequence": raw_tool_call_name_sequence[i] if raw_tool_call_name_sequence[i] else "none",
+            "invalid_tool_call_name_count": _int_or_default(invalid_tool_call_name_count[i]),
+            "invalid_tool_call_name_sequence": (
+                invalid_tool_call_name_sequence[i] if invalid_tool_call_name_sequence[i] else "none"
+            ),
+            "tool_call_json_decode_error_count": _int_or_default(tool_call_json_decode_error_count[i]),
+            "tool_call_missing_name_count": _int_or_default(tool_call_missing_name_count[i]),
             "prediction_step_index": _int_or_default(prediction_step_index[i]),
             "final_answer_step_index": _int_or_default(final_answer_step_index[i]),
             "required_step_budget": _int_or_default(required_step_budget[i]),
             "illegal_turn3_tool_call_count": _int_or_default(illegal_turn3_tool_call_count[i]),
             "tool_call_sequence": tool_call_sequence[i] if tool_call_sequence[i] else "none",
             "analysis_state_signature": analysis_state_signature[i] if analysis_state_signature[i] else "",
+            "refinement_decision_name": refinement_decision_name[i] if refinement_decision_name[i] else "",
             "selected_forecast_orig_mse": _float_or_nan(selected_forecast_orig_mse[i]),
             "final_vs_selected_mse": _float_or_nan(final_vs_selected_mse[i]),
             "refinement_delta_orig_mse": _float_or_nan(refinement_delta_orig_mse[i]),

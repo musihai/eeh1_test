@@ -14,6 +14,7 @@ from recipe.time_series_forecast.reward_metrics import (
     SEASON_COMPONENT_SCORE_WEIGHT,
     TREND_COMPONENT_SCORE_WEIGHT,
     compute_length_penalty,
+    compute_norm_mse_score,
 )
 from recipe.time_series_forecast.time_series_io import compact_historical_data_for_prompt
 from recipe.time_series_forecast.utils import compact_prediction_tool_output_from_string, format_prediction_tool_output
@@ -76,6 +77,29 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertIn("repeatable local motifs", prompt)
         self.assertIn("broader structural drift", prompt)
         self.assertIn("irregular, noisy, weakly structured, or zero-shot windows", prompt)
+
+    def test_routing_prompt_warns_against_placeholder_tool_names(self) -> None:
+        prompt = build_runtime_user_prompt(
+            data_source="ETTh1",
+            target_column="OT",
+            lookback_window=96,
+            forecast_horizon=96,
+            time_series_data="1.0000\n2.0000\n3.0000",
+            history_analysis=["Basic Statistics:\n  Median: 2.0000"],
+            prediction_results=None,
+            available_feature_tools=["extract_basic_statistics"],
+            completed_feature_tools=["extract_basic_statistics"],
+            routing_feature_payload={
+                "extract_basic_statistics": {
+                    "acf1": 0.91,
+                    "acf_seasonal": 0.12,
+                    "cusum_max": 42.0,
+                }
+            },
+            turn_stage="routing",
+        )
+        self.assertIn("Use the exact function name `predict_time_series`.", prompt)
+        self.assertIn('{"name":"predict_time_series","arguments":{"model_name":"arima"}}', prompt)
 
     def test_turn_three_prompt_omits_duplicate_predictions(self) -> None:
         prompt = build_runtime_user_prompt(
@@ -257,6 +281,12 @@ class CompactProtocolTests(unittest.TestCase):
         self.assertAlmostEqual(result["season_trend_score"], 0.0, places=6)
         self.assertAlmostEqual(result["orig_mse"], 0.0, places=6)
         self.assertAlmostEqual(result["norm_mse"], 0.0, places=6)
+
+    def test_norm_mse_score_uses_stronger_bad_side_separation(self) -> None:
+        self.assertAlmostEqual(compute_norm_mse_score(0.0), PREDICTION_ERROR_SCORE_WEIGHT, places=6)
+        self.assertAlmostEqual(compute_norm_mse_score(1.0), 0.3, places=6)
+        self.assertAlmostEqual(compute_norm_mse_score(100.0), 0.6 / 11.0, places=6)
+        self.assertLess(compute_norm_mse_score(100.0), compute_norm_mse_score(10.0))
 
     def test_composite_reward_keeps_structural_components_active_beyond_low_mse_region(self) -> None:
         ground_truth_values = [10.0, 12.0, 15.0, 18.0, 16.0, 13.0, 11.0, 14.0]

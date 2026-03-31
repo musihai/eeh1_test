@@ -63,7 +63,7 @@ INITIAL_MODEL_PATH="$(resolve_transformers_model_dir "$INITIAL_MODEL_PATH")" || 
 CURRICULUM_DATASET_DIR="${RL_CURRICULUM_DATASET_DIR:-}"
 VAL_FILES="$CURRICULUM_DATASET_DIR/val.jsonl"
 PHASES="${RL_CURRICULUM_PHASES:-stage1,stage12,stage123}"
-BASE_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper_20260326}"
+BASE_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper}"
 BASE_LOCAL_DIR="${RL_TRAINER_LOCAL_DIR:-$PROJECT_DIR/artifacts/checkpoints/rl/$BASE_EXP_NAME}"
 RUN_MODE="${RUN_MODE:-train}"
 

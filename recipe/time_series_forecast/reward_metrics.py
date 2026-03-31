@@ -18,6 +18,18 @@ TREND_COMPONENT_SCORE_WEIGHT = 0.0375
 CHANGE_POINT_COMPONENT_SCORE_WEIGHT = 0.025
 
 
+def compute_norm_mse_score(norm_mse: float) -> float:
+    """Map normalized MSE to a bounded reward with stronger bad-side separation.
+
+    The previous ``log1p`` curve compressed high-error predictions too heavily.
+    A square-root decay stays bounded in ``[0, 0.6]`` while preserving larger
+    relative gaps between mediocre and poor forecasts.
+    """
+    norm_mse = float(max(norm_mse, 0.0))
+    score = 1.0 / (1.0 + np.sqrt(norm_mse))
+    return float(score * PREDICTION_ERROR_SCORE_WEIGHT)
+
+
 class moving_avg(nn.Module):
     def __init__(self, kernel_size, stride):
         super().__init__()
@@ -199,8 +211,7 @@ def compute_mse_score(solution_str: str, ground_truth: str) -> float:
     gt_slice = gt_values[:min_len]
     norm_pred, norm_gt = normalize_for_reward(pred_slice, gt_slice)
     norm_mse = float(mean_squared_error(norm_gt, norm_pred))
-    score = 1.0 / (1.0 + np.log1p(norm_mse))
-    return score * PREDICTION_ERROR_SCORE_WEIGHT
+    return compute_norm_mse_score(norm_mse)
 
 
 def compute_season_trend_score(solution_str: str, ground_truth: str) -> float:
@@ -302,6 +313,7 @@ __all__ = [
     "compute_recovery_penalty",
     "compute_length_score",
     "compute_mse_score",
+    "compute_norm_mse_score",
     "compute_season_trend_score",
     "decompose",
     "find_change_points",

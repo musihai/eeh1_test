@@ -1,5 +1,6 @@
 import unittest
 
+import numpy as np
 import torch
 from tensordict import TensorDict
 
@@ -71,6 +72,28 @@ class TestTensorDictUtils(unittest.TestCase):
 
         self.assertTrue(torch.equal(value, torch.tensor([1.0])))
         self.assertNotIn("x", proto.batch.keys())
+
+    def test_dataproto_concat_keeps_union_of_non_tensor_keys_across_shards(self) -> None:
+        shard_a = DataProto(
+            batch=TensorDict({"x": torch.tensor([[1.0]])}, batch_size=[1]),
+            non_tensor_batch={
+                "shared": np.array(["a"], dtype=object),
+            },
+            meta_info={},
+        )
+        shard_b = DataProto(
+            batch=TensorDict({"x": torch.tensor([[2.0]])}, batch_size=[1]),
+            non_tensor_batch={
+                "shared": np.array(["b"], dtype=object),
+                "change_point_score": np.array([0.125], dtype=object),
+            },
+            meta_info={},
+        )
+
+        merged = DataProto.concat([shard_a, shard_b])
+
+        self.assertEqual(merged.non_tensor_batch["shared"].tolist(), ["a", "b"])
+        self.assertEqual(merged.non_tensor_batch["change_point_score"].tolist(), [None, 0.125])
 
 
 if __name__ == "__main__":

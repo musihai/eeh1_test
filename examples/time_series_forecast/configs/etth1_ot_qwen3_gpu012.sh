@@ -98,7 +98,9 @@ export RL_LR="${RL_LR:-1e-6}"
 # RL 学习率调度策略。
 export RL_LR_SCHEDULER_TYPE="${RL_LR_SCHEDULER_TYPE:-cosine}"
 # actor PPO loss 的 KL 系数。
-export RL_KL_LOSS_COEF="${RL_KL_LOSS_COEF:-0.04}"
+export RL_KL_LOSS_COEF="${RL_KL_LOSS_COEF:-0.01}"
+# 是否在 GRPO 中按组内标准差归一化 advantage。
+export RL_NORM_ADV_BY_STD_IN_GRPO="${RL_NORM_ADV_BY_STD_IN_GRPO:-False}"
 # 训练采样阶段的温度。
 export RL_TEMPERATURE="${RL_TEMPERATURE:-1.0}"
 # 验证采样阶段的温度。
@@ -143,7 +145,7 @@ export RL_FSDP_USE_TORCH_COMPILE="${RL_FSDP_USE_TORCH_COMPILE:-False}"
 case "$RUN_MODE" in
     val_only)
         # 仅打印命令 / 试运行时默认使用的 SFT 实验名。
-        export SFT_EXPERIMENT_NAME="${SFT_EXPERIMENT_NAME:-qwen3-1.7b-etth1-sft-paper-valonly-20260326}"
+        export SFT_EXPERIMENT_NAME="${SFT_EXPERIMENT_NAME:-qwen3-1.7b-etth1-sft-paper-valonly}"
         # 仅打印命令 / 试运行时默认使用的 SFT 输出目录。
         export SFT_SAVE_DIR="${SFT_SAVE_DIR:-$PROJECT_DIR/artifacts/checkpoints/sft/$SFT_EXPERIMENT_NAME}"
         # SFT 全局批大小。
@@ -162,7 +164,7 @@ case "$RUN_MODE" in
         SFT_EXTRA_ARGS=()
 
         # RL 实验名。
-        export RL_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper_valonly_20260326}"
+        export RL_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper_valonly}"
         # RL 输出目录。
         export RL_TRAINER_LOCAL_DIR="${RL_TRAINER_LOCAL_DIR:-$PROJECT_DIR/artifacts/checkpoints/rl/$RL_EXP_NAME}"
         # RL 全局批大小。
@@ -199,7 +201,7 @@ case "$RUN_MODE" in
         ;;
     smoke)
         # SFT 实验名。
-        export SFT_EXPERIMENT_NAME="${SFT_EXPERIMENT_NAME:-qwen3-1.7b-etth1-sft-paper-smoke-20260326-gpu012}"
+        export SFT_EXPERIMENT_NAME="${SFT_EXPERIMENT_NAME:-qwen3-1.7b-etth1-sft-paper-smoke}"
         # SFT 输出目录。
         export SFT_SAVE_DIR="${SFT_SAVE_DIR:-$PROJECT_DIR/artifacts/checkpoints/sft/$SFT_EXPERIMENT_NAME}"
         # SFT 全局批大小。
@@ -221,7 +223,7 @@ case "$RUN_MODE" in
         )
 
         # RL 实验名。
-        export RL_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper_smoke_20260326}"
+        export RL_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper_smoke}"
         # RL 输出目录。
         export RL_TRAINER_LOCAL_DIR="${RL_TRAINER_LOCAL_DIR:-$PROJECT_DIR/artifacts/checkpoints/rl/$RL_EXP_NAME}"
         # RL 全局批大小。
@@ -257,7 +259,7 @@ case "$RUN_MODE" in
         ;;
     train)
         # SFT 实验名。
-        export SFT_EXPERIMENT_NAME="${SFT_EXPERIMENT_NAME:-qwen3-1.7b-etth1-sft-paper-formal-20260326}"
+        export SFT_EXPERIMENT_NAME="${SFT_EXPERIMENT_NAME:-qwen3-1.7b-etth1-sft-paper-formal}"
         # SFT 输出目录。
         export SFT_SAVE_DIR="${SFT_SAVE_DIR:-$PROJECT_DIR/artifacts/checkpoints/sft/$SFT_EXPERIMENT_NAME}"
         # SFT 全局批大小。
@@ -276,7 +278,7 @@ case "$RUN_MODE" in
         SFT_EXTRA_ARGS=()
 
         # RL 实验名。
-        export RL_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper_20260326}"
+        export RL_EXP_NAME="${RL_EXP_NAME:-etth1_ot_qwen3_1_7b_rl_paper}"
         # RL 输出目录。
         export RL_TRAINER_LOCAL_DIR="${RL_TRAINER_LOCAL_DIR:-$PROJECT_DIR/artifacts/checkpoints/rl/$RL_EXP_NAME}"
         # RL 训练迭代中的 prompt batch。
@@ -309,7 +311,7 @@ case "$RUN_MODE" in
         # RL 权重保存频率。
         export RL_SAVE_FREQ="${RL_SAVE_FREQ:-50}"
         # RL 验证频率。
-        export RL_TEST_FREQ="${RL_TEST_FREQ:-20}"
+        export RL_TEST_FREQ="${RL_TEST_FREQ:-8}"
         # RL epoch 数。
         export RL_TOTAL_EPOCHS="${RL_TOTAL_EPOCHS:-1}"
         # RL 日志后端列表。

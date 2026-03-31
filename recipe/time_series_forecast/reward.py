@@ -13,6 +13,7 @@ from recipe.time_series_forecast.reward_metrics import (
     compute_length_penalty,
     compute_length_score,
     compute_mse_score,
+    compute_norm_mse_score,
     compute_recovery_penalty,
     compute_season_trend_score,
     decompose,
@@ -482,7 +483,7 @@ def _compute_score_impl(
             length_penalty = compute_length_penalty(pred_len, gt_len)
         length_score = compute_length_score(scoring_solution, ground_truth)
         if not np.isnan(orig_mse) and not np.isnan(norm_mse):
-            mse_score = (1.0 / (1.0 + np.log1p(norm_mse))) * PREDICTION_ERROR_SCORE_WEIGHT
+            mse_score = compute_norm_mse_score(norm_mse)
         if ENABLE_CHANGE_POINT_SCORE:
             change_point_score = float(compute_change_point_score(scoring_solution, ground_truth))
         if ENABLE_SEASON_TREND_SCORE:

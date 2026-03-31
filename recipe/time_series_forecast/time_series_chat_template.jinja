@@ -8,7 +8,7 @@
         {{- "\n" }}
         {{- tool | tojson }}
     {%- endfor %}
-    {{- "\n</tools>\n\nFor each function call, return exactly one strict JSON object inside <tool_call></tool_call> XML tags.\nUse double quotes around every string value and do not add markdown, comments, or placeholder tokens.\nExample:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {}}\n</tool_call><|im_end|>\n" }}
+    {{- "\n</tools>\n\nFor each function call, return exactly one strict JSON object inside <tool_call></tool_call> XML tags.\nUse double quotes around every string value and do not add markdown, comments, or placeholder tokens.\nExample:\n<tool_call>\n{\"name\": \"extract_basic_statistics\", \"arguments\": {}}\n</tool_call><|im_end|>\n" }}
 {%- else %}
     {%- if messages[0].role == 'system' %}
         {{- '<|im_start|>system\n' + messages[0].content + '<|im_end|>\n' }}

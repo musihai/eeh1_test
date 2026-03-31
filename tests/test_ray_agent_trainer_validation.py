@@ -350,6 +350,8 @@ class TestValidationRewardManager(unittest.TestCase):
         self.assertIn("data.train_batch_size=9", result.stdout)
         self.assertIn("data.filter_overlong_prompts=False", result.stdout)
         self.assertIn("actor_rollout_ref.actor.ppo_mini_batch_size=3", result.stdout)
+        self.assertIn("actor_rollout_ref.actor.kl_loss_coef=0.01", result.stdout)
+        self.assertIn("algorithm.norm_adv_by_std_in_grpo=False", result.stdout)
 
     def test_curriculum_rl_launcher_respects_smoke_run_mode(self) -> None:
         project_dir = os.path.dirname(os.path.dirname(__file__))
@@ -563,6 +565,7 @@ class TestValidationRewardManager(unittest.TestCase):
             "selected_model": ["itransformer", "itransformer", "chronos2"],
             "generation_stop_reason": ["stop", "length", "stop"],
             "generation_finish_reason": ["stop", "length", "stop"],
+            "run_name": ["unit-test-run", "unit-test-run", "unit-test-run"],
             "selected_forecast_orig_mse": [0.2, 0.8, 1.7],
             "selected_forecast_len_match": [True, False, True],
             "selected_forecast_exact_copy": [True, False, False],
@@ -615,6 +618,17 @@ class TestValidationRewardManager(unittest.TestCase):
             "prediction_tool_error": ["", "RuntimeError: timeout", ""],
             "selected_forecast_preview": ["1.0000, 2.0000 ... 95.0000, 96.0000", "", "1.0000, 2.0000 ... 94.0000, 95.0000"],
             "final_answer_preview": ["1.0000, 2.0000 ... 95.0000, 96.0000", "", "1.0000, 2.0000 ... 94.5000, 95.5000"],
+            "offline_best_model": ["itransformer", "chronos2", "itransformer"],
+            "offline_margin": [0.04, 0.02, 0.01],
+            "reference_teacher_error": [0.8, 1.4, 1.0],
+            "reference_teacher_error_band": ["mid", "high", "low"],
+            "refinement_decision_name": ["keep_baseline", "", "local_level_adjust"],
+            "raw_tool_call_block_count": [1, 0, 1],
+            "raw_tool_call_name_sequence": ["predict_time_series", "none", "predict_time_series"],
+            "invalid_tool_call_name_count": [0, 1, 0],
+            "invalid_tool_call_name_sequence": ["none", "tool_name", "none"],
+            "tool_call_json_decode_error_count": [0, 0, 0],
+            "tool_call_missing_name_count": [0, 0, 0],
         }
 
         previous_debug_dir = os.environ.get("TS_MIN_DEBUG_DIR")
@@ -649,22 +663,33 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertAlmostEqual(agg_row["workflow_rejected_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["missing_required_feature_tool_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["prediction_call_not_once_ratio"], 0.0, places=6)
+            self.assertAlmostEqual(agg_row["selected_model_offline_best_agreement_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["orig_mse_mean"], 0.0, places=6)
             self.assertAlmostEqual(agg_row["norm_mse_mean"], 0.0, places=6)
             self.assertAlmostEqual(agg_row["length_mismatch_ratio"], 2.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["selected_forecast_orig_mse_mean"], 0.9, places=6)
+            self.assertAlmostEqual(
+                agg_row["selected_vs_reference_teacher_orig_mse_regret_mean"],
+                (-0.6 - 0.6 + 0.7) / 3.0,
+                places=6,
+            )
+            self.assertAlmostEqual(agg_row["final_vs_reference_teacher_orig_mse_regret_mean"], (-0.8 + 0.5) / 2.0, places=6)
             self.assertAlmostEqual(agg_row["selected_forecast_exact_copy_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["final_vs_selected_mse_mean"], 0.075, places=6)
             self.assertAlmostEqual(agg_row["refinement_delta_orig_mse_mean"], 0.2, places=6)
             self.assertAlmostEqual(agg_row["refinement_improved_ratio"], 2.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["prediction_model_defaulted_ratio"], 1.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["invalid_tool_call_name_ratio"], 1.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["analysis_coverage_ratio_mean"], (1.0 + 0.4 + 0.8) / 3.0, places=6)
             self.assertAlmostEqual(agg_row["feature_tool_count_mean"], 2.0, places=6)
             self.assertAlmostEqual(agg_row["required_feature_tool_count_mean"], 8.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["missing_required_feature_tool_count_mean"], 2.0 / 3.0, places=6)
+            self.assertAlmostEqual(agg_row["raw_tool_call_block_count_mean"], 2.0 / 3.0, places=6)
             self.assertAlmostEqual(agg_row["response_token_len_mean"], 407.6666666666667, places=6)
             self.assertAlmostEqual(agg_row["illegal_turn3_tool_call_ratio"], 1.0 / 3.0, places=6)
             self.assertEqual(agg_row["prediction_tool_error_count"], 1)
+            self.assertEqual(agg_row["run_name"], "unit-test-run")
+            self.assertEqual(agg_row["run_name_distribution"], {"unit-test-run": 3})
             self.assertEqual(
                 agg_row["debug_bucket_distribution"],
                 {"ok": 1, "tool_error": 1, "workflow_violation": 1},
@@ -675,6 +700,8 @@ class TestValidationRewardManager(unittest.TestCase):
             )
             self.assertEqual(agg_row["selected_model_distribution"], {"chronos2": 1, "itransformer": 2})
             self.assertEqual(agg_row["workflow_status_distribution"], {"accepted": 1, "not_attempted": 1, "rejected": 1})
+            self.assertEqual(agg_row["invalid_tool_call_name_distribution"], {"tool_name": 1})
+            self.assertEqual(agg_row["refinement_decision_distribution"], {"keep_baseline": 1, "local_level_adjust": 1})
             self.assertEqual(agg_row["format_failure_reason_distribution"]["missing_answer_close_tag"], 1)
             self.assertEqual(agg_row["generation_stop_reason_distribution"], {"length": 1, "stop": 2})
             self.assertEqual(agg_row["generation_finish_reason_distribution"], {"length": 1, "stop": 2})
@@ -722,12 +749,16 @@ class TestValidationRewardManager(unittest.TestCase):
             self.assertEqual(failure_row["debug_bucket"], "tool_error")
             self.assertEqual(failure_row["debug_reason"], "prediction_tool_error")
             self.assertEqual(failure_row["prediction_tool_error"], "RuntimeError: timeout")
+            self.assertEqual(failure_row["invalid_tool_call_name_count"], 1)
+            self.assertEqual(failure_row["invalid_tool_call_name_sequence"], "tool_name")
+            self.assertFalse(failure_row["selected_model_matches_offline_best"])
 
             success_row = next(
                 row for row in sample_rows if row["category"] == "best_success" and row["sample_id"] == "sample-0"
             )
             self.assertEqual(success_row["debug_bucket"], "ok")
             self.assertTrue(success_row["selected_forecast_exact_copy"])
+            self.assertTrue(success_row["selected_model_matches_offline_best"])
 
     def test_flatten_validation_aggregate_metrics_emits_scalar_val_agg_metrics(self) -> None:
         agg_row = {

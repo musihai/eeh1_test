@@ -37,10 +37,34 @@ export PYTHONPATH=$PWD:$PYTHONPATH
   `artifacts/checkpoints/sft/<your_sft_run>/global_step_xx/huggingface`
 - 正式 step-wise SFT 只接受这一组 metadata 约束：
   `sft_stage_mode=full`、`turn3_target_mode=paper_strict`、`routing_label_source=reference_teacher`
+- 当前 formal RL 默认值已经改为：
+  `RL_KL_LOSS_COEF=0.01`
+  `RL_NORM_ADV_BY_STD_IN_GRPO=False`
 - `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_refinement_decision_*`
   和
   `artifacts/checkpoints/sft/qwen3-1.7b-etth1-refinement-decision-*`
   都是实验分支，不作为正式 RL warm start 输入
+
+### 2.1 清理基线
+
+- 当前正式链路建议只保留：
+  `dataset/ETT-small`
+  `dataset/ett_rl_etth1_paper_same2`
+  `dataset/ett_sft_etth1_runtime_teacher200_paper_same2`
+  `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise`
+  `dataset/ett_rl_etth1_paper_aligned_ot_curriculum_same2`
+- 当前仓库内建议只保留一个 formal SFT warm start 目录：
+  `artifacts/checkpoints/sft/qwen3-1.7b-etth1-sft-paper-20260330_224014`
+- 可以整体删除的旧实验产物包括：
+  `dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_*`
+  里除 `..._stepwise` 之外的所有目录
+- 可以整体删除的旧权重包括：
+  `artifacts/checkpoints/sft/`
+  里除最新 formal SFT 外的所有目录
+- 可以整体删除的旧 RL 输出包括：
+  `artifacts/checkpoints/rl/` 下全部目录
+- 可以整体删除的运行报告与 probe 输出包括：
+  `artifacts/reports/` 下除少量手写 `.md` 说明外的所有目录和日志文件
 
 ## 3. 一次性准备
 
@@ -100,6 +124,8 @@ python -m recipe.time_series_forecast.build_etth1_sft_dataset \
   --val-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/val_curated.jsonl \
   --test-jsonl dataset/ett_sft_etth1_runtime_teacher200_paper_same2/test_curated.jsonl \
   --routing-label-source reference_teacher \
+  --train-min-local-refine-ratio 0.10 \
+  --train-turn3-rebalance-mode oversample_local_refine \
   --output-dir dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise
 ```
 
@@ -111,6 +137,10 @@ python -m recipe.time_series_forecast.build_etth1_sft_dataset \
 正式链路要求：
 
 - `--routing-label-source` 必须是 `reference_teacher`
+- 如果 4.2 保持 `teacher200` 紧凑高质量集合，4.3 推荐同时使用：
+  `--train-min-local-refine-ratio 0.10`
+  `--train-turn3-rebalance-mode oversample_local_refine`
+- 不要继续使用 `downsample_keep`；它会把 `200` 个 train source window 下采样到几十个
 - 产物 `metadata.json` 必须满足：
   `sft_stage_mode=full`、`turn3_target_mode=paper_strict`、`routing_label_source=reference_teacher`
 
@@ -124,7 +154,15 @@ from pathlib import Path
 meta = json.loads(
     Path("dataset/ett_sft_etth1_runtime_ot_teacher200_paper_same4_stepwise/metadata.json").read_text()
 )
-for key in ("sft_stage_mode", "turn3_target_mode", "routing_label_source"):
+for key in (
+    "sft_stage_mode",
+    "turn3_target_mode",
+    "routing_label_source",
+    "train_turn3_rebalance_mode",
+    "train_min_local_refine_ratio",
+    "train_source_samples_before_balance",
+    "train_source_samples",
+):
     print(f"{key}={meta.get(key)}")
 PY
 ```
@@ -134,6 +172,13 @@ PY
 - `sft_stage_mode=full`
 - `turn3_target_mode=paper_strict`
 - `routing_label_source=reference_teacher`
+- `train_turn3_rebalance_mode=oversample_local_refine`
+- `train_min_local_refine_ratio=0.1`
+- `train_source_samples_before_balance=200`
+- `train_source_samples=200`
+
+如果这里仍然出现 `train_turn3_rebalance_mode=downsample_keep`
+或者 `train_source_samples` 明显小于 `200`，说明 4.3 还没有按正式推荐配置重建。
 
 如果这个目录是旧版本构建出来的，重新执行 4.3 后再检查一次 `metadata.json`；
 只要其中还出现 `routing_label_source=heuristic`，就不要继续拿它训 formal SFT / RL。
@@ -200,6 +245,9 @@ curl -s http://127.0.0.1:8994/models
 - 同时取：
   `RL_PPO_MINI_BATCH_SIZE=3`、`RL_PPO_MICRO_BATCH_SIZE=2`
   这样 actor 侧等效 `gradient accumulation=4`
+- 另外固定取：
+  `RL_KL_LOSS_COEF=0.01`
+  `RL_NORM_ADV_BY_STD_IN_GRPO=False`
 
 如果你想临时改成别的值，优先只改 profile；如果只是一次实验，直接用命令前缀覆盖。
 
@@ -273,7 +321,7 @@ PROFILE_PATH=$PROFILE_PATH \
 PRINT_CMD_ONLY=1 \
 SFT_MODEL_PATH=$BASE_MODEL_PATH \
 SFT_DATASET_DIR=$SFT_DATASET_DIR \
-SFT_SAVE_DIR=$SFT_SAVE_DIR \
+SFT_SAVE_DIR=$SFT_FORMAL_SAVE_DIR \
 SFT_EXPERIMENT_NAME=$SFT_RUN_NAME \
 SFT_LOGGER='["console","swanlab"]' \
 SWANLAB_LOG_DIR=$SWANLAB_LOG_DIR \
@@ -414,7 +462,7 @@ bash examples/time_series_forecast/run_qwen3-1.7B.sh
 正式 curriculum RL：
 
 ```bash
-ray stop --force
+conda run -n cast-r1-ts ray stop --force
 
 
 
@@ -432,6 +480,7 @@ bash examples/time_series_forecast/run_qwen3-1.7B_curriculum.sh
 
 - `run_qwen3-1.7B_curriculum.sh` 会自动依次跑 `stage1 -> stage12 -> stage123`
 - 每个命令里显式传入的环境变量都会覆盖 profile 默认值
+- formal RL 当前默认每 `8` 个 step 做一次验证
 - RL 真正开始前，不要再使用 `RL_MODEL_PATH=$BASE_MODEL_PATH`
 
 RL 在 SwanLab 里建议分两组看。

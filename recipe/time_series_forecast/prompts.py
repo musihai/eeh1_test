@@ -408,8 +408,13 @@ def build_runtime_user_prompt(
 - Make the routing decision from the structured evidence card only.
 - Do NOT restate the evidence in long prose.
 - The `predict_time_series` call must be emitted as strict JSON inside `<tool_call>...</tool_call>`.
+- Use the exact function name `predict_time_series`. Never emit placeholders such as `tool_name`.
 - Choose exactly one model_name from `patchtst`, `itransformer`, `arima`, `chronos2`.
 - Call predict_time_series exactly once with your chosen model_name.
+- Valid example:
+<tool_call>
+{{"name":"predict_time_series","arguments":{{"model_name":"arima"}}}}
+</tool_call>
 """
 
     raise ValueError(f"Unsupported runtime turn stage: {normalized_stage}")
